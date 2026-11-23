@@ -1,3 +1,4 @@
+import BackgroundTasks
 import Foundation
 import LlamaKit
 import Metal
@@ -5,6 +6,7 @@ import Observation
 import os
 import SwiftData
 import UIKit
+import UserNotifications
 
 /// Runs the one generation that can happen at a time, in whichever mode a chat uses. Only one
 /// on-device model is loaded at a time, since two would crowd each other out of memory.
@@ -23,6 +25,8 @@ final class Engine {
     /// Set while a model self-test runs, which also blocks chats.
     private(set) var testing: CatalogModel?
     var isBusy: Bool { running != nil || testing != nil }
+    /// The last finished reply's numbers (prompt, reused, generated tokens), for checks.
+    @ObservationIgnored private(set) var lastStats: GenerationStats?
 
     @ObservationIgnored private var llama: LlamaModel?
     @ObservationIgnored private var task: Task<Void, Never>?
@@ -31,6 +35,11 @@ final class Engine {
     @ObservationIgnored private var prepareCount = 0
     @ObservationIgnored private var inBackground = false
     @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    /// iOS 26+: the `BGContinuedProcessingTask` keeping the running reply going after leaving the
+    /// app, once the system has started it (`AnyObject` so the property exists on iOS 18).
+    @ObservationIgnored private var continued: AnyObject?
+    /// The identifier of the request submitted for the running reply, until it ends.
+    @ObservationIgnored private var continuedID: String?
 
     init() {
         store.canReplaceFile = { [weak self] model in
@@ -46,6 +55,9 @@ final class Engine {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.unload() }
         }
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-featuretest") { Task { await runFeatureTest() } }
+        #endif
     }
 
     func model(for mode: Mode) -> CatalogModel? {
@@ -54,24 +66,32 @@ final class Engine {
 
     // MARK: - Chats
 
-    func send(_ text: String, in conversation: Conversation) {
-        guard !isBusy else { return }
-        if conversation.messages.isEmpty { conversation.title = String(text.prefix(60)) }
-        conversation.messages.append(StoredMessage(isUser: true, content: text))
+    func send(_ text: String, attachments: [Attachment] = [], in conversation: Conversation) {
+        guard !isBusy, !text.isEmpty || !attachments.isEmpty else { return }
+        if conversation.messages.isEmpty { conversation.title = String((text.isEmpty ? attachments[0].name : text).prefix(60)) }
+        _ = frozenSystemPrompt(of: conversation)  // so the date note compares with the chat's own date
+        var message = StoredMessage(isUser: true, content: text)
+        message.attachments = attachments.isEmpty ? nil : attachments
+        message.dateNote = conversation.dateNote()
+        conversation.messages.append(message)
         generate(in: conversation)
     }
 
-    /// Replaces the last reply with a new one, optionally from another mode.
+    /// Replaces the last reply with a new one, optionally from another mode. The answer it replaces
+    /// (and its own earlier versions) are kept as the new one's other versions.
     func retry(in conversation: Conversation, mode: Mode) {
-        guard !isBusy, conversation.messages.last?.isUser == false else { return }
+        guard !isBusy, let old = conversation.messages.last, !old.isUser else { return }
+        let kept = old.allVersions.list.filter { !$0.content.isEmpty }
         conversation.messages.removeLast()
         conversation.mode = mode
-        generate(in: conversation)
+        generate(in: conversation, versions: kept)
     }
 
     /// Stops the running reply and starts it again in `mode` (e.g. Smart is too slow: use Fast).
+    /// What it had written so far is kept as a version, as Retry does.
     func restart(in conversation: Conversation, mode: Mode) {
         let previous = task
+        live?.stopNote = "Stopped for \(mode.title)"
         previous?.cancel()
         Task {
             await previous?.value
@@ -82,8 +102,9 @@ final class Engine {
     /// Stops the reply, including while its model is still loading.
     func stop() { task?.cancel() }
 
-    private func generate(in conversation: Conversation, trim: Bool = false) {
-        let reply = StoredMessage(isUser: false, finished: false)
+    private func generate(in conversation: Conversation, trim: Bool = false, versions: [ReplyVersion] = []) {
+        var reply = StoredMessage(isUser: false, finished: false)
+        reply.versions = versions.isEmpty ? nil : versions
         conversation.messages.append(reply)
         conversation.updated = .now
         try? conversation.modelContext?.save()
@@ -97,11 +118,14 @@ final class Engine {
         self.live = live
         running = conversation.persistentModelID
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
+        beginContinuedProcessing(mode: mode, chatTitle: conversation.title)
 
         task = Task {
             var stats: GenerationStats?
             var failure: Error?
             var lastSave = Date()
+            var lastProgress = Date()
+            var pieces = 0
             var statsKey: String?
             attempts: while true { do {
                 let stream: AsyncThrowingStream<Generation, Error>
@@ -116,6 +140,12 @@ final class Engine {
                     guard store.states[model.id] == .ready else { throw EngineError.notDownloaded(mode) }
                     let llama = try await load(model)
                     try Task.checkCancellation()
+                    // A chat with images: load the projector beside the model, if it's here.
+                    if history.contains(where: \.hasImages), !llama.hasVision,
+                       let projector = model.projector, store.states[projector.id] == .ready {
+                        try await llama.loadVision(projector: store.url(for: projector).path)
+                        try Task.checkCancellation()
+                    }
                     live.phase = .waiting
                     statsKey = model.id
                     conversation.tokenLimit = llama.contextLength
@@ -137,6 +167,11 @@ final class Engine {
                     case .thinking(let t): live.append(thinking: t)
                     case .text(let t): live.append(text: t)
                     case .done(let s): stats = s
+                    }
+                    pieces += 1
+                    if Date().timeIntervalSince(lastProgress) > 0.5 {
+                        reportContinuedProgress(pieces)
+                        lastProgress = .now
                     }
                     if Date().timeIntervalSince(lastSave) > 5 {  // so a crash keeps most of the answer
                         write(live, to: conversation, finished: false)
@@ -184,6 +219,7 @@ final class Engine {
             $0.errorKind = error.map(Self.kind)
             $0.cutOff = cutOff
         }
+        lastStats = stats
         if let stats, conversation.modelContext != nil, !conversation.isDeleted {
             conversation.tokensUsed = stats.promptTokens + stats.generatedTokens
             try? conversation.modelContext?.save()
@@ -195,10 +231,14 @@ final class Engine {
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)  // you may have put it down
         }
+        if inBackground, stats != nil || error != nil {
+            notifyFinished(conversation, reply: live, failed: error != nil)
+        }
         self.live = nil
         running = nil
         task = nil
         UIApplication.shared.isIdleTimerDisabled = false
+        endContinuedProcessing(success: error == nil)
         endBackgroundTask()
         pruneStates()
     }
@@ -289,10 +329,7 @@ final class Engine {
         let thinking = conversation.thinking
         let budget = llama.promptLimit * 2 / 3
         for (n, start) in starts.enumerated() {
-            let kept = conversation.messages[start..<end].compactMap { m -> ChatMessage? in
-                guard m.error == nil, !m.content.isEmpty else { return nil }
-                return ChatMessage(role: m.isUser ? .user : .assistant, content: m.content)
-            }
+            let kept = conversation.messages[start..<end].compactMap { $0.chatMessage }
             let tokens = await llama.countTokens([system] + kept, thinking: thinking)
             if tokens <= budget || (n == starts.count - 1 && tokens <= llama.promptLimit) { return start }
         }
@@ -306,6 +343,23 @@ final class Engine {
             return (llama.tokensInContext, llama.contextLength)
         }
         return conversation.tokenLimit > 0 ? (conversation.tokensUsed, conversation.tokenLimit) : nil
+    }
+
+    /// The most a chat in this mode can hold, in tokens, before any reply has said so.
+    func contextLimit(for mode: Mode) -> Int {
+        if mode == .mac { return mac.contextLength }
+        if let llama, loadedModel?.tier == mode { return llama.contextLength }
+        return Int(model(for: mode)?.options.contextLength ?? ModelOptions().contextLength)
+    }
+
+    /// Whether images attached in this mode are seen: Fast once its projector is downloaded, the
+    /// Mac if its model has vision (checked when sending). Smart has no projector.
+    func canSeeImages(_ mode: Mode) -> Bool {
+        switch mode {
+        case .mac: true
+        case .smart: false
+        case .fast: model(for: .fast)?.projector.map { store.states[$0.id] == .ready } ?? false
+        }
     }
 
     /// What this mode's model usually does on this device, from past replies. Nil until it has answered.
@@ -389,16 +443,22 @@ final class Engine {
 
     // MARK: - Leaving the app
 
-    /// iOS doesn't allow GPU work in the background, so an on-device reply stops when you leave.
-    /// A reply from the Mac gets the few seconds iOS allows to finish. The on-device model is then
-    /// unloaded: its state is saved, and a suspended app holding gigabytes is the first to be killed.
+    /// On iOS 26+, a reply whose continued-processing task the system started keeps going (an
+    /// on-device one only where background GPU is allowed; see `beginContinuedProcessing`).
+    /// Otherwise iOS doesn't allow GPU work in the background, so an on-device reply stops when you
+    /// leave, and a reply from the Mac gets the few seconds iOS allows to finish. The on-device
+    /// model is then unloaded (after a continued reply ends): its state is saved, and a suspended
+    /// app holding gigabytes is the first to be killed.
     func didEnterBackground() {
         inBackground = true
         if let live {
-            if live.mode.isOnDevice {
+            if continued != nil {
+                askToNotifyQuietly()
+            } else if live.mode.isOnDevice {
                 live.stopNote = "Stopped when you left Lantern"
                 stop()
             } else {
+                askToNotifyQuietly()
                 backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
                     self?.live?.stopNote = "Stopped when you left Lantern"
                     self?.stop()
@@ -439,6 +499,96 @@ final class Engine {
         guard backgroundTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(backgroundTask)
         backgroundTask = .invalid
+    }
+
+    // MARK: - Continued processing (iOS 26+)
+
+    /// Request identifiers: the prefix is in Info.plist's BGTaskSchedulerPermittedIdentifiers as
+    /// `<prefix>.*`; each reply submits its own, registered just before.
+    static let continuedPrefix = "com.merimerimeri.Lantern.reply"
+    /// Rough reply length for the system's progress display; raised as a reply runs past it.
+    private static let expectedPieces: Int64 = 600
+
+    /// Asks iOS to let the reply that's starting keep going if the user leaves. On-device replies
+    /// need the GPU in the background, which needs an entitlement and a device that supports it:
+    /// without both, nothing is submitted and leaving stops the reply as before. Ollama replies
+    /// only need the network. With `.fail`, a request iOS can't start now is refused outright.
+    private func beginContinuedProcessing(mode: Mode, chatTitle: String) {
+        guard #available(iOS 26, *) else { return }
+        let needsGPU = mode.isOnDevice && !Self.onCPU
+        if needsGPU, !BGTaskScheduler.supportedResources.contains(.gpu) { return }
+        let id = "\(Self.continuedPrefix).\(UUID().uuidString)"
+        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: id, using: .main) { [weak self] task in
+            MainActor.assumeIsolated {
+                guard let task = task as? BGContinuedProcessingTask, let self, self.continuedID == id, self.live != nil else {
+                    task.setTaskCompleted(success: true)  // the reply ended before iOS started this
+                    return
+                }
+                task.progress.totalUnitCount = Self.expectedPieces
+                task.expirationHandler = { [weak self] in
+                    Task { @MainActor in
+                        guard let self, self.continuedID == id else { return }
+                        self.live?.stopNote = "Stopped when iOS needed Lantern to pause"
+                        self.stop()  // `finish` saves the reply and completes the task
+                    }
+                }
+                self.continued = task
+            }
+        }
+        guard registered else { return }
+        let request = BGContinuedProcessingTaskRequest(
+            identifier: id, title: mode == .mac ? "Your Mac is answering" : "Lantern is answering", subtitle: chatTitle)
+        request.strategy = .fail
+        if needsGPU { request.requiredResources = .gpu }
+        do {
+            try BGTaskScheduler.shared.submit(request)
+            continuedID = id
+        } catch {
+            Logger(subsystem: "Lantern", category: "Engine").info("Continued processing not available: \(error.localizedDescription)")
+        }
+    }
+
+    /// llama.cpp runs on the CPU in the simulator, so an on-device reply needs no background GPU there.
+    private static var onCPU: Bool {
+        #if targetEnvironment(simulator)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private func reportContinuedProgress(_ pieces: Int) {
+        guard #available(iOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
+        let done = Int64(pieces)
+        if done >= task.progress.totalUnitCount * 9 / 10 { task.progress.totalUnitCount = done * 5 / 4 + 1 }
+        task.progress.completedUnitCount = done
+    }
+
+    private func endContinuedProcessing(success: Bool) {
+        continuedID = nil
+        guard #available(iOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
+        continued = nil
+        task.progress.completedUnitCount = task.progress.totalUnitCount
+        task.setTaskCompleted(success: success)
+    }
+
+    // MARK: - Telling the user a reply finished while away
+
+    /// Quiet (provisional) notifications need no prompt, so this never interrupts; a user who
+    /// allowed Lantern's reminders already gets full ones.
+    private func askToNotifyQuietly() {
+        Task { _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .provisional]) }
+    }
+
+    private func notifyFinished(_ conversation: Conversation, reply live: LiveReply, failed: Bool) {
+        let content = UNMutableNotificationContent()
+        content.title = conversation.title
+        content.body = failed ? "The reply didn't finish. Open Lantern to try again."
+            : live.text.isEmpty ? "Answer ready." : Markdown.firstSentence(live.text)
+        content.threadIdentifier = conversation.stateID
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "reply-\(live.id)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - Models

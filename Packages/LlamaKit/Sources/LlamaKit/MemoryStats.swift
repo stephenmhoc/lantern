@@ -15,9 +15,11 @@ public enum MemoryStats {
         return rc == KERN_SUCCESS ? info.phys_footprint : 0
     }
 
+    /// Nil where it isn't known: on macOS, and in the iOS simulator, where it's always 0.
     public static var availableBytes: UInt64? {
         #if os(iOS)
-        UInt64(os_proc_available_memory())
+        let bytes = os_proc_available_memory()
+        return bytes > 0 ? UInt64(bytes) : nil
         #else
         nil
         #endif

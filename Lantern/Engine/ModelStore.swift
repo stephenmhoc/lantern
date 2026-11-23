@@ -48,7 +48,7 @@ final class ModelStore: NSObject {
     override private init() {
         super.init()
         // A conversion the app was killed in the middle of: the original is intact, drop the copy.
-        for model in CatalogModel.all { try? FileManager.default.removeItem(atPath: url(for: model).path + ".converting") }
+        for model in CatalogModel.files { try? FileManager.default.removeItem(atPath: url(for: model).path + ".converting") }
         refresh()
         // Reattach to downloads that kept going while the app was closed.
         session.getAllTasks { tasks in
@@ -66,7 +66,7 @@ final class ModelStore: NSObject {
     var downloaded: Set<String> { Set(states.filter { $0.value == .ready }.map(\.key)) }
 
     func refresh() {
-        for model in CatalogModel.all {
+        for model in CatalogModel.files {
             if case .downloading = states[model.id] { continue }
             if case .converting = states[model.id] { continue }
             var file = url(for: model)
@@ -173,7 +173,7 @@ final class ModelStore: NSObject {
     func convertPending() {
         guard UIApplication.shared.applicationState == .active else { return }
         refresh()
-        for model in CatalogModel.all where convertWhenActive.contains(model.id) {
+        for model in CatalogModel.files where convertWhenActive.contains(model.id) {
             if unconverted.contains(model.id) { convert(model) } else if states[model.id] == .ready { convertWhenActive.remove(model.id) }
         }
     }
@@ -234,7 +234,7 @@ extension ModelStore: URLSessionDownloadDelegate {
         totalBytesWritten written: Int64, totalBytesExpectedToWrite expected: Int64
     ) {
         guard let id = downloadTask.taskDescription else { return }
-        let total = expected > 0 ? expected : CatalogModel.all.first { $0.id == id }?.bytes ?? 1
+        let total = expected > 0 ? expected : CatalogModel.files.first { $0.id == id }?.bytes ?? 1
         MainActor.assumeIsolated { states[id] = .downloading(Double(written) / Double(total)) }
     }
 
@@ -243,7 +243,7 @@ extension ModelStore: URLSessionDownloadDelegate {
     ) {
         // The temp file is deleted when this returns, so move it here.
         guard let id = downloadTask.taskDescription,
-              let model = CatalogModel.all.first(where: { $0.id == id }) else { return }
+              let model = CatalogModel.files.first(where: { $0.id == id }) else { return }
         let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
         let dest = URL.documentsDirectory.appending(path: model.filename)
         var error: String?

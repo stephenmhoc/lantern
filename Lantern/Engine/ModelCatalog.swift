@@ -81,6 +81,27 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
 
     static let all = [gemma, inklingQ2, inklingQ3]
 
+    /// Gemma's vision projector, from the same QAT repo: lets Fast see images. An optional extra
+    /// download, loaded beside Gemma only when a chat has an image (it costs about 1 GB of memory).
+    static let gemmaVision = CatalogModel(
+        id: "gemma-4-e2b-mmproj",
+        name: "Image reading for Fast",
+        detail: "Lets Gemma see photos and screenshots you attach.",
+        filename: "gemma-4-E2B-it-qat-mmproj-F16.gguf",
+        url: URL(string: "\(hf)/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/mmproj-F16.gguf")!,
+        bytes: 985_654_080, tier: .fast, minDeviceGB: 6,
+        sampling: Sampling(temperature: 1.0), options: ModelOptions(), convertsForMetal: false
+    )
+
+    /// Files that go with a model rather than being one: not offered as a mode's model.
+    static let extras = [gemmaVision]
+    /// Everything `ModelStore` downloads and tracks.
+    static let files = all + extras
+    var isExtra: Bool { Self.extras.contains(self) }
+
+    /// The projector that lets this model see images, if there is one.
+    var projector: CatalogModel? { self == .gemma ? .gemmaVision : nil }
+
     /// Devices report a little less than their marketed RAM, so allow 10% slack.
     static func fits(_ model: CatalogModel) -> Bool {
         Double(MemoryStats.deviceBytes) >= Double(model.minDeviceGB) * 0.9 * 1_073_741_824

@@ -1,14 +1,22 @@
 import UIKit
+import UniformTypeIdentifiers
 
-/// The bar under the chat: status strip, mode menu, a text view that grows to six lines, Send/Stop.
+/// The bar under the chat: status strip, attached files, mode menu, attach menu, a text view that
+/// grows to six lines, the dictation button, Send/Stop.
 /// On iOS 26 and later it's a floating Liquid Glass panel at the readable width; before that, a
 /// full-width blurred bar.
 final class ComposerView: UIView, UITextViewDelegate {
     let textView = ComposerTextView()
     let modeButton = HitButton(configuration: .gray())
     let sendButton = HitButton(configuration: .plain())
+    /// Files and photos; its menu is set by the chat, which knows what the mode can read.
+    let attachButton = HitButton(configuration: .plain())
+    /// Hidden until the chat knows on-device dictation works for the language.
+    let micButton = HitButton(configuration: .plain())
     private let placeholder = UILabel()
     private let editBanner = UIStackView()
+    private let chipScroll = UIScrollView()
+    private let chipStack = UIStackView()
     private var heightConstraint: NSLayoutConstraint!
     private var modeTitle = ""
     private let usesGlass: Bool
@@ -18,7 +26,18 @@ final class ComposerView: UIView, UITextViewDelegate {
     /// Every edit, for drafts and pre-warming.
     var onTextChange: ((String) -> Void)?
     var onCancelEdit: (() -> Void)?
+    var onMic: (() -> Void)?
+    /// After a chip's remove button.
+    var onAttachmentsChange: (() -> Void)?
     var isRunning = false { didSet { updateButton() } }
+    /// Files to send with the next message, shown as chips above the field.
+    var attachments: [Attachment] = [] {
+        didSet {
+            renderChips()
+            updateButton()
+        }
+    }
+    var isListening = false { didSet { updateMic() } }
     var canSend = true { didSet { updateButton() } }
     /// Shows "Editing message" above the field while a sent message is being edited.
     var isEditingMessage = false {
@@ -97,10 +116,43 @@ final class ComposerView: UIView, UITextViewDelegate {
         editBanner.alignment = .center
         editBanner.isHidden = true
 
-        let row = UIStackView(arrangedSubviews: [modeButton, textView, sendButton])
+        attachButton.configuration?.image = UIImage(systemName: "paperclip")
+        attachButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 2, bottom: 8, trailing: 2)
+        attachButton.configuration?.preferredSymbolConfigurationForImage = .init(textStyle: .body)
+        attachButton.showsMenuAsPrimaryAction = true
+        attachButton.isPointerInteractionEnabled = true
+        attachButton.accessibilityLabel = "Attach"
+        attachButton.setContentHuggingPriority(.required, for: .horizontal)
+        attachButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        micButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 2, bottom: 8, trailing: 2)
+        micButton.configuration?.preferredSymbolConfigurationForImage = .init(textStyle: .body)
+        micButton.isPointerInteractionEnabled = true
+        micButton.isHidden = true
+        micButton.setContentHuggingPriority(.required, for: .horizontal)
+        micButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        micButton.addAction(UIAction { [weak self] _ in self?.onMic?() }, for: .primaryActionTriggered)
+        updateMic()
+
+        chipStack.spacing = 6
+        chipStack.translatesAutoresizingMaskIntoConstraints = false
+        chipScroll.showsHorizontalScrollIndicator = false
+        chipScroll.addSubview(chipStack)
+        chipScroll.isHidden = true
+        NSLayoutConstraint.activate([
+            chipStack.topAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.topAnchor),
+            chipStack.bottomAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.bottomAnchor),
+            chipStack.leadingAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.leadingAnchor),
+            chipStack.trailingAnchor.constraint(equalTo: chipScroll.contentLayoutGuide.trailingAnchor),
+            chipStack.heightAnchor.constraint(equalTo: chipScroll.frameLayoutGuide.heightAnchor),
+        ])
+
+        let row = UIStackView(arrangedSubviews: [modeButton, attachButton, textView, micButton, sendButton])
         row.spacing = 8
         row.alignment = .bottom
-        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, row])
+        row.setCustomSpacing(2, after: attachButton)
+        row.setCustomSpacing(2, after: micButton)
+        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, row])
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -214,7 +266,34 @@ final class ComposerView: UIView, UITextViewDelegate {
         let name = isRunning ? "stop.circle.fill" : "arrow.up.circle.fill"
         sendButton.configuration?.image = UIImage(systemName: name)
         sendButton.accessibilityLabel = isRunning ? "Stop" : "Send"
-        sendButton.isEnabled = isRunning || (canSend && hasText)
+        sendButton.isEnabled = isRunning || (canSend && (hasText || !attachments.isEmpty))
+    }
+
+    private func updateMic() {
+        micButton.configuration?.image = UIImage(systemName: isListening ? "mic.fill" : "mic")
+        micButton.configuration?.baseForegroundColor = isListening ? .systemRed : nil
+        micButton.accessibilityLabel = isListening ? "Stop dictation" : "Dictate"
+        if isListening {
+            micButton.imageView?.addSymbolEffect(.pulse, options: .repeating)
+        } else {
+            micButton.imageView?.removeAllSymbolEffects()
+        }
+    }
+
+    private func renderChips() {
+        chipStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        for attachment in attachments {
+            chipStack.addArrangedSubview(AttachmentChip(attachment) { [weak self] in
+                guard let self else { return }
+                attachments.removeAll { $0.id == attachment.id }
+                onAttachmentsChange?()
+            })
+        }
+        chipScroll.isHidden = attachments.isEmpty
+        if let last = chipStack.arrangedSubviews.last {
+            layoutIfNeeded()
+            chipScroll.scrollRectToVisible(last.frame, animated: false)
+        }
     }
 }
 
@@ -222,7 +301,27 @@ final class ComposerView: UIView, UITextViewDelegate {
 /// the composer's own layout runs before the stack view inside it has resized the field.
 final class ComposerTextView: UITextView {
     var onWidthChange: (() -> Void)?
+    /// Paste with an image or a PDF (and no text) on the pasteboard attaches it instead.
+    var onPasteFiles: (([NSItemProvider]) -> Void)?
     private var lastWidth: CGFloat = 0
+
+    private var pasteboardHasFiles: Bool {
+        let board = UIPasteboard.general
+        return !board.hasStrings && (board.hasImages || board.contains(pasteboardTypes: [UTType.pdf.identifier]))
+    }
+
+    override func paste(_ sender: Any?) {
+        if let onPasteFiles, pasteboardHasFiles {
+            onPasteFiles(UIPasteboard.general.itemProviders)
+        } else {
+            super.paste(sender)
+        }
+    }
+
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)), onPasteFiles != nil, pasteboardHasFiles { return true }
+        return super.canPerformAction(action, withSender: sender)
+    }
 
     override func layoutSubviews() {
         super.layoutSubviews()

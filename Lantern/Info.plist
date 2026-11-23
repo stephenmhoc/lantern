@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.merimerimeri.Lantern.reply.*</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -52,6 +56,10 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Lantern talks to Ollama on your Mac over your home network.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lantern listens when you tap the microphone, to type what you say.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Lantern turns what you say into text on this device. Nothing is sent anywhere.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

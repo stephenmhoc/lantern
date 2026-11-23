@@ -39,6 +39,11 @@ private final class AnswerTextView: UITextView {
 final class UserCell: UICollectionViewCell {
     private let bubble = UIView()
     private let textView = makeTextView()
+    private let files = UIStackView()
+    private let dateLabel = UILabel()
+    private var renderedFiles: [Attachment]?
+    private var belowDate: NSLayoutConstraint!
+    private var atTop: NSLayoutConstraint!
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -50,18 +55,36 @@ final class UserCell: UICollectionViewCell {
         bubble.translatesAutoresizingMaskIntoConstraints = false
         // The bubble takes the touches, so long-press and right-click open the message's menu.
         textView.isUserInteractionEnabled = false
-        textView.translatesAutoresizingMaskIntoConstraints = false
+        files.axis = .vertical
+        files.alignment = .leading
+        files.spacing = 4
+        // The date note the model was given, shown small above the bubble.
+        dateLabel.font = .preferredFont(forTextStyle: .caption2)
+        dateLabel.adjustsFontForContentSizeCategory = true
+        dateLabel.textColor = .tertiaryLabel
+        dateLabel.textAlignment = .right
+        let content = UIStackView(arrangedSubviews: [files, textView])
+        content.axis = .vertical
+        content.spacing = 8
+        content.translatesAutoresizingMaskIntoConstraints = false
+        dateLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(dateLabel)
         contentView.addSubview(bubble)
-        bubble.addSubview(textView)
+        bubble.addSubview(content)
+        atTop = bubble.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4)
+        belowDate = bubble.topAnchor.constraint(equalTo: dateLabel.bottomAnchor, constant: 3)
         NSLayoutConstraint.activate([
-            bubble.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
+            atTop,
+            dateLabel.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
+            dateLabel.trailingAnchor.constraint(equalTo: contentView.layoutMarginsGuide.trailingAnchor),
+            dateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.layoutMarginsGuide.leadingAnchor),
             bubble.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -4),
             bubble.trailingAnchor.constraint(equalTo: contentView.layoutMarginsGuide.trailingAnchor),
             bubble.leadingAnchor.constraint(greaterThanOrEqualTo: contentView.layoutMarginsGuide.leadingAnchor, constant: 48),
-            textView.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            textView.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
-            textView.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
-            textView.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
+            content.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -10),
+            content.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
         ])
         isAccessibilityElement = true
         accessibilityTraits = .staticText
@@ -74,8 +97,20 @@ final class UserCell: UICollectionViewCell {
 
     func configure(_ message: StoredMessage, editing: Bool) {
         textView.text = message.content
+        textView.isHidden = message.content.isEmpty
+        if renderedFiles != message.attachments {
+            renderedFiles = message.attachments
+            files.arrangedSubviews.forEach { $0.removeFromSuperview() }
+            (message.attachments ?? []).forEach { files.addArrangedSubview(AttachmentChip($0)) }
+        }
+        files.isHidden = !message.hasAttachments
+        dateLabel.text = message.dateNote?.trimmingCharacters(in: CharacterSet(charactersIn: "()"))
+        dateLabel.isHidden = message.dateNote == nil
+        atTop.isActive = dateLabel.isHidden
+        belowDate.isActive = !dateLabel.isHidden
         bubble.alpha = editing ? 0.5 : 1
-        accessibilityLabel = "You: \(message.content)"
+        let names = (message.attachments ?? []).map(\.name).joined(separator: ", ")
+        accessibilityLabel = "You: \(message.content)" + (names.isEmpty ? "" : ". Attached: \(names)")
         accessibilityValue = editing ? "Editing" : nil
     }
 }

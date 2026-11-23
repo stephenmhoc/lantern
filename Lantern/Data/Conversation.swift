@@ -37,10 +37,17 @@ final class Conversation {
     /// What the model sees before message `index`: user turns and answers, including a stopped
     /// answer's partial text, but not failed or empty replies, nor turns dropped to fit the context.
     func history(before index: Int) -> [ChatMessage] {
-        messages[min(historyStart, index)..<index].compactMap { m in
-            guard m.error == nil, !m.content.isEmpty else { return nil }
-            return ChatMessage(role: m.isUser ? .user : .assistant, content: m.content)
-        }
+        messages[min(historyStart, index)..<index].compactMap { $0.chatMessage }
+    }
+
+    /// The note to put before a new question when the day has changed since the model last heard
+    /// the date (in the system prompt or an earlier note), else nil. "(Today is Monday, 23 November
+    /// 2026.)" Stored on the message, so the turn is rendered the same every time it's sent.
+    func dateNote(now: Date = .now) -> String? {
+        let today = now.formatted(date: .complete, time: .omitted)
+        let lastSaid = messages.last(where: { $0.dateNote != nil })?.dateNote ?? systemPrompt
+        if lastSaid.isEmpty || lastSaid.contains(today) { return nil }
+        return "(Today is \(today).)"
     }
 
     func index(of id: UUID) -> Int? { messages.firstIndex { $0.id == id } }
@@ -69,6 +76,29 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     var versionIndex: Int?
     /// How long the model thought before answering, when the chat screen saw it happen.
     var thoughtSeconds: Double?
+    /// Files sent with a question: their text (or the image) is part of what the model sees.
+    var attachments: [Attachment]?
+    /// "(Today is …)", put before a question sent on a later day than the chat began (see
+    /// `Conversation.dateNote`). Fixed once sent.
+    var dateNote: String?
+
+    nonisolated var hasAttachments: Bool { !(attachments ?? []).isEmpty }
+
+    /// This turn as the model sees it, or nil if it isn't sent (failed or empty). A question's text
+    /// is preceded by its date note and its files' text, in a fixed format, so the turn renders
+    /// byte for byte the same each time (Inkling's cache is only ever appended to).
+    nonisolated var chatMessage: ChatMessage? {
+        guard error == nil, !content.isEmpty || hasAttachments else { return nil }
+        guard isUser else { return ChatMessage(role: .assistant, content: content) }
+        var parts: [String] = []
+        if let dateNote { parts.append(dateNote) }
+        for file in attachments ?? [] where file.image == nil {
+            parts.append("<file name=\"\(file.name)\">\n\(file.text)\n</file>")
+        }
+        if !content.isEmpty { parts.append(content) }
+        return ChatMessage(role: .user, content: parts.joined(separator: "\n\n"),
+                           images: (attachments ?? []).compactMap(\.image))
+    }
 
     /// Every answer to this question, oldest first, and which one this message shows.
     var allVersions: (list: [ReplyVersion], current: Int) {
@@ -92,6 +122,18 @@ struct StoredMessage: Codable, Hashable, Identifiable {
         versions = list
         versionIndex = index == list.count ? nil : index
     }
+}
+
+/// A file sent with a question. Only what the model needs is kept: the name, the text taken out
+/// of it, and for an image the downscaled JPEG it's shown.
+nonisolated struct Attachment: Codable, Hashable, Identifiable {
+    var id = UUID()
+    var name: String
+    var text = ""
+    var image: Data?
+
+    var isImage: Bool { image != nil }
+    var symbol: String { isImage ? "photo" : name.lowercased().hasSuffix(".pdf") ? "doc.richtext" : "doc.text" }
 }
 
 /// One answer to a question, kept when Retry writes another.
