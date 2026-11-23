@@ -7,7 +7,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @AppStorage(MacLink.lanKey) private var lanHost = MacLink.defaultLAN
-    @AppStorage(MacLink.tailnetKey) private var tailnetHost = ""
+    @AppStorage(MacLink.tailnetKey) private var tailnetHost = MacLink.defaultTailnet
     @AppStorage(MacLink.modelKey) private var modelName = ""
     /// The hosts last checked (or as Settings opened with), so only edits trigger a check.
     @State private var openedWith: String?
@@ -22,7 +22,7 @@ struct SettingsView: View {
                         .multilineTextAlignment(.trailing).autocorrectionDisabled().textInputAutocapitalization(.never)
                 }
                 LabeledContent("Tailnet") {
-                    TextField("mac-studio.example.ts.net", text: $tailnetHost)
+                    TextField(MacLink.defaultTailnet, text: $tailnetHost)
                         .multilineTextAlignment(.trailing).autocorrectionDisabled().textInputAutocapitalization(.never)
                 }
                 LabeledContent("Connected by", value: mac.route.label)
@@ -36,8 +36,8 @@ struct SettingsView: View {
                 Text("Mac")
             } footer: {
                 Text("""
-                    Ollama has to listen on your network: on the Mac, run `launchctl setenv OLLAMA_HOST 0.0.0.0` \
-                    and restart Ollama. Port 11434 is assumed unless you add one.
+                    Ollama has to listen on your network: in Ollama's settings on the Mac, turn on \
+                    "Expose Ollama to the network". Port 11434 is assumed unless you add one.
                     """)
             }
 

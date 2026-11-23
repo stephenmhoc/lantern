@@ -270,7 +270,7 @@ struct ReadinessView: View {
         Task {
             let d = UserDefaults.standard
             let lanHost = MacLink.normalized(d.string(forKey: MacLink.lanKey) ?? MacLink.defaultLAN)
-            let tailHost = MacLink.normalized(d.string(forKey: MacLink.tailnetKey) ?? "")
+            let tailHost = MacLink.normalized(d.string(forKey: MacLink.tailnetKey) ?? MacLink.defaultTailnet)
             async let l = MacLink.tags(lanHost)
             async let t = MacLink.tags(tailHost)
             let (lr, tr) = await (l, t)

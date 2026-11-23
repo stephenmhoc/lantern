@@ -35,7 +35,9 @@ final class MacLink {
     /// The context Ollama is asked for (`options.num_ctx`); its own default is much smaller and
     /// silently drops the start of a long chat.
     static let contextKey = "mac.numCtx"
-    static let defaultLAN = "mac-studio.local", defaultContext = 16384
+    // The Mac Studio by its Bonjour and MagicDNS names, so a fresh install finds it with no setup.
+    static let defaultLAN = "Stephens-Mac-Studio.local", defaultTailnet = "stephens-mac-studio.tail7b6e2.ts.net"
+    static let defaultContext = 16384
 
     let tailnet = Tailnet()
     private(set) var route: Route = .unknown
@@ -55,7 +57,7 @@ final class MacLink {
     func resolve() async -> Route {
         route = .checking
         let lan = Self.normalized(defaults.string(forKey: Self.lanKey) ?? Self.defaultLAN)
-        let tail = Self.normalized(defaults.string(forKey: Self.tailnetKey) ?? "")
+        let tail = Self.normalized(defaults.string(forKey: Self.tailnetKey) ?? Self.defaultTailnet)
         async let tailTags = Self.tags(tail, session: tailnet.session ?? .shared)
         if let lan, let l = await Self.tags(lan) {
             route = .lan(lan)
