@@ -1,0 +1,81 @@
+name: Lantern
+options:
+  bundleIdPrefix: com.merimerimeri
+  deploymentTarget:
+    iOS: "18.1"  # TailscaleKit
+  createIntermediateGroups: true
+
+packages:
+  LlamaKit:
+    path: Packages/LlamaKit
+
+settings:
+  base:
+    DEVELOPMENT_TEAM: 8G4H6268W7
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+
+targets:
+  Lantern:
+    type: application
+    platform: iOS
+    # llama.xcframework ships no simulator slice, so Lantern builds for devices only.
+    supportedDestinations: [iOS]
+    sources:
+      - Lantern
+    dependencies:
+      - package: LlamaKit
+      - framework: Vendor/TailscaleKit.xcframework  # scripts/fetch-tailscale.sh
+        embed: true
+    entitlements:
+      path: Lantern/Lantern.entitlements
+      properties:
+        # Raise the per-app memory ceiling (and address space for mapping a 9-12 GB model).
+        com.apple.developer.kernel.increased-memory-limit: true
+        com.apple.developer.kernel.extended-virtual-addressing: true
+    info:
+      path: Lantern/Info.plist
+      properties:
+        CFBundleDisplayName: Lantern
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIRequiresFullScreen: false
+        UIApplicationSupportsIndirectInputEvents: true
+        ITSAppUsesNonExemptEncryption: false
+        # Models can be dropped in from Finder (cable) or the Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: Lantern talks to Ollama on your Mac over your home network.
+        NSAppTransportSecurity:
+          # Ollama speaks plain HTTP: allowed for .local names and IPs, and for tailnet names.
+          NSAllowsLocalNetworking: true
+          NSExceptionDomains:
+            ts.net:
+              NSIncludesSubdomains: true
+              NSExceptionAllowsInsecureHTTPLoads: true
+    postBuildScripts:
+      # Readiness shows when a TestFlight build stops launching: 90 days after this date.
+      - name: Stamp build date
+        basedOnDependencyAnalysis: false
+        inputFiles:
+          - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)  # so it runs after Xcode writes Info.plist
+        script: |
+          plutil -replace LanternBuildDate -date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+    settings:
+      base:
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

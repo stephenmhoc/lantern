@@ -1,0 +1,8 @@
+Models/
+build/
+*.xcodeproj/xcuserdata/
+Vendor/
+.DS_Store
+Lantern.xcodeproj/
+.build/
+.swiftpm/
