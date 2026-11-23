@@ -9,6 +9,10 @@ struct SettingsView: View {
     @AppStorage(MacLink.lanKey) private var lanHost = MacLink.defaultLAN
     @AppStorage(MacLink.tailnetKey) private var tailnetHost = ""
     @AppStorage(MacLink.modelKey) private var modelName = ""
+    /// The hosts last checked (or as Settings opened with), so only edits trigger a check.
+    @State private var openedWith: String?
+
+    private var hosts: String { "\(lanHost)\n\(tailnetHost)" }
 
     var body: some View {
         Form {
@@ -55,8 +59,16 @@ struct SettingsView: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
         }
-        .onChange(of: lanHost) { Task { await mac.resolve() } }
-        .onChange(of: tailnetHost) { Task { await mac.resolve() } }
+        // Checks the Mac once typing pauses, not on every keystroke: a new keystroke cancels the
+        // wait. Opening Settings doesn't check by itself.
+        .task(id: hosts) {
+            guard let opened = openedWith else { openedWith = hosts; return }
+            guard hosts != opened else { return }
+            openedWith = hosts
+            try? await Task.sleep(for: .milliseconds(700))
+            guard !Task.isCancelled else { return }
+            await mac.resolve()
+        }
     }
 }
 

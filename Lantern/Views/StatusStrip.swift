@@ -25,7 +25,7 @@ struct StatusStrip: View {
                     line(memory: false)
                     Label(primary, systemImage: conversation.mode.symbol).lineLimit(1)
                 }
-                .font(.caption2.monospacedDigit())
+                .font(.caption.monospacedDigit())  // caption2 was too faint to read at a glance
                 .foregroundStyle(.secondary)
                 .accessibilityElement(children: .ignore)
                 .accessibilityLabel(spoken)
