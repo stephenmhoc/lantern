@@ -83,16 +83,25 @@ struct ChatTemplate {
         }
     }
 
+    /// Replaced by an image's tokens when a prompt with images is tokenized (`mtmd_default_marker`).
+    static let mediaMarker = "<__media__>"
+
+    /// A turn's text with a media marker per image in front, as llama-server places them. A turn
+    /// without images is just its content, so text-only prompts are unchanged.
+    private func content(_ m: ChatMessage) -> String {
+        (m.images ?? []).map { _ in Self.mediaMarker + "\n" }.joined() + m.content
+    }
+
     private func inklingTurn(_ m: ChatMessage) -> String {
         switch m.role {
         case .system: "<|message_system|><|content_text|>\(m.content)<|end_message|>"
-        case .user: "<|message_user|><|content_text|>\(m.content)<|end_message|>"
+        case .user: "<|message_user|><|content_text|>\(content(m))<|end_message|>"
         case .assistant: "<|message_model|><|content_text|>\(m.content)<|end_message|>\(turnEnd)"
         }
     }
 
     private func gemmaTurn(_ m: ChatMessage) -> String {
-        "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(trim(m.content))<turn|>\n"
+        "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(trim(content(m)))<turn|>\n"
     }
 
     // Inkling 2: no assistant header at the end; the model opens its own message.

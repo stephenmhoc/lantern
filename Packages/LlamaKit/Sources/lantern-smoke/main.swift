@@ -3,6 +3,10 @@ import LlamaKit
 
 // swift run lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--template] [prompt]
 // swift run lantern-smoke <model.gguf> --convert [iq4_nl|q4_0]     (rewrites the file in place)
+// swift run lantern-smoke <model.gguf> --mmproj <mmproj.gguf> --image <file> [--lazy] [--f16]
+//
+// --image asks about an image, then a text follow-up, then a retry of the follow-up: the image must
+// be encoded once and its positions reused after that.
 //
 // Two turns, so the second shows whether the cache was extended. --stop also stops a reply after
 // 10 pieces first and checks the next generation still runs in full. --state checks saved state:
@@ -102,6 +106,36 @@ struct Reply {
 }
 
 let second = "Now say it in one short sentence. Use an emoji."
+
+func value(after flag: String) -> String? {
+    args.firstIndex(of: flag).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+}
+
+if let projector = value(after: "--mmproj"), let imagePath = value(after: "--image") {
+    let image = try Data(contentsOf: URL(fileURLWithPath: imagePath))
+    do {
+        let model = try load()
+        let start = Date()
+        try await model.loadVision(projector: projector)
+        print(String(format: "vision loaded in %.1fs, footprint %@", Date().timeIntervalSince(start), MemoryStats.gb(MemoryStats.footprintBytes)))
+        var history = [system, ChatMessage(role: .user, content: "What is in this picture? One sentence.", images: [image])]
+        print("> (image) \(history[1].content)")
+        let first = try await ask(model, history)
+        check("the image was read", first.stats.promptTokens > 100 && !first.text.isEmpty)
+        history.append(.init(role: .assistant, content: first.text))
+        history.append(.init(role: .user, content: "What colours stand out? Answer briefly."))
+        print("> \(history.last!.content)")
+        let next = try await ask(model, history)
+        check("the follow-up reused the image", next.stats.reusedTokens >= first.stats.promptTokens)
+        print("> (retry)")
+        let again = try await ask(model, history)
+        check("the retry reused the image", again.stats.reusedTokens >= first.stats.promptTokens)
+        print("> (no vision) counting")
+        let counted = await model.countTokens(history)
+        check("counting includes the image", counted >= first.stats.promptTokens - 20)
+    }
+    exit(0)
+}
 if args.contains("--state") {
     let checkpoint = URL.temporaryDirectory.appending(path: "lantern-smoke-\(getpid())")
     defer { try? FileManager.default.removeItem(at: checkpoint) }
