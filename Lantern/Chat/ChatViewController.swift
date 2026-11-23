@@ -98,6 +98,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         scrollToBottom(animated: false)
+        engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
     }
 
     private func host<V: View>(_ view: V) -> UIHostingController<some View> {

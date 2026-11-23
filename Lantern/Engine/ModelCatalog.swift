@@ -33,8 +33,10 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
     /// Device RAM this quant is meant for. Below it the model may still run, slowly.
     let minDeviceGB: Int
     let sampling: Sampling
-    /// Stream MoE experts from storage: the file is bigger than the app's memory limit.
-    let lazyExperts: Bool
+    /// How llama.cpp loads it: context length, KV cache type, lazy embedding tables.
+    let options: ModelOptions
+    /// The file has tensors Metal can't run (NVFP4), which `ModelStore.convert` rewrites after download.
+    let convertsForMetal: Bool
 
     static func == (a: Self, b: Self) -> Bool { a.id == b.id }
     func hash(into h: inout Hasher) { h.combine(id) }
@@ -49,7 +51,10 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
         url: URL(string: "\(hf)/unsloth/gemma-4-E2B-it-qat-GGUF/resolve/main/gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf")!,
         bytes: 2_620_370_976, tier: .fast, minDeviceGB: 6,
         sampling: Sampling(temperature: 1.0, topK: 64, topP: 0.95),  // Google's recommendation
-        lazyExperts: false
+        // Its cache is small, so F16 costs 70 MB and speeds up generation; its 1.2 GB per-layer
+        // embedding table is read row by row instead of being prefetched at load.
+        options: ModelOptions(lazyEmbeddings: true, f16Cache: true),
+        convertsForMetal: false
     )
 
     // Unsloth's Mainline_Support files: the inkling2_loop layout upstream llama.cpp reads.
@@ -63,7 +68,9 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
             url: URL(string: "\(hf)/unsloth/Inkling-2-Mini-GGUF/resolve/main/Mainline_Support/Inkling-2-Mini-UD-\(quant).gguf_file")!,
             bytes: bytes, tier: .smart, minDeviceGB: minGB,
             sampling: Sampling(temperature: 1.0),  // Thinking Machines: no truncation
-            lazyExperts: true
+            // Bigger than the app's memory limit: mmap alone pages its experts in from storage.
+            options: ModelOptions(),
+            convertsForMetal: true
         )
     }
 

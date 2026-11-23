@@ -94,6 +94,11 @@ struct ReadinessView: View {
                     Text("\(Int(p * 100))%").font(.caption.monospacedDigit())
                     Button("Cancel") { store.cancel(model) }
                 }
+            case .converting(let p):
+                HStack {
+                    ProgressView(value: p).accessibilityLabel("Making it faster")
+                    Text("Making it faster for this device · \(Int(p * 100))%").font(.caption.monospacedDigit())
+                }
             case .incomplete(let bytes):
                 Label("Incomplete: \(size(bytes)) of \(size(model.bytes)). If it's still copying, wait.",
                       systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
@@ -109,6 +114,14 @@ struct ReadinessView: View {
                     Spacer()
                     Button("Test") { test(model) }.disabled(engine.isBusy)
                     Button("Delete", role: .destructive) { deleting = model }.disabled(engine.isBusy)
+                }
+                if store.unconverted.contains(model.id) {
+                    HStack {
+                        Text(store.conversionErrors[model.id] ?? "Part of this model runs on the CPU. Converting it once makes it several times faster.")
+                            .font(.caption).foregroundStyle(store.conversionErrors[model.id] == nil ? Color.secondary : Color.orange)
+                        Spacer()
+                        Button("Make faster") { store.convert(model) }.disabled(engine.isBusy)
+                    }
                 }
             }
         }
