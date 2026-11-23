@@ -29,7 +29,7 @@ struct RootView: View {
     @AppStorage(DefaultMode.key) private var lastMode = ""
     @Environment(\.scenePhase) private var scenePhase
     @State private var window = WindowProbe()
-    private var router = SystemRouter.shared
+    private let router = SystemRouter.shared
 
     enum Sheet: String, Identifiable {
         case readiness, settings
