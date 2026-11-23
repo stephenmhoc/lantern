@@ -165,6 +165,16 @@ public final class LlamaModel: @unchecked Sendable {
 
     private static let backend: Void = llama_backend_init()
     private static let batchSize = 512
+    /// The performance cores, up to six. Each op is split evenly across the threads and waits for
+    /// the slowest, so a thread on an efficiency core holds the rest back.
+    private static let threadCount: Int32 = {
+        var cores: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        if sysctlbyname("hw.perflevel0.physicalcpu", &cores, &size, nil, 0) != 0 || cores < 1 {
+            cores = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount - 2))
+        }
+        return max(1, min(cores, 6))
+    }()
     /// Room kept free for the reply; a prompt that leaves less is treated as too long.
     private static let replyRoom = 1024
 
@@ -236,12 +246,17 @@ public final class LlamaModel: @unchecked Sendable {
         // A model that can't rewind has no use for sliding-window layers remembering more than
         // their window: on Inkling that is 550 MB less cache and a slightly faster prefill.
         cp.swa_full = canRewind
-        let threads = Int32(max(1, min(ProcessInfo.processInfo.activeProcessorCount - 2, 6)))
+        let threads = Self.threadCount
         cp.n_threads = threads
         cp.n_threads_batch = threads
         #if targetEnvironment(simulator)
         cp.offload_kqv = false
         cp.op_offload = false
+        #else
+        // With the experts left in CPU memory, offloading a prompt's expert matmuls to the GPU
+        // means copying the expert weights there for every batch, which needs gigabytes of GPU
+        // scratch on a device that kept them off the GPU for lack of room. Run them where they are.
+        if options.expertsOnCPU { cp.op_offload = false }
         #endif
         guard let ctx = llama_init_from_model(model, cp) else {
             llama_model_free(model)
