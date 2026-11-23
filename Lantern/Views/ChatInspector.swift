@@ -20,11 +20,16 @@ struct ChatInspector: View {
             }
 
             Section {
-                LabeledContent("Context used", value: "≈ \(contextTokens.formatted()) tokens")
+                if let usage = engine.contextUsage(for: conversation) {
+                    LabeledContent("Context used", value: "\(usage.used.formatted()) of \(usage.limit.formatted()) tokens")
+                    ProgressView(value: Double(usage.used), total: Double(max(usage.limit, 1)))
+                } else {
+                    LabeledContent("Context used", value: "≈ \(contextTokens.formatted()) tokens")
+                }
             } footer: {
-                // HOOK(engine): replace the estimate with the engine's real count (and the model's
-                // context size) once it exposes context usage.
-                Text("An estimate: about four characters to a token.")
+                if engine.contextUsage(for: conversation) == nil {
+                    Text("An estimate until the chat's next reply: about four characters to a token.")
+                }
             }
 
             Section("Last reply") {
@@ -52,13 +57,11 @@ struct ChatInspector: View {
     }
 
     private var contextTokens: Int {
-        let chars = Engine.systemPrompt().count + conversation.messages.reduce(0) { $0 + $1.content.count }
+        let chars = conversation.systemPrompt.count + conversation.messages.reduce(0) { $0 + $1.content.count }
         return chars / 4
     }
 
     /// Read from the last reply's footnote, e.g. "Gemma 4 E2B · 14.2 tok/s · 0.8 s to first token".
-    /// HOOK(engine): the footnote has no time to first token yet; any part containing "first token"
-    /// or "TTFT" with a number of seconds is picked up here.
     private var lastReply: (speed: String?, firstToken: String?) {
         guard let footnote = conversation.messages.last(where: { !$0.isUser && $0.footnote != nil })?.footnote else {
             return (nil, nil)

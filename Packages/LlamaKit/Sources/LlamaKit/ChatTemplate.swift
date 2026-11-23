@@ -62,14 +62,37 @@ struct ChatTemplate {
     }
 
     /// The text that follows a reply the model closed with `turnEnd` (not yet in the cache), through
-    /// the next generation prompt.
-    func renderContinuation(_ newUserTurns: [ChatMessage]) -> String {
+    /// the next generation prompt. The turns are rendered as a full render would: user turns, and on
+    /// a model that can't rewind, earlier replies (a stopped answer) as history.
+    func renderContinuation(_ turns: [ChatMessage]) -> String {
         switch format {
         case .inkling:
-            turnEnd + newUserTurns.map { "<|message_user|><|content_text|>\($0.content)<|end_message|>" }.joined()
+            turnEnd + turns.map(inklingTurn).joined()
         case .gemma4:
-            turnEnd + "\n" + newUserTurns.map { "<|turn>user\n\(trim($0.content))<turn|>\n" }.joined() + "<|turn>model\n"
+            turnEnd + "\n" + turns.map(gemmaTurn).joined() + "<|turn>model\n"
         }
+    }
+
+    /// The start of a full render up to the end of a leading system message: the part every chat
+    /// with the same system prompt shares. Nil if there's no system message.
+    func renderSystemPrefix(_ messages: [ChatMessage], thinking: Thinking) -> String? {
+        guard let system = messages.first, system.role == .system else { return nil }
+        switch format {
+        case .inkling: return inklingTurn(system)
+        case .gemma4: return "<bos><|turn>system\n" + (thinking != .off ? "<|think|>\n" : "") + trim(system.content) + "<turn|>\n"
+        }
+    }
+
+    private func inklingTurn(_ m: ChatMessage) -> String {
+        switch m.role {
+        case .system: "<|message_system|><|content_text|>\(m.content)<|end_message|>"
+        case .user: "<|message_user|><|content_text|>\(m.content)<|end_message|>"
+        case .assistant: "<|message_model|><|content_text|>\(m.content)<|end_message|>\(turnEnd)"
+        }
+    }
+
+    private func gemmaTurn(_ m: ChatMessage) -> String {
+        "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(trim(m.content))<turn|>\n"
     }
 
     // Inkling 2: no assistant header at the end; the model opens its own message.
@@ -82,11 +105,7 @@ struct ChatTemplate {
                 out += effort
                 effortEmitted = true
             }
-            switch m.role {
-            case .system: out += "<|message_system|><|content_text|>\(m.content)<|end_message|>"
-            case .user: out += "<|message_user|><|content_text|>\(m.content)<|end_message|>"
-            case .assistant: out += "<|message_model|><|content_text|>\(m.content)<|end_message|>\(turnEnd)"
-            }
+            out += inklingTurn(m)
         }
         return effortEmitted ? out : out + effort
     }
@@ -102,10 +121,7 @@ struct ChatTemplate {
             if thinking != .off { out += "<|think|>\n" }
             out += trim(system ?? "") + "<turn|>\n"
         }
-        for m in rest {
-            out += "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(trim(m.content))<turn|>\n"
-        }
-        return out + "<|turn>model\n"
+        return out + rest.map(gemmaTurn).joined() + "<|turn>model\n"
     }
 
     private func trim(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }

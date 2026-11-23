@@ -35,9 +35,18 @@ struct OpenSheetAction: Equatable {
     static func == (_: Self, _: Self) -> Bool { true }
 }
 
+/// Shows a chat in this window. Set by `RootView`; always equal, like `OpenSheetAction`.
+struct OpenChatAction: Equatable {
+    let action: (Conversation) -> Void
+    init(_ action: @escaping (Conversation) -> Void = { _ in }) { self.action = action }
+    func callAsFunction(_ c: Conversation) { action(c) }
+    static func == (_: Self, _: Self) -> Bool { true }
+}
+
 extension EnvironmentValues {
     @Entry var showReadiness = OpenSheetAction()
     @Entry var showSettings = OpenSheetAction()
+    @Entry var openChat = OpenChatAction()
 }
 
 extension FocusedValues {

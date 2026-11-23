@@ -81,21 +81,3 @@ struct PhaseClock {
         seconds < 60 ? "\(seconds) s" : "\(seconds / 60) min \(seconds % 60) s"
     }
 }
-
-/// What a failed reply's error is about, for the buttons under it.
-///
-/// Stopgap: read from the error's text until `StoredMessage` carries an error kind.
-enum ReplyErrorKind {
-    case notDownloaded, mac, other
-
-    init(error: String, mode: Mode) {
-        let e = error.lowercased()
-        if e.contains("readiness") || e.contains("model on this device") {
-            self = .notDownloaded
-        } else if mode == .mac || e.contains("ollama") || e.contains("the mac") {
-            self = .mac
-        } else {
-            self = .other
-        }
-    }
-}

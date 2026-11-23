@@ -32,7 +32,10 @@ final class MacLink {
 
     // Settings, edited with @AppStorage in SettingsView.
     static let lanKey = "mac.lan", tailnetKey = "mac.tailnet", modelKey = "mac.model"
-    static let defaultLAN = "mac-studio.local"
+    /// The context Ollama is asked for (`options.num_ctx`); its own default is much smaller and
+    /// silently drops the start of a long chat.
+    static let contextKey = "mac.numCtx"
+    static let defaultLAN = "mac-studio.local", defaultContext = 16384
 
     let tailnet = Tailnet()
     private(set) var route: Route = .unknown
@@ -40,6 +43,12 @@ final class MacLink {
 
     private var defaults: UserDefaults { .standard }
     var modelName: String { defaults.string(forKey: Self.modelKey) ?? "" }
+    var contextLength: Int {
+        let n = defaults.integer(forKey: Self.contextKey)
+        return n > 0 ? n : Self.defaultContext
+    }
+    /// Models Ollama refused `think` for; they're asked without it from then on.
+    @ObservationIgnored private var cannotThink: Set<String> = []
 
     /// Uses the home network if it answers; only then waits on the tailnet.
     @discardableResult
@@ -126,17 +135,30 @@ final class MacLink {
         var request = URLRequest(url: url, timeoutInterval: 120)  // between bytes, not overall
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let model = modelName
+        // Sent even when off, or a thinking model thinks anyway; left out for models that reject it.
+        let think: Bool? = cannotThink.contains(model) ? nil : thinking != .off
         request.httpBody = try JSONEncoder().encode(ChatRequest(
-            model: modelName,
+            model: model,
             messages: messages.map { .init(role: $0.role.rawValue, content: $0.content) },
             stream: true,
-            think: thinking != .off
+            think: think,
+            options: .init(num_ctx: contextLength)
         ))
         do {
             let session: URLSession = if case .tailnet = route { tailnet.session ?? .shared } else { .shared }
             let (bytes, response) = try await session.bytes(for: request)
             guard let code = (response as? HTTPURLResponse)?.statusCode, code == 200 else {
-                throw MacError.http((response as? HTTPURLResponse)?.statusCode ?? 0)
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                // Ollama explains itself in a small JSON body.
+                var body = Data()
+                for try await byte in bytes.prefix(4096) { body.append(byte) }
+                let message = (try? JSONDecoder().decode(ChatChunk.self, from: body))?.error
+                if code == 400, think != nil, message?.localizedCaseInsensitiveContains("think") == true {
+                    cannotThink.insert(model)  // not a thinking model: ask again without it, once
+                    return try await open(messages, thinking: thinking, retry: retry)
+                }
+                throw MacError.http(code, model: model, message: message)
             }
             return (bytes, response)
         } catch let error as URLError where error.code != .cancelled && retry {
@@ -152,10 +174,12 @@ final class MacLink {
 
     private struct ChatRequest: Encodable {
         struct Message: Encodable { let role: String; let content: String }
+        struct Options: Encodable { let num_ctx: Int }
         let model: String
         let messages: [Message]
         let stream: Bool
-        let think: Bool
+        let think: Bool?  // left out when nil
+        let options: Options
     }
 
     private struct ChatChunk: Decodable {
@@ -171,13 +195,29 @@ final class MacLink {
 }
 
 nonisolated enum MacError: LocalizedError {
-    case unreachable, noModel, http(Int), ollama(String)
+    case unreachable, noModel, http(Int, model: String, message: String?), ollama(String)
+
     var errorDescription: String? {
         switch self {
         case .unreachable: "Can't reach Ollama on the Mac over the home network or the tailnet."
         case .noModel: "Ollama on the Mac has no models."
-        case .http(let code): "Ollama answered with HTTP \(code)."
+        case .http(404, let model, _):
+            "The Mac doesn't have the model \(model) any more. Pick another in Settings, or pull it in Ollama."
+        case .http(400, _, let message): "Ollama couldn't use this request: \(message ?? "bad request")."
+        case .http(401, _, _), .http(403, _, _): "Ollama on the Mac refused the connection. Check that it allows this device."
+        case .http(429, _, _), .http(503, _, _): "Ollama on the Mac is busy. Try again in a moment."
+        case .http(let code, let model, let message) where code >= 500:
+            "Ollama on the Mac failed to run \(model)\(message.map { ": \($0)" } ?? " (HTTP \(code))"). It may be out of memory."
+        case .http(let code, _, let message): "Ollama answered with HTTP \(code)\(message.map { ": \($0)" } ?? "")."
         case .ollama(let message): "Ollama: \(message)"
+        }
+    }
+
+    var kind: ReplyErrorKind {
+        switch self {
+        case .unreachable: .macUnreachable
+        case .noModel, .http(404, _, _): .macNoModel
+        case .http, .ollama: .macFailed
         }
     }
 }

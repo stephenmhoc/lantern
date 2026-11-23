@@ -65,13 +65,13 @@ struct RootView: View {
         }
         .environment(\.showReadiness, OpenSheetAction { sheet = .readiness })
         .environment(\.showSettings, OpenSheetAction { sheet = .settings })
+        .environment(\.openChat, OpenChatAction { selection = $0 })
         .focusedSceneValue(\.sceneActions, actions)
         .onAppear(perform: restoreSelection)
         .onChange(of: selection) { _, c in
             // A new chat's identifier is temporary until it's saved; newChat() saves first.
             storedSelection = c?.persistentModelID.stored
-            // HOOK(engine): once Engine.prepare(mode:for:) exists, warm the chat's model here:
-            // if let c { engine.prepare(mode: c.mode, for: c) }
+            // The chat screen warms its model when it appears (Engine.prepare).
         }
         .onChange(of: conversations) {
             // Deleted in another window: don't keep showing a chat that's gone.
@@ -322,8 +322,7 @@ struct RootView: View {
 
     private func delete(_ c: Conversation) {
         if engine.running == c.persistentModelID { engine.stop() }
-        // HOOK(engine): once Engine.forgetState(for:) exists, drop the chat's cached KV state:
-        // engine.forgetState(for: c)
+        engine.forgetState(for: c)  // its saved model state in Caches/kv
         if selection == c {
             // iPad moves to the next chat; iPhone goes back to the list.
             let list = ordered

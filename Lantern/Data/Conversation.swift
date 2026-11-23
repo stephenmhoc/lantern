@@ -16,13 +16,28 @@ final class Conversation {
     var messages: [StoredMessage] = []
     /// What's typed in the message box but not sent, kept when switching chats.
     var draft: String = ""
+    /// Fixed when the chat is created, date included. The models' caches and saved states start
+    /// with it, so a prompt that changed at midnight would mean reading the whole chat again.
+    /// Empty in chats from before this existed: `Engine` fills it in from `created` on first use.
+    var systemPrompt: String = ""
+    /// Names this chat's saved model state in Caches/kv. Empty until first needed.
+    var stateID: String = ""
+    /// Messages before this index are no longer sent to the model: dropped to fit its context.
+    var historyStart: Int = 0
+    /// The context the last reply left in use, and the model's limit, for showing how full the chat is.
+    var tokensUsed: Int = 0
+    var tokenLimit: Int = 0
 
-    init(mode: Mode) { self.mode = mode }
+    init(mode: Mode) {
+        self.mode = mode
+        self.systemPrompt = Engine.systemPrompt()
+        self.stateID = UUID().uuidString
+    }
 
     /// What the model sees before message `index`: user turns and answers, including a stopped
-    /// answer's partial text, but not failed or empty replies.
+    /// answer's partial text, but not failed or empty replies, nor turns dropped to fit the context.
     func history(before index: Int) -> [ChatMessage] {
-        messages[..<index].compactMap { m in
+        messages[min(historyStart, index)..<index].compactMap { m in
             guard m.error == nil, !m.content.isEmpty else { return nil }
             return ChatMessage(role: m.isUser ? .user : .assistant, content: m.content)
         }
@@ -42,6 +57,11 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     /// False until a reply ends (finished, stopped or failed). A reply still false when nothing is
     /// generating was cut off by the app being killed.
     var finished = true
+    /// What kind of failure `error` describes, for offering the right way out.
+    var errorKind: ReplyErrorKind?
+    /// Set when a reply was cut short by a limit rather than ended by the model or the user:
+    /// `.maxTokens` (the reply-length limit) or `.contextFull` (the chat filled the context).
+    var cutOff: StopReason?
     /// The other answers to the same question (from Retry), oldest first. Optional so messages saved
     /// before it existed still decode.
     var versions: [ReplyVersion]?
@@ -89,4 +109,24 @@ struct ReplyVersion: Codable, Hashable {
         error = m.error
         thoughtSeconds = m.thoughtSeconds
     }
+}
+
+/// What went wrong with a reply, so the chat can offer something better than the message alone.
+nonisolated enum ReplyErrorKind: String, Codable, Sendable {
+    /// The mode's model isn't on this device: offer Readiness.
+    case notDownloaded
+    /// The model file is being converted: try again shortly.
+    case modelBusy
+    /// The model couldn't be loaded (usually memory).
+    case loadFailed
+    /// The chat no longer fits the model's context: offer `Engine.continueTrimmed(in:)` or
+    /// `Engine.continueInNewChat(from:)`.
+    case contextFull
+    /// Ollama on the Mac didn't answer on either route: offer Fast or Smart.
+    case macUnreachable
+    /// Ollama answered but has no usable model (none at all, or the chosen one is gone).
+    case macNoModel
+    /// Ollama answered with an error.
+    case macFailed
+    case other
 }

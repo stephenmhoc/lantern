@@ -17,6 +17,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     var onOpenReadiness: (() -> Void)?
     /// Opens Settings, where the Mac's address is. "Check the Mac" opens it if the Mac still can't be reached.
     var onOpenSettings: (() -> Void)?
+    /// Shows another chat in this window ("Continue in New Chat").
+    var onOpenChat: ((Conversation) -> Void)?
     /// Called when typing starts in a chat whose model isn't loaded (or whose Mac route isn't known),
     /// to get it ready before Send. Must return at once (e.g. start `Engine.prepare` in a Task).
     var onBeginTyping: (() -> Void)?
@@ -131,6 +133,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         scrollToBottom(animated: false)
         // Ready to type on iPad and Mac; on iPhone the keyboard would cover a chat you came to read.
         if traitCollection.userInterfaceIdiom != .phone { composer.textView.becomeFirstResponder() }
+        engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -488,7 +491,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     /// Retry, plus a way to fix the cause: Readiness for a missing model, a fresh look for the Mac.
     private func errorActions(for m: StoredMessage) -> [UIAction] {
-        guard let error = m.error, !m.isUser else { return [] }
+        guard m.error != nil, !m.isUser else { return [] }
         var actions: [UIAction] = []
         if isLast(m.id) {
             actions.append(UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise"),
@@ -496,16 +499,28 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                 retry(conversation.mode)
             })
         }
-        switch ReplyErrorKind(error: error, mode: conversation.mode) {
+        // Replies saved before errors had a kind fall back to the mode.
+        let kind = m.errorKind ?? (conversation.mode == .mac ? .macUnreachable : .other)
+        switch kind {
         case .notDownloaded:
             if let open = onOpenReadiness {
                 actions.append(UIAction(title: "Open Readiness", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
             }
-        case .mac:
+        case .macUnreachable, .macNoModel, .macFailed:
             actions.append(UIAction(title: "Check the Mac", image: UIImage(systemName: "desktopcomputer")) {
                 [unowned self] _ in checkMac()
             })
-        case .other:
+        case .contextFull where isLast(m.id):
+            actions.append(UIAction(title: "Drop Oldest Messages and Continue", image: UIImage(systemName: "scissors"),
+                                    attributes: engine.isBusy ? .disabled : []) { [unowned self] _ in
+                engine.continueTrimmed(in: conversation)
+            })
+            if let open = onOpenChat {
+                actions.append(UIAction(title: "Continue in New Chat", image: UIImage(systemName: "square.and.pencil")) {
+                    [unowned self] _ in open(engine.continueInNewChat(from: conversation))
+                })
+            }
+        default:
             break
         }
         return actions
@@ -632,9 +647,10 @@ struct ChatScreen: View {
     @SceneStorage("inspector") private var showInspector = false
     @Environment(\.showReadiness) private var showReadiness
     @Environment(\.showSettings) private var showSettings
+    @Environment(\.openChat) private var openChat
 
     var body: some View {
-        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness, showSettings: showSettings)
+        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness, showSettings: showSettings, openChat: openChat)
             .ignoresSafeArea(.keyboard)  // the UIKit side follows the keyboard itself
             .safeAreaInset(edge: .top, spacing: 0) { BusyBanner(conversation: conversation) }
             .navigationTitle(title)
@@ -736,12 +752,14 @@ private struct ChatControllerView: UIViewControllerRepresentable {
     let revision: Int
     let showReadiness: OpenSheetAction
     let showSettings: OpenSheetAction
+    let openChat: OpenChatAction
 
     func makeUIViewController(context: Context) -> ChatViewController {
         let controller = ChatViewController(conversation: conversation, engine: engine)
         controller.onOpenReadiness = { showReadiness() }
         controller.onOpenSettings = { showSettings() }
-        // HOOK(engine): controller.onBeginTyping = { Task { await engine.prepare(mode: conversation.mode, for: conversation) } }
+        controller.onOpenChat = { openChat($0) }
+        controller.onBeginTyping = { [conversation, engine] in engine.prepare(mode: conversation.mode, for: conversation) }
         return controller
     }
 

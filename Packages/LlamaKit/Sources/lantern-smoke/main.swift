@@ -1,37 +1,82 @@
 import Foundation
 import LlamaKit
 
-// swift run lantern-smoke <model.gguf> [--lazy] [--think] [--stop] [--template] [prompt]
+// swift run lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--template] [prompt]
+// swift run lantern-smoke <model.gguf> --convert [iq4_nl|q4_0]     (rewrites the file in place)
+//
 // Two turns, so the second shows whether the cache was extended. --stop also stops a reply after
-// 10 pieces first and checks the next generation still runs in full.
-var args = Array(CommandLine.arguments.dropFirst())
-guard let path = args.first else {
-    print("usage: lantern-smoke <model.gguf> [--lazy] [--think] [--stop] [--template] [prompt]")
+// 10 pieces first and checks the next generation still runs in full. --state checks saved state:
+// the second turn is repeated after reloading the model from the first turn's checkpoint and must
+// match byte for byte, then after a stopped reply and as a retry, which must not re-read the chat.
+let args = Array(CommandLine.arguments.dropFirst().dropFirst())
+guard CommandLine.arguments.count > 1 else {
+    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--template] [prompt]")
+    print("       lantern-smoke <model.gguf> --convert [iq4_nl|q4_0]")
     exit(2)
 }
-args.removeFirst()
+let path = CommandLine.arguments[1]
 if args.contains("--template") {
     print(LlamaModel.rawTemplate(path: path) ?? "(no template)")
     exit(0)
 }
+if args.contains("--convert") {
+    let target = args.compactMap(MetalConverter.Target.init(rawValue:)).first ?? .iq4NL
+    guard let before = MetalConverter.inspect(path: path) else {
+        print("can't read \(path)")
+        exit(1)
+    }
+    print("\(before.unsupported) tensors Metal can't run, converted marker: \(before.converted)")
+    do {
+        let report = try MetalConverter.convert(path: path, target: target, progress: { p in
+            if Int(p * 1000) % 100 == 0 { print(String(format: "[%.0f%%]", p * 100), terminator: ""); fflush(stdout) }
+        })
+        print(String(format: "\nconverted %d tensors to %@ in %.1fs, relative RMS error %.4f, file is now %lld bytes",
+                     report.converted, target.rawValue, report.seconds, report.relativeError, report.bytes))
+        let after = MetalConverter.inspect(path: path)
+        print("now \(after?.unsupported ?? -1) tensors Metal can't run, converted marker: \(after?.converted ?? false)")
+        exit(after?.unsupported == 0 ? 0 : 1)
+    } catch {
+        print("failed: \(error.localizedDescription)")
+        exit(1)
+    }
+}
 let firstPrompt = args.first { !$0.hasPrefix("--") } ?? "In two sentences: how do I purify water if the power is out?"
 let thinking: Thinking = args.contains("--think") ? .low : .off
+let options = ModelOptions(lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"))
+let system = ChatMessage(role: .system, content: "You are Lantern, a helpful assistant. This conversation began on Sunday, November 22, 2026.")
 
-/// Returns the answer text; stops reading after `stopAfter` pieces if given.
-func ask(_ model: LlamaModel, _ history: [ChatMessage], stopAfter: Int? = nil) async throws -> String {
-    var reply = ""
+struct Reply {
+    var text = ""
+    var thinking = ""
+    var stats = GenerationStats()
+    var firstToken = 0.0
+}
+
+/// Returns the answer; stops reading after `stopAfter` pieces if given.
+@MainActor func ask(
+    _ model: LlamaModel, _ history: [ChatMessage], stopAfter: Int? = nil, checkpoint: URL? = nil, quiet: Bool = false
+) async throws -> Reply {
+    var reply = Reply()
     var pieces = 0
-    for try await event in model.generate(history, sampling: Sampling(temperature: 0), thinking: thinking, maxTokens: 1500) {
+    let start = Date()
+    for try await event in model.generate(
+        history, sampling: Sampling(temperature: 0), thinking: thinking, maxTokens: 1500, checkpoint: checkpoint)
+    {
         switch event {
-        case .reading(let p): print(String(format: "[reading %.0f%%]", p * 100), terminator: "")
-        case .thinking(let t): print("\u{1B}[2m\(t)\u{1B}[0m", terminator: "")
+        case .reading(let p): if !quiet { print(String(format: "[reading %.0f%%]", p * 100), terminator: "") }
+        case .thinking(let t):
+            if reply.firstToken == 0 { reply.firstToken = Date().timeIntervalSince(start) }
+            if !quiet { print("\u{1B}[2m\(t)\u{1B}[0m", terminator: "") }
+            reply.thinking += t
         case .text(let t):
-            print(t, terminator: "")
-            reply += t
+            if reply.firstToken == 0 { reply.firstToken = Date().timeIntervalSince(start) }
+            if !quiet { print(t, terminator: "") }
+            reply.text += t
         case .done(let s):
-            print(String(format: "\n[%d prompt tokens (%d reused) in %.2fs; %d tokens at %.1f tok/s; footprint %@]",
-                         s.promptTokens, s.reusedTokens, s.promptSeconds, s.generatedTokens, s.tokensPerSecond,
-                         MemoryStats.gb(MemoryStats.footprintBytes)))
+            reply.stats = s
+            print(String(format: "%@[%d prompt tokens (%d reused%@) first token %.2fs; %d tokens at %.1f tok/s, %@; footprint %@]",
+                         quiet ? "" : "\n", s.promptTokens, s.reusedTokens, s.restored ? ", restored" : "", reply.firstToken,
+                         s.generatedTokens, s.tokensPerSecond, s.stopReason.rawValue, MemoryStats.gb(MemoryStats.footprintBytes)))
         }
         fflush(stdout)
         pieces += 1
@@ -43,21 +88,87 @@ func ask(_ model: LlamaModel, _ history: [ChatMessage], stopAfter: Int? = nil) a
     return reply
 }
 
+@MainActor func load() throws -> LlamaModel {
+    let start = Date()
+    let model = try LlamaModel(path: path, options: options)
+    print("loaded \(MemoryStats.gb(model.sizeBytes)) in \(String(format: "%.1f", Date().timeIntervalSince(start)))s,",
+          "template: \(model.templateName), can rewind: \(model.canRewind), footprint \(MemoryStats.gb(MemoryStats.footprintBytes))")
+    return model
+}
+
+@MainActor func check(_ what: String, _ ok: Bool) {
+    print("\(ok ? "PASS" : "FAIL"): \(what)")
+    if !ok { exit(1) }
+}
+
+let second = "Now say it in one short sentence. Use an emoji."
+if args.contains("--state") {
+    let checkpoint = URL.temporaryDirectory.appending(path: "lantern-smoke-\(getpid())")
+    defer { try? FileManager.default.removeItem(at: checkpoint) }
+    var history = [system, ChatMessage(role: .user, content: firstPrompt)]
+    var expected = Reply()
+    var firstReply = Reply()
+    do {
+        let model = try load()
+        await model.prepare([system], thinking: thinking, checkpoint: checkpoint)
+        print("\n> \(firstPrompt)")
+        firstReply = try await ask(model, history, checkpoint: checkpoint, quiet: true)
+        check("first turn continued the primed system prompt", firstReply.stats.reusedTokens > 0)
+        history.append(.init(role: .assistant, content: firstReply.text))
+        print("> \(second)")
+        expected = try await ask(model, history + [.init(role: .user, content: second)], checkpoint: checkpoint, quiet: true)
+        if !(model.canRewind && thinking != .off) {  // Gemma re-renders with thinking on
+            check("second turn appended", expected.stats.reusedTokens > firstReply.stats.promptTokens)
+        }
+    }
+    do {
+        // A fresh load, as after the app was closed: the chat is reopened from the second turn's
+        // checkpoint, then retried from the first turn's.
+        let model = try load()
+        if model.canRewind && thinking != .off {
+            print("(this model re-renders with thinking on, so nothing is saved for it)")
+        } else {
+            let full = history + [.init(role: .user, content: second), .init(role: .assistant, content: expected.text)]
+            await model.prepare(full, thinking: thinking, checkpoint: checkpoint)
+            check("reopening the chat loaded its state", model.tokensInContext > 0)
+            print("> (retry) \(second)")
+            let retried = try await ask(model, history + [.init(role: .user, content: second)], checkpoint: checkpoint, quiet: true)
+            check("retry didn't re-read the chat", retried.stats.reusedTokens > firstReply.stats.promptTokens)
+            if !model.canRewind {
+                check("retry restored the turn before", retried.stats.restored)
+                check("retry after restore is byte-identical", retried.text == expected.text && retried.thinking == expected.thinking)
+            }
+            print("> (stopped, then) Thanks. And in French?")
+            let stopped = try await ask(model, history + [.init(role: .user, content: "Count slowly from 1 to 50.")],
+                                        stopAfter: 6, checkpoint: checkpoint, quiet: true)
+            var after = history + [.init(role: .user, content: "Count slowly from 1 to 50.")]
+            if !stopped.text.isEmpty { after.append(.init(role: .assistant, content: stopped.text)) }
+            after.append(.init(role: .user, content: "Thanks. Now the water answer again, in French."))
+            let next = try await ask(model, after, checkpoint: checkpoint, quiet: true)
+            check("a message after a stopped reply didn't re-read the chat", next.stats.reusedTokens >= firstReply.stats.promptTokens)
+            print("> (new chat) What is 17 * 23?")
+            // The first chat started from nothing snapshots the system prompt (a model that can
+            // rewind just keeps the shared prefix); the next one starts from it.
+            _ = try await ask(model, [system, .init(role: .user, content: "What is 17 * 23? Answer briefly.")], quiet: true)
+            print("> (another new chat) Name a primary colour.")
+            let other = try await ask(model, [system, .init(role: .user, content: "Name a primary colour.")], quiet: true)
+            check("a new chat reused the system prompt", other.stats.reusedTokens > 0)
+        }
+    }
+    exit(0)
+}
+
 // Scoped so the model is freed before exit; llama.cpp's Metal teardown asserts on live resources.
 do {
-    let loadStart = Date()
-    let model = try LlamaModel(path: path, lazyExperts: args.contains("--lazy"))
-    print("loaded \(MemoryStats.gb(model.sizeBytes)) in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s,",
-          "template: \(model.templateName), footprint \(MemoryStats.gb(MemoryStats.footprintBytes))")
-
+    let model = try load()
     if args.contains("--stop") {
         print("\n> (stopping after 10 pieces) \(firstPrompt)")
         _ = try await ask(model, [.init(role: .user, content: firstPrompt)], stopAfter: 10)
     }
     var history: [ChatMessage] = []
-    for prompt in [firstPrompt, "Now say it in one short sentence. Use an emoji."] {
+    for prompt in [firstPrompt, second] {
         print("\n> \(prompt)")
         history.append(.init(role: .user, content: prompt))
-        history.append(.init(role: .assistant, content: try await ask(model, history)))
+        history.append(.init(role: .assistant, content: try await ask(model, history).text))
     }
 }
