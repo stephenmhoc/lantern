@@ -2,6 +2,7 @@ import CoreSpotlight
 import LlamaKit
 import SwiftData
 import SwiftUI
+import UIKit
 
 /// One window: the chats in a sidebar and the selected chat. Each window keeps its own selection
 /// (restored with `@SceneStorage`); all of them share the app's one `Engine`.
@@ -52,6 +53,10 @@ struct RootView: View {
                         if !Task.isCancelled { withAnimation { self.deleted = nil } }
                     }
             }
+        }
+        .onChange(of: sheet) { _, shown in
+            // The message box keeps focus behind a sheet, and its keyboard would cover the sheet.
+            if shown != nil { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
         }
         .sheet(item: $sheet) { sheet in
             NavigationStack {

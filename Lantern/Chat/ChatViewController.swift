@@ -152,7 +152,10 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         super.viewDidAppear(animated)
         scrollToBottom(animated: false)
         // Ready to type on iPad and Mac; on iPhone the keyboard would cover a chat you came to read.
-        if traitCollection.userInterfaceIdiom != .phone { composer.textView.becomeFirstResponder() }
+        // Not behind a sheet (Settings, Readiness), whose keyboard-covered content would be hidden.
+        if traitCollection.userInterfaceIdiom != .phone, view.window?.rootViewController?.presentedViewController == nil {
+            composer.textView.becomeFirstResponder()
+        }
         engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
     }
 
@@ -792,7 +795,10 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
 
     private func append(_ attachments: [Attachment]) {
         composer.attachments += attachments
-        if traitCollection.userInterfaceIdiom != .phone { composer.textView.becomeFirstResponder() }
+        // Not behind a sheet (Settings, Readiness), whose keyboard-covered content would be hidden.
+        if traitCollection.userInterfaceIdiom != .phone, view.window?.rootViewController?.presentedViewController == nil {
+            composer.textView.becomeFirstResponder()
+        }
     }
 
     fileprivate func showProblem(_ message: String, settings: Bool = false) {

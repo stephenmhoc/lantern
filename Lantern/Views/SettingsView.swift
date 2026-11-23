@@ -43,6 +43,17 @@ struct SettingsView: View {
 
             TailnetSection(tailnet: mac.tailnet, host: $tailnetHost, openURL: openURL)
 
+            Section {
+                Text(Engine.systemPrompt())
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } header: {
+                Text("System prompt")
+            } footer: {
+                Text("What every model is told at the start of a new chat. Each chat keeps the prompt it started with.")
+            }
+
             Section("This device") {
                 LabeledContent("Memory", value: MemoryStats.gb(MemoryStats.deviceBytes))
                 LabeledContent("Lantern is using", value: MemoryStats.gb(MemoryStats.footprintBytes))
