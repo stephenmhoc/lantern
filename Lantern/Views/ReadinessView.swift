@@ -35,7 +35,7 @@ struct ReadinessView: View {
             }
 
             Section {
-                ForEach(CatalogModel.all) { row($0) }
+                ForEach(CatalogModel.files) { row($0) }
             } header: {
                 Text("On this device")
             } footer: {
@@ -144,7 +144,7 @@ struct ReadinessView: View {
         let state = store.states[model.id] ?? .missing
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Label(model.name, systemImage: model.tier.symbol).font(.headline)
+                Label(model.name, systemImage: model.isExtra ? "photo" : model.tier.symbol).font(.headline)
                 if CatalogModel.preferred(for: model.tier, downloaded: []) == model {
                     Text("Best fit").font(.caption).padding(.horizontal, 6).background(.tint.opacity(0.2), in: .capsule)
                 }
@@ -179,7 +179,7 @@ struct ReadinessView: View {
                 HStack {
                     testResult(model)
                     Spacer()
-                    Button("Test") { test(model) }.disabled(engine.isBusy)
+                    if !model.isExtra { Button("Test") { test(model) }.disabled(engine.isBusy) }
                     Button("Delete", role: .destructive) { deleting = model }.disabled(engine.isBusy)
                 }
                 if store.unconverted.contains(model.id) {

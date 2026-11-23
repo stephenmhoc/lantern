@@ -51,6 +51,8 @@ final class MacLink {
     }
     /// Models Ollama refused `think` for; they're asked without it from then on.
     @ObservationIgnored private var cannotThink: Set<String> = []
+    /// Whether each model has Ollama's "vision" capability, once asked (`/api/show`).
+    @ObservationIgnored private var vision: [String: Bool] = [:]
 
     /// Uses the home network if it answers; only then waits on the tailnet.
     @discardableResult
@@ -99,6 +101,13 @@ final class MacLink {
     /// dropped) gets one fresh check and retry before giving up.
     func stream(_ messages: [ChatMessage], thinking: Thinking) async throws -> AsyncThrowingStream<Generation, Error> {
         if route.host == nil { await resolve() }
+        var messages = messages
+        // Images go in each message's `images`, for a model that can see. One that can't is sent
+        // the text alone, unless the question itself is about an image.
+        if messages.contains(where: \.hasImages), await !canSee(modelName) {
+            if messages.last?.hasImages == true { throw MacError.noVision(modelName) }
+            messages = messages.map(\.withoutImages)
+        }
         let (bytes, _) = try await open(messages, thinking: thinking, retry: true)
         return AsyncThrowingStream { continuation in
             let task = Task {
@@ -129,6 +138,23 @@ final class MacLink {
         }
     }
 
+    /// Asks Ollama whether a model has vision. A model it can't describe counts as without.
+    func canSee(_ model: String) async -> Bool {
+        if let known = vision[model] { return known }
+        guard let host = route.host, let url = URL(string: "http://\(host)/api/show") else { return false }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(["model": model])
+        let session: URLSession = if case .tailnet = route { tailnet.session ?? .shared } else { .shared }
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let info = try? JSONDecoder().decode(ShowResponse.self, from: data) else { return false }
+        let sees = info.capabilities?.contains("vision") == true
+        vision[model] = sees
+        return sees
+    }
+
     private func open(
         _ messages: [ChatMessage], thinking: Thinking, retry: Bool
     ) async throws -> (URLSession.AsyncBytes, URLResponse) {
@@ -142,7 +168,9 @@ final class MacLink {
         let think: Bool? = cannotThink.contains(model) ? nil : thinking != .off
         request.httpBody = try JSONEncoder().encode(ChatRequest(
             model: model,
-            messages: messages.map { .init(role: $0.role.rawValue, content: $0.content) },
+            messages: messages.map {
+                .init(role: $0.role.rawValue, content: $0.content, images: $0.images?.map { $0.base64EncodedString() })
+            },
             stream: true,
             think: think,
             options: .init(num_ctx: contextLength)
@@ -175,7 +203,7 @@ final class MacLink {
     }
 
     private struct ChatRequest: Encodable {
-        struct Message: Encodable { let role: String; let content: String }
+        struct Message: Encodable { let role: String; let content: String; let images: [String]? }
         struct Options: Encodable { let num_ctx: Int }
         let model: String
         let messages: [Message]
@@ -183,6 +211,8 @@ final class MacLink {
         let think: Bool?  // left out when nil
         let options: Options
     }
+
+    private struct ShowResponse: Decodable { let capabilities: [String]? }
 
     private struct ChatChunk: Decodable {
         struct Message: Decodable { let content: String?; let thinking: String? }
@@ -197,7 +227,7 @@ final class MacLink {
 }
 
 nonisolated enum MacError: LocalizedError {
-    case unreachable, noModel, http(Int, model: String, message: String?), ollama(String)
+    case unreachable, noModel, http(Int, model: String, message: String?), ollama(String), noVision(String)
 
     var errorDescription: String? {
         switch self {
@@ -212,6 +242,7 @@ nonisolated enum MacError: LocalizedError {
             "Ollama on the Mac failed to run \(model)\(message.map { ": \($0)" } ?? " (HTTP \(code))"). It may be out of memory."
         case .http(let code, _, let message): "Ollama answered with HTTP \(code)\(message.map { ": \($0)" } ?? "")."
         case .ollama(let message): "Ollama: \(message)"
+        case .noVision(let model): "\(model) on the Mac can't see images. Pick a vision model in Settings, or use Fast."
         }
     }
 
@@ -219,7 +250,7 @@ nonisolated enum MacError: LocalizedError {
         switch self {
         case .unreachable: .macUnreachable
         case .noModel, .http(404, _, _): .macNoModel
-        case .http, .ollama: .macFailed
+        case .http, .ollama, .noVision: .macFailed
         }
     }
 }

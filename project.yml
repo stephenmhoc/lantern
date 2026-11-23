@@ -70,6 +70,12 @@ targets:
             UTTypeTagSpecification:
               public.filename-extension: [md, markdown]
         NSLocalNetworkUsageDescription: Lantern talks to Ollama on your Mac over your home network.
+        # Dictation in the message box, recognized on this device only.
+        NSMicrophoneUsageDescription: Lantern listens when you tap the microphone, to type what you say.
+        NSSpeechRecognitionUsageDescription: Lantern turns what you say into text on this device. Nothing is sent anywhere.
+        # iOS 26: a reply keeps going after you leave the app (BGContinuedProcessingTask, Engine).
+        BGTaskSchedulerPermittedIdentifiers:
+          - com.merimerimeri.Lantern.reply.*
         NSAppTransportSecurity:
           # Ollama speaks plain HTTP: allowed for .local names and IPs, and for tailnet names.
           NSAllowsLocalNetworking: true

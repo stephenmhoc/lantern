@@ -1,7 +1,9 @@
 import LlamaKit
+import PhotosUI
 import SwiftData
 import SwiftUI
 import UIKit
+import UniformTypeIdentifiers
 
 /// The chat: a UIKit transcript and message box, hosted in SwiftUI's split view. UIKit because this
 /// is where the work is: streaming text into a cell without reloading it, selectable answers with
@@ -40,6 +42,10 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     /// The sent message being edited in the composer (Edit & Resend), and the draft it replaced.
     private var editingID: UUID?
     private var draftBeforeEdit = ""
+    private var attachmentsBeforeEdit: [Attachment] = []
+    private let dictation = Dictation()
+    /// What was in the field when dictation started; what's heard goes after it.
+    private var dictationPrefix = ""
     private var draftSave: Task<Void, Never>?
     private var wasTyping = false
 
@@ -51,18 +57,27 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// The widest the transcript's text gets.
+    static let maxTextWidth: CGFloat = 688
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
 
-        // Messages keep to the readable width: about 700 points, centered, on iPad; the standard
-        // margins on iPhone. Cells add no side margins of their own.
-        let size = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(80))
-        let group = NSCollectionLayoutGroup.vertical(layoutSize: size, subitems: [NSCollectionLayoutItem(layoutSize: size)])
-        let section = NSCollectionLayoutSection(group: group)
-        section.contentInsetsReference = .readableContent
-        section.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: 0, bottom: 12, trailing: 0)
-        collectionView = UICollectionView(frame: .zero, collectionViewLayout: UICollectionViewCompositionalLayout(section: section))
+        // Messages keep to the readable width, but no wider than `maxTextWidth`, centered: on a
+        // 13-inch iPad the system's readable width is about 900 points, too long a line. The
+        // standard margins on iPhone. Cells add no side margins of their own.
+        let layout = UICollectionViewCompositionalLayout { [weak self] _, _ in
+            let size = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(80))
+            let group = NSCollectionLayoutGroup.vertical(layoutSize: size, subitems: [NSCollectionLayoutItem(layoutSize: size)])
+            let section = NSCollectionLayoutSection(group: group)
+            section.contentInsetsReference = .readableContent
+            let readable = self?.collectionView?.readableContentGuide.layoutFrame.width ?? 0
+            let extra = max(0, (readable - Self.maxTextWidth) / 2).rounded()
+            section.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: extra, bottom: 12, trailing: extra)
+            return section
+        }
+        collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.selfSizingInvalidation = .enabledIncludingConstraints
         collectionView.keyboardDismissMode = .interactive
         collectionView.alwaysBounceVertical = true
@@ -89,6 +104,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         composer.onStop = { [unowned self] in engine.stop() }
         composer.onTextChange = { [unowned self] text in textChanged(text) }
         composer.onCancelEdit = { [unowned self] in cancelEditing() }
+        composer.onMic = { [unowned self] in toggleDictation() }
+        composer.textView.onPasteFiles = { [unowned self] providers in attach(providers) }
         composer.text = conversation.draft
         wasTyping = !conversation.draft.isEmpty
         view.addSubview(composer)
@@ -125,6 +142,9 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         ])
 
         Speaker.shared.onChange = { [weak self] in self?.reconfigureVisibleAnswers() }
+        // Files dropped anywhere on the chat are attached (text dropped on the field is typed).
+        view.addInteraction(UIDropInteraction(delegate: self))
+        setUpDictation()
         refresh()
     }
 
@@ -138,6 +158,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        dictation.stop()
         saveDraft()
     }
 
@@ -193,8 +214,10 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         composer.isRunning = runningHere
         composer.canSend = !engine.isBusy
         composer.isEditingMessage = editingID != nil
-        composer.placeholderText = engine.isBusy && !runningHere ? "Another chat is answering…" : "Ask \(conversation.mode.title)"
+        composer.placeholderText = dictation.isRunning ? "Listening…"
+            : engine.isBusy && !runningHere ? "Another chat is answering…" : "Ask \(conversation.mode.title)"
         updateModeButton()
+        updateAttachMenu()
 
         if runningHere, ticker == nil {
             ticker = CADisplayLink(target: self, selector: #selector(tick))
@@ -287,7 +310,9 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     private func send(_ text: String) {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !engine.isBusy else { return }
+        let attachments = composer.attachments
+        guard !text.isEmpty || !attachments.isEmpty, !engine.isBusy else { return }
+        dictation.stop()
         // Edit & Resend: the conversation goes back to just before the edited message.
         if let id = editingID, let i = conversation.index(of: id) {
             Speaker.shared.stop()
@@ -295,24 +320,22 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         }
         editingID = nil
         composer.text = ""
+        composer.attachments = []
+        attachmentsBeforeEdit = []
         wasTyping = false
         saveDraft()
         isPinned = true
-        engine.send(text, in: conversation)
+        engine.send(text, attachments: attachments, in: conversation)
         refresh()
     }
 
-    /// Retry keeps the answer it replaces: the new one gets the old ones as its other versions.
+    /// Retry keeps the answer it replaces: the new one gets the old ones as its other versions
+    /// (`Engine.retry` does that).
     private func retry(_ mode: Mode) {
         guard let old = conversation.messages.last, !old.isUser, !engine.isBusy else { return }
         if Speaker.shared.speaking == old.id { Speaker.shared.stop() }
-        let kept = old.allVersions.list.filter { !$0.content.isEmpty }
         isPinned = true
         engine.retry(in: conversation, mode: mode)
-        if let i = conversation.messages.indices.last, conversation.messages[i].id != old.id, !kept.isEmpty {
-            conversation.messages[i].versions = kept
-            try? conversation.modelContext?.save()
-        }
         refresh()
     }
 
@@ -328,9 +351,13 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     private func beginEditing(_ id: UUID) {
         guard let m = message(id), m.isUser, !engine.isBusy else { return }
-        if editingID == nil { draftBeforeEdit = composer.text }
+        if editingID == nil {
+            draftBeforeEdit = composer.text
+            attachmentsBeforeEdit = composer.attachments
+        }
         editingID = id
         composer.text = m.content
+        composer.attachments = m.attachments ?? []
         composer.textView.becomeFirstResponder()
         refreshEditingCells()
     }
@@ -339,6 +366,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         guard editingID != nil else { return }
         editingID = nil
         composer.text = draftBeforeEdit
+        composer.attachments = attachmentsBeforeEdit
+        attachmentsBeforeEdit = []
         refreshEditingCells()
     }
 
@@ -633,6 +662,202 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     @objc private func modeKey(_ command: UIKeyCommand) {
         if let raw = command.propertyList as? String, let mode = Mode(rawValue: raw) { setMode(mode) }
+    }
+}
+
+// MARK: - Attachments
+
+extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDelegate, UIDropInteractionDelegate {
+    /// Choose File, Choose Photo; Photo is off in a mode that can't see images, with the reason.
+    fileprivate func updateAttachMenu() {
+        let mode = conversation.mode
+        let seesImages = engine.canSeeImages(mode)
+        var photoNote: String?
+        if !seesImages { photoNote = mode == .smart ? "Smart can't see images. Fast and Mac can." : "Needs Image reading for Fast" }
+        var items: [UIMenuElement] = [
+            UIAction(title: "Choose File…", subtitle: "Text or PDF", image: UIImage(systemName: "doc")) { [unowned self] _ in
+                chooseFile()
+            },
+            UIAction(title: "Choose Photo…", subtitle: photoNote, image: UIImage(systemName: "photo"),
+                     attributes: seesImages ? [] : .disabled) { [unowned self] _ in choosePhoto() },
+        ]
+        if mode == .fast, !seesImages, let open = onOpenReadiness {
+            items.append(UIAction(title: "Get Image Reading…", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
+        }
+        composer.attachButton.menu = UIMenu(children: items)
+        composer.attachButton.isEnabled = live == nil
+    }
+
+    private func chooseFile() {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: AttachmentReader.types, asCopy: true)
+        picker.allowsMultipleSelection = true
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    private func choosePhoto() {
+        var config = PHPickerConfiguration()
+        config.filter = .images
+        config.selectionLimit = 4
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = self
+        present(picker, animated: true)
+    }
+
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        Task {
+            var read: [Attachment] = []
+            for url in urls {
+                do {
+                    read.append(try await Task.detached { try AttachmentReader.read(url) }.value)
+                } catch {
+                    showProblem(error.localizedDescription)
+                }
+            }
+            add(read)
+        }
+    }
+
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        attach(results.map(\.itemProvider))
+    }
+
+    /// Pasted or dropped items: files, images, or text that came as a file.
+    fileprivate func attach(_ providers: [NSItemProvider]) {
+        Task {
+            var read: [Attachment] = []
+            for (n, provider) in providers.enumerated() {
+                do {
+                    read.append(try await Self.load(provider, fallbackName: "Pasted \(n + 1)"))
+                } catch {
+                    showProblem(error.localizedDescription)
+                }
+            }
+            add(read)
+        }
+    }
+
+    private nonisolated static func load(_ provider: NSItemProvider, fallbackName: String) async throws -> Attachment {
+        guard let type = AttachmentReader.types.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) }) else {
+            throw AttachmentReader.Failure.unsupported(provider.suggestedName ?? fallbackName)
+        }
+        let name = provider.suggestedName
+        return try await withCheckedThrowingContinuation { done in
+            _ = provider.loadFileRepresentation(for: type, openInPlace: false) { url, _, error in
+                guard let url else {
+                    return done.resume(throwing: error ?? AttachmentReader.Failure.unreadable(name ?? fallbackName))
+                }
+                do {
+                    var attachment = try AttachmentReader.read(url)
+                    // Temporary files have made-up names; the provider knows the real one.
+                    if let name, !name.isEmpty {
+                        let ext = url.pathExtension
+                        attachment.name = name.hasSuffix(".\(ext)") || ext.isEmpty ? name : "\(name).\(ext)"
+                    }
+                    done.resume(returning: attachment)
+                } catch {
+                    done.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Adds files to the composer, first saying so if one is too big for the model to make good
+    /// use of (over half its context), or is an image the mode can't see.
+    private func add(_ new: [Attachment]) {
+        guard !new.isEmpty else { return }
+        let mode = conversation.mode
+        let seen = engine.canSeeImages(mode) ? new : new.filter { !$0.isImage }
+        if seen.count < new.count {
+            showProblem(mode == .smart ? "Smart can't see images. Switch to Fast or Mac to ask about a photo."
+                : "Fast needs Image reading, in Readiness, to see photos.")
+        }
+        guard !seen.isEmpty else { return }
+        let limit = engine.contextLimit(for: mode)
+        let big = seen.filter { AttachmentReader.estimatedTokens($0) > limit / 2 }
+        guard let first = big.first else { return append(seen) }
+        let tokens = AttachmentReader.estimatedTokens(first)
+        let alert = UIAlertController(
+            title: big.count == 1 ? "“\(first.name)” is long" : "Some files are long",
+            message: """
+                About \(tokens.formatted()) tokens: more than half of what \(mode.title) can hold \
+                (\(limit.formatted())). The answer may be cut short, and the chat will fill up quickly.
+                """,
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Attach Anyway", style: .default) { [unowned self] _ in append(seen) })
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        present(alert, animated: true)
+    }
+
+    private func append(_ attachments: [Attachment]) {
+        composer.attachments += attachments
+        if traitCollection.userInterfaceIdiom != .phone { composer.textView.becomeFirstResponder() }
+    }
+
+    fileprivate func showProblem(_ message: String, settings: Bool = false) {
+        let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
+        if settings, let url = URL(string: UIApplication.openSettingsURLString) {
+            alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { _ in UIApplication.shared.open(url) })
+        }
+        alert.addAction(UIAlertAction(title: "OK", style: .cancel))
+        if presentedViewController == nil { present(alert, animated: true) }
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, canHandle session: UIDropSession) -> Bool {
+        live == nil && session.hasItemsConforming(toTypeIdentifiers: AttachmentReader.types.map(\.identifier))
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, sessionDidUpdate session: UIDropSession) -> UIDropProposal {
+        UIDropProposal(operation: .copy)
+    }
+
+    func dropInteraction(_ interaction: UIDropInteraction, performDrop session: UIDropSession) {
+        attach(session.items.map(\.itemProvider))
+    }
+}
+
+// MARK: - Dictation
+
+extension ChatViewController {
+    fileprivate func setUpDictation() {
+        dictation.onTranscript = { [unowned self] heard in
+            composer.text = dictationPrefix + heard
+            textChanged(composer.text)
+        }
+        dictation.onEnd = { [unowned self] error in
+            composer.isListening = false
+            refresh()
+            if let error { showProblem(error.localizedDescription) }
+        }
+        Task { [weak self] in
+            let available = await Dictation.isAvailable()
+            self?.composer.micButton.isHidden = !available
+        }
+    }
+
+    /// Tap to listen, tap again to stop. What's heard goes after what's already typed.
+    fileprivate func toggleDictation() {
+        if dictation.isRunning {
+            dictation.stop()
+            composer.isListening = false
+            refresh()
+            return
+        }
+        Speaker.shared.stop()
+        let typed = composer.text
+        dictationPrefix = typed.isEmpty || typed.hasSuffix(" ") || typed.hasSuffix("\n") ? typed : typed + " "
+        composer.isListening = true
+        Task {
+            do {
+                try await dictation.start()
+                refresh()
+            } catch {
+                composer.isListening = false
+                let failure = error as? Dictation.Failure
+                showProblem(error.localizedDescription, settings: failure?.opensSettings == true)
+            }
+        }
     }
 }
 

@@ -40,8 +40,8 @@ nonisolated enum ModelImport {
         guard magic == Data("GGUF".utf8) else { throw Failure.notGGUF(name) }
 
         let size = Int64(try source.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0)
-        guard let model = CatalogModel.all.first(where: { $0.bytes == size }) else {
-            if let named = CatalogModel.all.first(where: { $0.filename == name }) { throw Failure.wrongSize(name, named, size) }
+        guard let model = CatalogModel.files.first(where: { $0.bytes == size }) else {
+            if let named = CatalogModel.files.first(where: { $0.filename == name }) { throw Failure.wrongSize(name, named, size) }
             throw Failure.unknown(name)
         }
 
