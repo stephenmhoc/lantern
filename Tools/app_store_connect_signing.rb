@@ -141,15 +141,15 @@ def find_or_create_bundle_id(client, identifier:, name:)
   created.fetch("data").fetch("id")
 end
 
-# Lantern's entitlements (Lantern.entitlements) each need a capability on the bundle ID, or the
-# profile lacks them and the archive won't sign. Adding one that's already there is a 409.
-CAPABILITIES = %w[INCREASED_MEMORY_LIMIT EXTENDED_VIRTUAL_ADDRESSING].freeze
+# Each target's entitlements need a capability on its bundle ID, or the profile lacks them and the
+# archive won't sign. Adding one that's already there is a 409. The widget extension has none.
+APP_CAPABILITIES = %w[INCREASED_MEMORY_LIMIT EXTENDED_VIRTUAL_ADDRESSING].freeze
 
-def ensure_capabilities(client, bundle_id)
+def ensure_capabilities(client, bundle_id, capabilities)
   have = client.get("/v1/bundleIds/#{bundle_id}/bundleIdCapabilities").fetch("data", []).map do |c|
     c.fetch("attributes").fetch("capabilityType")
   end
-  (CAPABILITIES - have).each do |type|
+  (capabilities - have).each do |type|
     puts "Enabling #{type}"
     client.post(
       "/v1/bundleIdCapabilities",
@@ -257,44 +257,72 @@ def append_env(values)
   end
 end
 
-# Revoking a certificate invalidates what it signed, and TestFlight review checks the signature
-# after processing (ITMS-90035), so one certificate stays for as long as builds need it.
-def prepare
-  client = AppStoreConnectClient.new
-  temp_dir = env_fetch("RUNNER_TEMP")
-  certificate_id = env_fetch("APPLE_DISTRIBUTION_CERT_ID")
-  p12_path = File.join(temp_dir, "certificate.p12")
-  profile_path = File.join(temp_dir, "ios.mobileprovision")
-
-  FileUtils.mkdir_p(temp_dir)
-  File.binwrite(p12_path, Base64.decode64(env_fetch("APPLE_DISTRIBUTION_CERT_BASE64")))
-  ios_bundle_identifier = env_fetch("IOS_BUNDLE_ID")
-  # Named after the certificate, so that replacing it makes a new profile.
-  name = "Lantern App Store #{certificate_id}"
-
+# Finds the App Store profile for one bundle ID, or registers the bundle ID (with its capabilities)
+# and creates the profile. Named after the certificate, so that replacing it makes a new profile.
+def prepare_profile(client, identifier:, bundle_name:, profile_prefix:, capabilities:, certificate_id:, output_path:)
+  name = "#{profile_prefix} App Store #{certificate_id}"
   query = URI.encode_www_form("filter[name]" => name, "filter[profileState]" => "ACTIVE", "limit" => 200)
   profile = client.get("/v1/profiles?#{query}").fetch("data").find do |candidate|
     candidate.fetch("attributes").fetch("name") == name
   end
 
   if profile
-    File.binwrite(profile_path, Base64.decode64(profile.fetch("attributes").fetch("profileContent")))
+    puts "Using profile #{name}"
+    File.binwrite(output_path, Base64.decode64(profile.fetch("attributes").fetch("profileContent")))
   else
-    bundle_id = find_or_create_bundle_id(client, identifier: ios_bundle_identifier, name: "Lantern")
-    ensure_capabilities(client, bundle_id)  # before the profile, which captures them
+    puts "Creating profile #{name}"
+    bundle_id = find_or_create_bundle_id(client, identifier: identifier, name: bundle_name)
+    ensure_capabilities(client, bundle_id, capabilities)  # before the profile, which captures them
     create_profile(
       client,
       name: name,
       bundle_id: bundle_id,
       certificate_id: certificate_id,
-      output_path: profile_path
+      output_path: output_path
     )
   end
+end
+
+# Revoking a certificate invalidates what it signed, and TestFlight review checks the signature
+# after processing (ITMS-90035), so one certificate stays for as long as builds need it.
+#
+# Two targets, two profiles: the app (IOS_BUNDLE_ID, "Lantern App Store <cert id>") and the widget
+# extension embedded in it (WIDGETS_BUNDLE_ID, "Lantern Widgets App Store <cert id>").
+def prepare
+  client = AppStoreConnectClient.new
+  temp_dir = env_fetch("RUNNER_TEMP")
+  certificate_id = env_fetch("APPLE_DISTRIBUTION_CERT_ID")
+  p12_path = File.join(temp_dir, "certificate.p12")
+  profile_path = File.join(temp_dir, "ios.mobileprovision")
+  widgets_profile_path = File.join(temp_dir, "widgets.mobileprovision")
+
+  FileUtils.mkdir_p(temp_dir)
+  File.binwrite(p12_path, Base64.decode64(env_fetch("APPLE_DISTRIBUTION_CERT_BASE64")))
+
+  prepare_profile(
+    client,
+    identifier: env_fetch("IOS_BUNDLE_ID"),
+    bundle_name: "Lantern",
+    profile_prefix: "Lantern",
+    capabilities: APP_CAPABILITIES,
+    certificate_id: certificate_id,
+    output_path: profile_path
+  )
+  prepare_profile(
+    client,
+    identifier: env_fetch("WIDGETS_BUNDLE_ID"),
+    bundle_name: "Lantern Widgets",
+    profile_prefix: "Lantern Widgets",
+    capabilities: [],
+    certificate_id: certificate_id,
+    output_path: widgets_profile_path
+  )
 
   append_env(
     "APPLE_CERTIFICATE_PATH" => p12_path,
     "APPLE_CERTIFICATE_PASSWORD" => env_fetch("APPLE_DISTRIBUTION_CERT_PASSWORD"),
-    "IOS_PROVISIONING_PROFILE_PATH" => profile_path
+    "IOS_PROVISIONING_PROFILE_PATH" => profile_path,
+    "WIDGETS_PROVISIONING_PROFILE_PATH" => widgets_profile_path
   )
 end
 
