@@ -9,6 +9,8 @@ final class Conversation {
     var updated: Date = Date()
     var mode: Mode = Mode.fast
     var thinking: Thinking = Thinking.off
+    /// Kept at the top of the sidebar.
+    var pinned: Bool = false
     /// In order. Written when a turn starts and ends (and every few seconds while streaming), never
     /// per token: the live reply lives in `Engine.live` until then.
     var messages: [StoredMessage] = []

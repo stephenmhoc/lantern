@@ -49,11 +49,26 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UIRequiresFullScreen: false
+        # iPad: a chat can open in its own window. All windows share the one Engine.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
         UIApplicationSupportsIndirectInputEvents: true
         ITSAppUsesNonExemptEncryption: false
         # Models can be dropped in from Finder (cable) or the Files app.
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Readiness imports .gguf files (file picker or drag and drop); chats export as Markdown.
+        UTImportedTypeDeclarations:
+          - UTTypeIdentifier: org.ggml.gguf
+            UTTypeDescription: GGUF model
+            UTTypeConformsTo: [public.data]
+            UTTypeTagSpecification:
+              public.filename-extension: [gguf]
+          - UTTypeIdentifier: net.daringfireball.markdown
+            UTTypeDescription: Markdown text
+            UTTypeConformsTo: [public.plain-text]
+            UTTypeTagSpecification:
+              public.filename-extension: [md, markdown]
         NSLocalNetworkUsageDescription: Lantern talks to Ollama on your Mac over your home network.
         NSAppTransportSecurity:
           # Ollama speaks plain HTTP: allowed for .local names and IPs, and for tailnet names.
