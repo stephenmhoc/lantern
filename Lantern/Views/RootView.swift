@@ -1,3 +1,4 @@
+import CoreSpotlight
 import LlamaKit
 import SwiftData
 import SwiftUI
@@ -26,6 +27,9 @@ struct RootView: View {
     @State private var renameText = ""
     @State private var deleted: DeletedChat?
     @AppStorage(DefaultMode.key) private var lastMode = ""
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var window = WindowProbe()
+    private var router = SystemRouter.shared
 
     enum Sheet: String, Identifiable {
         case readiness, settings
@@ -79,6 +83,16 @@ struct RootView: View {
                 selection = hasSidebarToggle ? conversations.first : nil
             }
         }
+        // Deep links, App Intents and Spotlight (Lantern/System).
+        .background { WindowReader(probe: window) }
+        .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
+        .onOpenURL { url in if let link = LanternLink(url: url) { handle(link) } }
+        .onContinueUserActivity(CSSearchableItemActionType) { activity in
+            if let id = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String { handle(.chat(id: id)) }
+        }
+        .onChange(of: router.pending) { claimRequest() }
+        .onChange(of: scenePhase) { claimRequest() }
+        .onReceive(NotificationCenter.default.publisher(for: UIWindow.didBecomeKeyNotification)) { _ in claimRequest() }
         .task {
             // Only if the Mac has been used: checking it would otherwise ask for local network
             // access at launch. It doesn't hold anything up.
@@ -144,7 +158,7 @@ struct RootView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
-                Button("New chat", systemImage: "square.and.pencil", action: newChat)
+                Button("New chat", systemImage: "square.and.pencil", action: { newChat() })
             }
             ToolbarItemGroup(placement: .bottomBar) {
                 let ready = Readiness.isReady(store: store, engine: engine)
@@ -174,7 +188,7 @@ struct RootView: View {
                     if store.downloaded.isEmpty {
                         Button("Get models") { sheet = .readiness }.buttonStyle(.borderedProminent)
                     } else {
-                        Button("New chat", action: newChat).buttonStyle(.borderedProminent)
+                        Button("New chat", action: { newChat() }).buttonStyle(.borderedProminent)
                     }
                 }
             } else if sections.isEmpty {
@@ -289,20 +303,48 @@ struct RootView: View {
         if opened == nil, conversations.isEmpty, store.downloaded.isEmpty { sheet = .readiness }
     }
 
-    private func newChat() {
-        let mode = DefaultMode.pick(last: lastMode, engine: engine)
+    @discardableResult
+    private func newChat(mode: Mode? = nil) -> Conversation {
+        let mode = mode ?? DefaultMode.pick(last: lastMode, engine: engine)
         query = ""
         // Reuse an empty chat rather than stacking up "New chat" rows.
         if let empty = conversations.first(where: { $0.messages.isEmpty && !$0.pinned }) {
             empty.mode = mode
             empty.updated = .now
             selection = empty
-            return
+            return empty
         }
         let c = Conversation(mode: mode)
         context.insert(c)
         try? context.save()  // a permanent identifier, for @SceneStorage and Engine.running
         selection = c
+        return c
+    }
+
+    // MARK: - Deep links and intents
+
+    private func claimRequest() {
+        if let link = router.claim(active: scenePhase == .active, window: window.window) { handle(link) }
+    }
+
+    /// A `lantern://` link, an App Intent or a Spotlight result, in this window.
+    private func handle(_ link: LanternLink) {
+        restoreSelection()  // first, in case this arrives before the window appeared
+        sheet = nil
+        searching = false
+        switch link {
+        case .new(let mode):
+            newChat(mode: mode.flatMap(Mode.init(rawValue:)))
+        case .ask(let text, let mode):
+            let c = newChat(mode: mode.flatMap(Mode.init(rawValue:)))
+            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return }
+            // Another chat is answering: leave the question in the message box to send after.
+            if engine.isBusy { c.draft = text } else { engine.send(text, in: c) }
+        case .chat(let id):
+            query = ""
+            if let c = conversations.first(where: { $0.stateID == id }) { selection = c }
+        }
     }
 
     private func startRename(_ c: Conversation) {

@@ -7,6 +7,15 @@ struct LanternApp: App {
     /// for an ordinary window. Every window shares `engine`, so one generation runs at a time.
     static let mainWindow = "main"
 
+    /// The one store, shared by the windows and by App Intents and Spotlight (`ChatQuery`, `SpotlightIndex`).
+    static let container: ModelContainer = {
+        do { return try ModelContainer(for: Conversation.self) } catch { fatalError("Couldn't open the chats: \(error)") }
+    }()
+
+    init() {
+        SpotlightIndex.start(Self.container)
+    }
+
     @State private var engine = Engine()
     @Environment(\.scenePhase) private var scenePhase
 
@@ -38,9 +47,10 @@ struct LanternApp: App {
                     print("SELFTEST done")
                 }
                 .modifier(EngineTest(engine: engine))
+                .task { await DebugLaunch.system() }  // -openURL, -intent
                 #endif
         }
-        .modelContainer(for: Conversation.self)
+        .modelContainer(Self.container)
         .commands { LanternCommands(engine: engine) }
         .onChange(of: scenePhase) { _, phase in
             // The app's phase: background only once every window is.
