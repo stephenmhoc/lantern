@@ -60,21 +60,29 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     /// The widest the transcript's text gets.
     static let maxTextWidth: CGFloat = 688
 
+    /// The text column's distance from each side of a view this wide: the standard margin, where
+    /// the header's buttons start, or centered at `maxTextWidth` when there's room. The transcript
+    /// and the composer's field and controls share it.
+    func columnInsets(width: CGFloat) -> (leading: CGFloat, trailing: CGFloat) {
+        let margin = systemMinimumLayoutMargins
+        let safe = view.safeAreaInsets
+        let leading = safe.left + margin.leading, trailing = safe.right + margin.trailing
+        let extra = max(0, (width - leading - trailing - Self.maxTextWidth) / 2)
+        return ((leading + extra).rounded(), (trailing + extra).rounded())
+    }
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .systemBackground
 
-        // Messages keep to the readable width, but no wider than `maxTextWidth`, centered: on a
-        // 13-inch iPad the system's readable width is about 900 points, too long a line. The
-        // standard margins on iPhone. Cells add no side margins of their own.
-        let layout = UICollectionViewCompositionalLayout { [weak self] _, _ in
+        // Messages keep to `columnInsets`. Cells add no side margins of their own.
+        let layout = UICollectionViewCompositionalLayout { [weak self] _, environment in
             let size = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(80))
             let group = NSCollectionLayoutGroup.vertical(layoutSize: size, subitems: [NSCollectionLayoutItem(layoutSize: size)])
             let section = NSCollectionLayoutSection(group: group)
-            section.contentInsetsReference = .readableContent
-            let readable = self?.collectionView?.readableContentGuide.layoutFrame.width ?? 0
-            let extra = max(0, (readable - Self.maxTextWidth) / 2).rounded()
-            section.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: extra, bottom: 12, trailing: extra)
+            section.contentInsetsReference = .none
+            let side = self?.columnInsets(width: environment.container.contentSize.width) ?? (leading: 16, trailing: 16)
+            section.contentInsets = NSDirectionalEdgeInsets(top: 12, leading: side.leading, bottom: 12, trailing: side.trailing)
             return section
         }
         collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
@@ -135,7 +143,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             composer.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             composer.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             composer.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor),
-            jumpButton.trailingAnchor.constraint(equalTo: view.readableContentGuide.trailingAnchor),
+            jumpButton.trailingAnchor.constraint(equalTo: composer.columnGuide.trailingAnchor),
             jumpButton.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -12),
             jumpButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
             jumpButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
@@ -167,6 +175,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
+        let side = columnInsets(width: view.bounds.width)
+        if composer.columnInsets != side {
+            composer.columnInsets = side
+            collectionView.collectionViewLayout.invalidateLayout()
+        }
         let overlap = max(0, view.bounds.maxY - composer.frame.minY - view.safeAreaInsets.bottom)
         guard collectionView.contentInset.bottom != overlap else { return }
         collectionView.contentInset.bottom = overlap

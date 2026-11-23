@@ -21,6 +21,19 @@ final class ComposerView: UIView, UITextViewDelegate {
     private var heightConstraint: NSLayoutConstraint!
     private var modeTitle = ""
     private let usesGlass: Bool
+    /// The chat's text column; the field's text and the controls line up with its edges.
+    let columnGuide = UILayoutGuide()
+    private var columnLeading: NSLayoutConstraint!
+    private var columnTrailing: NSLayoutConstraint!
+    /// Set by the chat from its own layout, so the field lines up with the transcript.
+    var columnInsets: (leading: CGFloat, trailing: CGFloat) = (16, 16) {
+        didSet {
+            columnLeading.constant = columnInsets.leading
+            columnTrailing.constant = -columnInsets.trailing
+        }
+    }
+    /// How far the glass panel reaches past the column on each side.
+    private static let glassPadding: CGFloat = 12
 
     var onSend: (() -> Void)?
     var onStop: (() -> Void)?
@@ -67,7 +80,11 @@ final class ComposerView: UIView, UITextViewDelegate {
         textView.backgroundColor = usesGlass ? .clear : .secondarySystemBackground
         textView.layer.cornerRadius = 18
         textView.layer.cornerCurve = .continuous
-        textView.textContainerInset = UIEdgeInsets(top: 9, left: 10, bottom: 9, right: 10)
+        // On glass, no side inset: the text starts on the column edge, in line with the transcript.
+        // Before iOS 26 the field is its own grey bubble and keeps its padding.
+        let side: CGFloat = usesGlass ? 0 : 10
+        textView.textContainerInset = UIEdgeInsets(top: 9, left: side, bottom: 9, right: side)
+        if usesGlass { textView.textContainer.lineFragmentPadding = 0 }
         textView.isScrollEnabled = false
         textView.delegate = self
         // The field's height depends on its width: follow rotation, Stage Manager and the sidebar.
@@ -162,8 +179,14 @@ final class ComposerView: UIView, UITextViewDelegate {
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
 
+        addLayoutGuide(columnGuide)
+        columnLeading = columnGuide.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16)
+        columnTrailing = columnGuide.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16)
+        NSLayoutConstraint.activate([columnLeading, columnTrailing])
+        let pad = Self.glassPadding
+
         if #available(iOS 26, *) {
-            // A floating glass panel at the readable width; the chat scrolls under it.
+            // A floating glass panel just wider than the text column; the chat scrolls under it.
             let glass = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
             glass.layer.cornerRadius = 26
             glass.layer.cornerCurve = .continuous
@@ -174,12 +197,12 @@ final class ComposerView: UIView, UITextViewDelegate {
             NSLayoutConstraint.activate([
                 glass.topAnchor.constraint(equalTo: topAnchor, constant: 4),
                 glass.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-                glass.leadingAnchor.constraint(equalTo: readableContentGuide.leadingAnchor, constant: -8),
-                glass.trailingAnchor.constraint(equalTo: readableContentGuide.trailingAnchor, constant: 8),
+                glass.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor, constant: -pad),
+                glass.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor, constant: pad),
                 stack.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 10),
-                stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -6),
-                stack.leadingAnchor.constraint(equalTo: glass.contentView.leadingAnchor, constant: 10),
-                stack.trailingAnchor.constraint(equalTo: glass.contentView.trailingAnchor, constant: -10),
+                stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -8),
+                stack.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor),
             ])
         } else {
             let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
@@ -193,8 +216,8 @@ final class ComposerView: UIView, UITextViewDelegate {
                 blur.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 100),  // under the home indicator too
                 stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
                 stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
-                stack.leadingAnchor.constraint(equalTo: readableContentGuide.leadingAnchor),
-                stack.trailingAnchor.constraint(equalTo: readableContentGuide.trailingAnchor),
+                stack.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor),
+                stack.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor),
             ])
         }
 
@@ -202,8 +225,8 @@ final class ComposerView: UIView, UITextViewDelegate {
         NSLayoutConstraint.activate([
             heightConstraint,
             modeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
-            placeholder.leadingAnchor.constraint(equalTo: textView.leadingAnchor, constant: 15),
-            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor, constant: -10),
+            placeholder.leadingAnchor.constraint(equalTo: textView.leadingAnchor, constant: usesGlass ? 0 : 15),
+            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor, constant: usesGlass ? 0 : -10),
             placeholder.topAnchor.constraint(equalTo: textView.topAnchor, constant: 9),
         ])
         placeholder.numberOfLines = 1
