@@ -26,9 +26,9 @@ struct ChatFocus {
     let canChangeMode: Bool
 }
 
-/// Opens Readiness in this window. Set by `RootView`, for views deep inside the chat. Always equal:
+/// Opens a sheet (Readiness or Settings) in this window. Set by `RootView`, for views deep inside the chat. Always equal:
 /// the closure only flips the window's sheet state, so a newer copy does the same thing.
-struct ShowReadinessAction: Equatable {
+struct OpenSheetAction: Equatable {
     let action: () -> Void
     init(_ action: @escaping () -> Void = {}) { self.action = action }
     func callAsFunction() { action() }
@@ -36,7 +36,8 @@ struct ShowReadinessAction: Equatable {
 }
 
 extension EnvironmentValues {
-    @Entry var showReadiness = ShowReadinessAction()
+    @Entry var showReadiness = OpenSheetAction()
+    @Entry var showSettings = OpenSheetAction()
 }
 
 extension FocusedValues {

@@ -63,7 +63,8 @@ struct RootView: View {
             Button("Rename") { rename() }
             Button("Cancel", role: .cancel) {}
         }
-        .environment(\.showReadiness, ShowReadinessAction { sheet = .readiness })
+        .environment(\.showReadiness, OpenSheetAction { sheet = .readiness })
+        .environment(\.showSettings, OpenSheetAction { sheet = .settings })
         .focusedSceneValue(\.sceneActions, actions)
         .onAppear(perform: restoreSelection)
         .onChange(of: selection) { _, c in

@@ -631,9 +631,10 @@ struct ChatScreen: View {
     @AppStorage(DefaultMode.key) private var lastMode = ""
     @SceneStorage("inspector") private var showInspector = false
     @Environment(\.showReadiness) private var showReadiness
+    @Environment(\.showSettings) private var showSettings
 
     var body: some View {
-        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness)
+        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness, showSettings: showSettings)
             .ignoresSafeArea(.keyboard)  // the UIKit side follows the keyboard itself
             .safeAreaInset(edge: .top, spacing: 0) { BusyBanner(conversation: conversation) }
             .navigationTitle(title)
@@ -733,13 +734,14 @@ private struct ChatControllerView: UIViewControllerRepresentable {
     let conversation: Conversation
     let engine: Engine
     let revision: Int
-    let showReadiness: ShowReadinessAction
+    let showReadiness: OpenSheetAction
+    let showSettings: OpenSheetAction
 
     func makeUIViewController(context: Context) -> ChatViewController {
         let controller = ChatViewController(conversation: conversation, engine: engine)
-        // HOOK(chat): wire the controller's closures once ChatViewController exposes them:
-        // controller.onOpenReadiness = { showReadiness() }
-        // controller.onBeginTyping = { /* HOOK(engine): engine.prepare(mode: conversation.mode, for: conversation) */ }
+        controller.onOpenReadiness = { showReadiness() }
+        controller.onOpenSettings = { showSettings() }
+        // HOOK(engine): controller.onBeginTyping = { Task { await engine.prepare(mode: conversation.mode, for: conversation) } }
         return controller
     }
 
