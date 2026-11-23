@@ -15,7 +15,18 @@ MainActor default isolation, SwiftData. Three modes behind one chat:
   `lantern-smoke` Mac CLI.
 - `Lantern/Engine`: `Engine` owns the one generation that can run at a time (send, stop, retry,
   backgrounding, idle unload, model self-test); `ModelStore` downloads; `MacLink` talks to Ollama.
-- `Lantern/Chat`: the chat screen, in UIKit. `Lantern/Views`: everything else, in SwiftUI.
+- `Lantern/Chat`: the chat screen, in UIKit. `ChatScreen` at the bottom of `ChatViewController.swift`
+  is its SwiftUI wrapper: editable title and title menu (Rename, Export as Markdown), the inspector,
+  and the banner shown while another chat or a model test holds the engine.
+- `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window (sidebar with search,
+  date sections, pin, rename, delete with undo); `LanternCommands` is the iPad menu bar, reaching
+  the key window through `focusedSceneValue` (`SceneActions`, `ChatFocus`); `ChatList` holds the
+  sidebar's grouping, the default mode for new chats and the undo snapshot; `ModelImport` copies a
+  `.gguf` the user already has into Documents (Readiness's file picker and drop target).
+- Windows: one `WindowGroup(for: PersistentIdentifier.self)`. A plain window opens with no value;
+  "Open in New Window" opens one with a chat's identifier. Each window restores its own selection
+  with `@SceneStorage`; all share the app's one `Engine`, so a second chat can't send while one
+  answers anywhere (`BusyBanner` says so).
 
 ## Commands
 
@@ -29,6 +40,10 @@ cd Packages/LlamaKit && swift build -c release && .build/release/lantern-smoke .
 The official xcframework has no simulator slice. For the simulator, build llama.cpp's
 `build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
 simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't map its buffers.
+Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
+`-seedChats`, `-ui readiness|settings|inspector|search:<text>|delete|newchat|sidebar|next|window`,
+`-testflight` (show the expiry and reminders), `-importModel <path>`, and `-selftest`.
+
 `scripts/fetch-tailscale.sh` builds TailscaleKit (needs Go) for signing into the tailnet; without it
 `Tailnet` compiles out.
 
@@ -55,5 +70,12 @@ simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't ma
 - **The system prompt is neutral.** Outages are why Lantern exists, not something the models should
   assume: no disaster or emergency framing in the prompt, starters or copy.
 - **Offline first.** Nothing may need the network to launch or to open an existing chat.
+- **Conversation changes are additive** (new stored properties with defaults, like `pinned`), so
+  SwiftData migrates existing chats without a schema version.
+- **Menu bar shortcuts are idempotent.** ⌘1–3 and ⌘. exist both in `LanternCommands` and as
+  `UIKeyCommand`s on `ChatViewController`; whichever UIKit routes the key to, it sets the same mode
+  or cancels the same task.
 - Distributed by TestFlight with a monthly rebuild, like Quill. A build stops launching 90 days after
-  upload; Readiness shows the date from `LanternBuildDate`, stamped into Info.plist at build time.
+  upload; Readiness shows the date from `LanternBuildDate`, stamped into Info.plist at build time,
+  and offers local reminders 14 and 3 days before (permission is asked from that button, never at
+  launch).
