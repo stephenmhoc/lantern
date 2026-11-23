@@ -2,8 +2,8 @@ import LlamaKit
 import SwiftUI
 import UIKit
 
-/// Above the message box: what's loaded (or how the Mac is reached), memory, battery, heat. Also
-/// suggests Fast when Smart is too slow or too costly on battery.
+/// Above the message box: what's loaded (or how the Mac is reached), how full the chat is (past
+/// half), memory, battery, heat. Also suggests Fast when Smart is too slow or too costly on battery.
 struct StatusStrip: View {
     let conversation: Conversation
     @Environment(Engine.self) private var engine
@@ -23,7 +23,10 @@ struct StatusStrip: View {
                 ViewThatFits {
                     line(memory: true)
                     line(memory: false)
-                    Label(primary, systemImage: conversation.mode.symbol).lineLimit(1)
+                    HStack(spacing: 10) {
+                        Label(primary, systemImage: conversation.mode.symbol).lineLimit(1)
+                        if let fullness { Spacer(minLength: 4); ContextMeter(fraction: fullness) }
+                    }
                 }
                 .font(.caption.monospacedDigit())  // caption2 was too faint to read at a glance
                 .foregroundStyle(.secondary)
@@ -41,6 +44,7 @@ struct StatusStrip: View {
         HStack(spacing: 10) {
             Label(primary, systemImage: conversation.mode.symbol).lineLimit(1)
             Spacer(minLength: 4)
+            if let fullness { ContextMeter(fraction: fullness) }
             if memory, let free = MemoryStats.availableBytes, conversation.mode.isOnDevice {
                 Text("\(MemoryStats.gb(free)) free")
             }
@@ -59,8 +63,16 @@ struct StatusStrip: View {
         return engine.store.states[model.id] == .ready ? model.name : "\(model.name) isn't on this device"
     }
 
+    /// How full the chat's context is, once it's past about half: nil below that.
+    private var fullness: Double? {
+        guard let usage = engine.contextUsage(for: conversation), usage.limit > 0 else { return nil }
+        let fraction = min(1, Double(usage.used) / Double(usage.limit))
+        return fraction >= 0.5 ? fraction : nil
+    }
+
     private var spoken: String {
         var parts = [primary, "battery \(Power.batteryText)"]
+        if let fullness { parts.insert("chat \(Int(fullness * 100))% full", at: 1) }
         if conversation.mode.isOnDevice, let free = MemoryStats.availableBytes { parts.insert("\(MemoryStats.gb(free)) free", at: 1) }
         if Power.isHot { parts.append("device is hot") }
         return parts.joined(separator: ", ")
@@ -85,6 +97,27 @@ struct StatusStrip: View {
             }
         }
         return nil
+    }
+}
+
+/// A small bar and percentage for how much of the model's context the chat uses. Orange near full,
+/// when the next long answer may not fit.
+private struct ContextMeter: View {
+    let fraction: Double
+    private var nearFull: Bool { fraction >= 0.85 }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Capsule().fill(.quaternary)
+                .frame(width: 32, height: 5)
+                .overlay(alignment: .leading) {
+                    Capsule().fill(nearFull ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                        .frame(width: max(5, 32 * fraction), height: 5)
+                }
+            Text("\(Int(fraction * 100))% full")
+        }
+        .foregroundStyle(nearFull ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+        .fixedSize()
     }
 }
 
