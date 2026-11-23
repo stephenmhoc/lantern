@@ -13,6 +13,7 @@ import UIKit
 /// - `-testflight` (in ReadinessView): pretend to be a TestFlight install.
 /// - `-openURL <lantern://…>`: the app opens the link itself two seconds after launch, through the
 ///   system like any other app would, without `simctl openurl`'s "Open in Lantern?" prompt.
+/// - `-ui inspector` opens the chat's info panel.
 /// - `-intent ask:<text>|new:<mode>|open:<chat title>`: runs that App Intent's `perform()`.
 /// - `-spotlightQuery <text>`: searches Lantern's own Spotlight items after indexing and prints them.
 enum DebugLaunch {

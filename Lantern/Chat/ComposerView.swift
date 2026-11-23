@@ -157,6 +157,7 @@ final class ComposerView: UIView, UITextViewDelegate {
         controls.setCustomSpacing(2, after: micButton)
         let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, textView, controls])
         stack.setCustomSpacing(2, after: textView)
+        stack.setCustomSpacing(0, after: statusView)
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false

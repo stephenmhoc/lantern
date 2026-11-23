@@ -901,6 +901,9 @@ struct ChatScreen: View {
                     .keyboardShortcut("i", modifiers: [.command, .option])
                 }
             }
+            #if DEBUG
+            .onAppear { if DebugLaunch.ui == "inspector" { showInspector = true } }
+            #endif
             .inspector(isPresented: $showInspector) {
                 ChatInspector(conversation: conversation)
                     .inspectorColumnWidth(min: 260, ideal: 300, max: 420)

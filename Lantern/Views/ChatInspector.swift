@@ -11,10 +11,18 @@ struct ChatInspector: View {
     @Environment(MacLink.self) private var mac
 
     var body: some View {
+        // Memory, battery and heat change while it's open.
+        TimelineView(.periodic(from: .now, by: 2)) { _ in form }
+    }
+
+    private var form: some View {
         Form {
             Section("Model") {
                 LabeledContent("Mode", value: conversation.mode.title)
                 LabeledContent("Model", value: modelName)
+                if conversation.mode == .mac {
+                    LabeledContent("Connected by", value: mac.route.label)
+                }
                 LabeledContent("Thinking", value: conversation.mode == .smart && conversation.thinking == .off
                                ? "A little (Smart always thinks)" : conversation.thinking.rawValue.capitalized)
             }
@@ -35,6 +43,16 @@ struct ChatInspector: View {
             Section("Last reply") {
                 LabeledContent("Speed", value: lastReply.speed ?? "—")
                 LabeledContent("First token", value: lastReply.firstToken ?? "—")
+            }
+
+            Section("This device") {
+                if conversation.mode.isOnDevice, let free = MemoryStats.availableBytes {
+                    LabeledContent("Memory free", value: MemoryStats.gb(free))
+                }
+                LabeledContent("Battery", value: Power.isCharging ? "\(Power.batteryText), charging" : Power.batteryText)
+                if Power.isHot {
+                    LabeledContent("Temperature") { Text("Hot").foregroundStyle(.orange) }
+                }
             }
 
             Section("System prompt") {
