@@ -1,8 +1,9 @@
 import UIKit
 import UniformTypeIdentifiers
 
-/// The bar under the chat: status strip, attached files, mode menu, attach menu, a text view that
-/// grows to six lines, the dictation button, Send/Stop.
+/// The bar under the chat: status strip, attached files, a full-width text view that grows to six
+/// lines, and under it the controls: mode menu and attach menu on the left, dictation and Send/Stop
+/// on the right.
 /// On iOS 26 and later it's a floating Liquid Glass panel at the readable width; before that, a
 /// full-width blurred bar.
 final class ComposerView: UIView, UITextViewDelegate {
@@ -147,12 +148,15 @@ final class ComposerView: UIView, UITextViewDelegate {
             chipStack.heightAnchor.constraint(equalTo: chipScroll.frameLayoutGuide.heightAnchor),
         ])
 
-        let row = UIStackView(arrangedSubviews: [modeButton, attachButton, textView, micButton, sendButton])
-        row.spacing = 8
-        row.alignment = .bottom
-        row.setCustomSpacing(2, after: attachButton)
-        row.setCustomSpacing(2, after: micButton)
-        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, row])
+        // The field gets the whole width; the controls sit in a row beneath it.
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let controls = UIStackView(arrangedSubviews: [modeButton, attachButton, spacer, micButton, sendButton])
+        controls.spacing = 8
+        controls.alignment = .center
+        controls.setCustomSpacing(2, after: micButton)
+        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, textView, controls])
+        stack.setCustomSpacing(2, after: textView)
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -174,7 +178,7 @@ final class ComposerView: UIView, UITextViewDelegate {
                 stack.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 10),
                 stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -6),
                 stack.leadingAnchor.constraint(equalTo: glass.contentView.leadingAnchor, constant: 10),
-                stack.trailingAnchor.constraint(equalTo: glass.contentView.trailingAnchor, constant: -6),
+                stack.trailingAnchor.constraint(equalTo: glass.contentView.trailingAnchor, constant: -10),
             ])
         } else {
             let blur = UIVisualEffectView(effect: UIBlurEffect(style: .systemChromeMaterial))
@@ -196,7 +200,7 @@ final class ComposerView: UIView, UITextViewDelegate {
         heightConstraint = textView.heightAnchor.constraint(equalToConstant: 38)
         NSLayoutConstraint.activate([
             heightConstraint,
-            modeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 38),
+            modeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
             placeholder.leadingAnchor.constraint(equalTo: textView.leadingAnchor, constant: 15),
             placeholder.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor, constant: -10),
             placeholder.topAnchor.constraint(equalTo: textView.topAnchor, constant: 9),
@@ -215,7 +219,7 @@ final class ComposerView: UIView, UITextViewDelegate {
     required init?(coder: NSCoder) { fatalError() }
 
     /// The mode button's title and symbol. At accessibility text sizes it shows only the symbol, so
-    /// the message field keeps its room.
+    /// the controls row keeps its room.
     func setMode(title: String, symbol: String) {
         modeTitle = title
         modeButton.configuration?.image = UIImage(systemName: symbol)
