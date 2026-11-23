@@ -297,16 +297,62 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 }
 
 /// The chat screen as SwiftUI sees it. `revision` changes whenever something the UIKit side shows
-/// (other than streaming text) changes, which is what makes SwiftUI call `refresh()`.
+/// (other than streaming text) changes, which is what makes SwiftUI call `refresh()`. Around the
+/// UIKit controller: the editable title and its menu (Rename, Export), the inspector,
+/// a banner when another chat or a model test holds the engine, and the menu bar's view of the chat.
 struct ChatScreen: View {
-    let conversation: Conversation
+    @Bindable var conversation: Conversation
     @Environment(Engine.self) private var engine
+    @AppStorage(DefaultMode.key) private var lastMode = ""
+    @SceneStorage("inspector") private var showInspector = false
+    @Environment(\.showReadiness) private var showReadiness
 
     var body: some View {
-        ChatControllerView(conversation: conversation, engine: engine, revision: revision)
+        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness)
             .ignoresSafeArea(.keyboard)  // the UIKit side follows the keyboard itself
-            .navigationTitle(conversation.title)
+            .safeAreaInset(edge: .top, spacing: 0) { BusyBanner(conversation: conversation) }
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarTitleMenu {
+                RenameButton()
+                ShareLink(item: ChatExport(conversation), preview: SharePreview(conversation.title)) {
+                    Label("Export Chat", systemImage: "square.and.arrow.up")
+                }
+                .disabled(conversation.messages.isEmpty)
+            }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button(showInspector ? "Hide Info" : "Show Info", systemImage: "info.circle") {
+                        withAnimation { showInspector.toggle() }
+                    }
+                    .keyboardShortcut("i", modifiers: [.command, .option])
+                }
+            }
+            .inspector(isPresented: $showInspector) {
+                ChatInspector(conversation: conversation)
+                    .inspectorColumnWidth(min: 260, ideal: 300, max: 420)
+            }
+            #if DEBUG
+            .onAppear { if DebugLaunch.ui == "inspector" { showInspector = true } }
+            #endif
+            .focusedSceneValue(\.chat, ChatFocus(
+                conversation: conversation, mode: conversation.mode,
+                canChangeMode: engine.running != conversation.persistentModelID))
+            // The mode a new chat starts in follows the one last chosen or sent with.
+            .onChange(of: conversation.mode) { _, mode in lastMode = mode.rawValue }
+            .onChange(of: conversation.messages.count) { old, new in
+                if new > old { lastMode = conversation.mode.rawValue }
+            }
+    }
+
+    /// Renaming to nothing keeps the old title.
+    private var title: Binding<String> {
+        Binding(
+            get: { conversation.title },
+            set: { new in
+                let t = new.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !t.isEmpty { conversation.title = t }
+            })
     }
 
     private var revision: Int {
@@ -323,13 +369,53 @@ struct ChatScreen: View {
     }
 }
 
+/// When another chat (maybe in another window) is answering, or Readiness is testing a model, this
+/// chat can't send. Says so above the transcript, with a way to stop it.
+private struct BusyBanner: View {
+    let conversation: Conversation
+    @Environment(Engine.self) private var engine
+    @Environment(\.modelContext) private var context
+
+    var body: some View {
+        if let text {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                Text(text).lineLimit(2)
+                Spacer(minLength: 8)
+                if engine.running != nil {
+                    Button("Stop") { engine.stop() }.buttonStyle(.bordered).controlSize(.small)
+                }
+            }
+            .font(.footnote)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(.bar)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    private var text: String? {
+        if let model = engine.testing { return "Testing \(model.name). Chats can send when it's done." }
+        guard let running = engine.running, running != conversation.persistentModelID else { return nil }
+        if let other: Conversation = context.registeredModel(for: running) {
+            return "“\(other.title)” is answering. This chat can send when it's done."
+        }
+        return "Another chat is answering. This chat can send when it's done."
+    }
+}
+
 private struct ChatControllerView: UIViewControllerRepresentable {
     let conversation: Conversation
     let engine: Engine
     let revision: Int
+    let showReadiness: ShowReadinessAction
 
     func makeUIViewController(context: Context) -> ChatViewController {
-        ChatViewController(conversation: conversation, engine: engine)
+        let controller = ChatViewController(conversation: conversation, engine: engine)
+        // HOOK(chat): wire the controller's closures once ChatViewController exposes them:
+        // controller.onOpenReadiness = { showReadiness() }
+        // controller.onBeginTyping = { /* HOOK(engine): engine.prepare(mode: conversation.mode, for: conversation) */ }
+        return controller
     }
 
     func updateUIViewController(_ controller: ChatViewController, context: Context) {
