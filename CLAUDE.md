@@ -19,7 +19,12 @@ MainActor default isolation, SwiftData. Three modes behind one chat:
   converts; `MacLink` talks to Ollama.
 - `Lantern/Chat`: the chat screen, in UIKit. `ChatScreen` at the bottom of `ChatViewController.swift`
   is its SwiftUI wrapper: editable title and title menu (Rename, Export as Markdown), the inspector,
-  and the banner shown while another chat or a model test holds the engine.
+  and the banner shown while another chat or a model test holds the engine. `Attachments.swift`
+  reads files into `Attachment`s (PDFKit for PDFs, images downscaled to a 1024 px JPEG) and draws
+  their chips; files come from the composer's paperclip menu, a drop anywhere on the chat, or paste.
+  `Dictation.swift` is the composer's mic: on-device only, `SpeechAnalyzer`/`SpeechTranscriber` on
+  iOS 26+, `SFSpeechRecognizer` with `requiresOnDeviceRecognition` otherwise; the button is hidden
+  when neither works for the language.
 - `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window (sidebar with search,
   date sections, pin, rename, delete with undo); `LanternCommands` is the iPad menu bar, reaching
   the key window through `focusedSceneValue` (`SceneActions`, `ChatFocus`); `ChatList` holds the
@@ -44,7 +49,11 @@ cd Packages/LlamaKit && swift build -c release && .build/release/lantern-smoke .
 ```
 
 In a Debug build, `simctl launch --console <device> com.merimerimeri.Lantern -selftest` tests each
-downloaded model, and `-enginetest [-smart] [-convert]` drives a short chat through `Engine`.
+downloaded model, `-enginetest [-smart] [-convert]` drives a short chat through `Engine`, and
+`-featuretest [-smart] [-image <path>]` checks that a date note, an attached file and an image keep
+the cache append-only (the follow-up must reuse everything; in-memory store, no chats touched).
+`lantern-smoke <gemma>.gguf --lazy --f16 --mmproj <mmproj>.gguf --image <file>` checks images on
+the Mac: the image is encoded once and reused by the follow-up and a retry.
 
 The official xcframework has no simulator slice. For the simulator, build llama.cpp's
 `build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
@@ -85,7 +94,28 @@ Debug builds take launch arguments for checking the UI without tapping (`DebugLa
   `lantern-smoke --state` on both models after touching it.
 - **The system prompt is frozen per chat** (`Conversation.systemPrompt`, set at creation, date
   included). It's the start of every cache and saved state: anything in it that changes between
-  turns makes Inkling read the whole chat again.
+  turns makes Inkling read the whole chat again. When a question is sent on a later day than the
+  model last heard (the prompt's date or the last note), `Engine.send` stores a `dateNote`
+  ("(Today is …)") on that message, which goes before its text.
+- **A user turn is rendered from stored fields only** (`StoredMessage.chatMessage`): date note,
+  then each text file as `<file name="…">…</file>`, then the typed text, joined by blank lines;
+  images go in `ChatMessage.images`. Never derive any of it from the current date, settings or
+  file contents at send time again: history passed back must be byte-identical.
+- **Images**: Fast sees them through Gemma's vision projector (`CatalogModel.gemmaVision`, an
+  optional extra in Readiness, ~1 GB, loaded beside Gemma only when a chat has an image;
+  `LlamaModel.loadVision`). A prompt with images is tokenized by mtmd and always rendered in full;
+  each image position gets a stand-in token from its bytes, so the shared prefix is reused and an
+  image is encoded once. Only models that can rewind have a projector here. Smart can't see images
+  (the turn is sent without them). Mac sends them in Ollama's `images` if `/api/show` lists
+  `vision` for the model, else fails a question about an image with `MacError.noVision`.
+- **Leaving the app mid-reply (iOS 26+)**: `Engine` submits a `BGContinuedProcessingTaskRequest`
+  (`com.merimerimeri.Lantern.reply.<uuid>`, registered just before, strategy `.fail`) as a reply
+  starts: always for Mac, for on-device only if `BGTaskScheduler.supportedResources` has `.gpu`
+  (needs the `com.apple.developer.background-tasks.continued-processing.gpu` entitlement, not yet
+  added) or in the simulator (CPU). Progress is pieces against an estimate; expiry stops and saves.
+  Without a started task it's the old behaviour: on-device stops ("Stopped when you left
+  Lantern"), Mac gets the usual few seconds. A reply that finishes in the background posts a
+  local notification (provisional authorization, never a prompt).
 - **Inkling's GGUFs must be converted before Metal runs all of them.** Unsloth stores some
   `ffn_down_exps` tensors as NVFP4, which Metal has no kernel for: those layers fall back to the
   CPU (Mac: prefill 50 tok/s instead of 1100, generation 18 instead of 34). `ModelStore.convert`
@@ -103,7 +133,8 @@ Debug builds take launch arguments for checking the UI without tapping (`DebugLa
   assume: no disaster or emergency framing in the prompt, starters or copy.
 - **Offline first.** Nothing may need the network to launch or to open an existing chat.
 - **Conversation changes are additive** (new stored properties with defaults, like `pinned`), so
-  SwiftData migrates existing chats without a schema version.
+  SwiftData migrates existing chats without a schema version. The same goes for `StoredMessage`
+  and `ChatMessage` (optional `attachments`, `dateNote`, `images`), which are also in saved states.
 - **Menu bar shortcuts are idempotent.** ⌘1–3 and ⌘. exist both in `LanternCommands` and as
   `UIKeyCommand`s on `ChatViewController`; whichever UIKit routes the key to, it sets the same mode
   or cancels the same task.
