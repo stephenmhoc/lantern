@@ -1,5 +1,6 @@
 import Foundation
 import LlamaKit
+import Metal
 import Observation
 import os
 import SwiftData
@@ -102,7 +103,7 @@ final class Engine {
             var failure: Error?
             var lastSave = Date()
             var statsKey: String?
-            do {
+            attempts: while true { do {
                 let stream: AsyncThrowingStream<Generation, Error>
                 if mode == .mac {
                     live.phase = .waiting
@@ -142,11 +143,18 @@ final class Engine {
                         lastSave = .now
                     }
                 }
+            } catch LlamaError.processFailed where mode != .mac && model(for: mode).map(Self.canMoveExperts) == true {
+                // The GPU gave up (Metal out of memory, error -3): from now on this model keeps its
+                // experts on the CPU. Try again at once if nothing has been shown yet.
+                if let model = model(for: mode) { UserDefaults.standard.set(true, forKey: Self.cpuExpertsKey(model)) }
+                if let old = llama { llama = nil; loadedModel = nil; await old.flush() }
+                if live.text.isEmpty && live.thinking.isEmpty { continue attempts }
+                failure = LlamaError.processFailed(-3)
             } catch is CancellationError {
             } catch LlamaError.cancelled {
             } catch {
                 failure = error
-            }
+            }; break attempts }
             finish(live, in: conversation, stats: stats, error: failure, statsKey: statsKey)
         }
     }
@@ -444,6 +452,26 @@ final class Engine {
         Task { await old.flush() }  // `old` is freed when this is done
     }
 
+    /// Whether a mixture-of-experts model should keep its experts on the CPU: when it's bigger than
+    /// three quarters of what iOS lets the GPU use, or after the GPU has already failed with it once.
+    /// Inkling's 9-12 GB doesn't fit a 12 GB iPhone or iPad mini's GPU budget; Metal then fails the
+    /// first command buffer instead of paging.
+    static func needsCPUExperts(_ model: CatalogModel) -> Bool {
+        guard canMoveExperts(model) else { return false }
+        if UserDefaults.standard.bool(forKey: cpuExpertsKey(model)) { return true }
+        #if DEBUG
+        // `-allgpu`: skip the size check, to see the GPU fail and the fallback take over.
+        if ProcessInfo.processInfo.arguments.contains("-allgpu") { return false }
+        #endif
+        guard let budget = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize, budget > 0 else { return true }
+        return Double(model.bytes) > Double(budget) * 0.75
+    }
+
+    /// Only the mixture-of-experts models (Smart) have experts to move.
+    nonisolated static func canMoveExperts(_ model: CatalogModel) -> Bool { model.tier == .smart }
+
+    nonisolated static func cpuExpertsKey(_ model: CatalogModel) -> String { "cpuExperts.\(model.id)" }
+
     /// One load at a time, shared by whoever asks for the same model (a `prepare` and the message
     /// sent while it was still loading). Cancelling the caller's task (Stop) abandons the load.
     private func load(_ model: CatalogModel) async throws -> LlamaModel {
@@ -466,7 +494,8 @@ final class Engine {
                 if llama != nil || pendingLoad != nil { return try await load(model) }
             }
             let path = store.url(for: model).path
-            let options = model.options
+            var options = model.options
+            options.expertsOnCPU = Self.needsCPUExperts(model)
             let cancel = CancelFlag()
             let report: @Sendable (Float) -> Void = { progress in
                 Task { @MainActor in

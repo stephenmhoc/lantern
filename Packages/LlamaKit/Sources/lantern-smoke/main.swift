@@ -1,7 +1,7 @@
 import Foundation
 import LlamaKit
 
-// swift run lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--template] [prompt]
+// swift run lantern-smoke <model.gguf> [--lazy] [--f16] [--cpu-experts] [--think] [--stop] [--state] [--template] [prompt]
 // swift run lantern-smoke <model.gguf> --convert [iq4_nl|q4_0]     (rewrites the file in place)
 //
 // Two turns, so the second shows whether the cache was extended. --stop also stops a reply after
@@ -10,7 +10,7 @@ import LlamaKit
 // match byte for byte, then after a stopped reply and as a retry, which must not re-read the chat.
 let args = Array(CommandLine.arguments.dropFirst().dropFirst())
 guard CommandLine.arguments.count > 1 else {
-    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--template] [prompt]")
+    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--cpu-experts] [--think] [--stop] [--state] [--template] [prompt]")
     print("       lantern-smoke <model.gguf> --convert [iq4_nl|q4_0]")
     exit(2)
 }
@@ -42,7 +42,8 @@ if args.contains("--convert") {
 }
 let firstPrompt = args.first { !$0.hasPrefix("--") } ?? "In two sentences: how do I purify water if the power is out?"
 let thinking: Thinking = args.contains("--think") ? .low : .off
-let options = ModelOptions(lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"))
+let options = ModelOptions(
+    lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"), expertsOnCPU: args.contains("--cpu-experts"))
 let system = ChatMessage(role: .system, content: "You are Lantern, a helpful assistant. This conversation began on Sunday, November 22, 2026.")
 
 struct Reply {

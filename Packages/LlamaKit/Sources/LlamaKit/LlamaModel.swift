@@ -46,11 +46,19 @@ public struct ModelOptions: Sendable, Hashable {
     /// F16 instead of Q8_0 for the KV cache: twice the memory, faster attention on models whose
     /// cache is small (Gemma). Not worth it on Inkling, whose cache is ten times larger.
     public var f16Cache: Bool
+    /// Keeps a mixture-of-experts model's expert weights (`ffn_*_exps`) on the CPU, read straight
+    /// from the memory-mapped file, and puts only the rest (attention, shared layers, a few hundred
+    /// MB) on the GPU. Needed when the whole model is more than iOS lets the GPU use: Metal then
+    /// fails the first command buffer (llama.cpp's error -3). Slower than all-GPU, but it runs.
+    public var expertsOnCPU: Bool
 
-    public init(contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false) {
+    public init(
+        contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false, expertsOnCPU: Bool = false
+    ) {
         self.contextLength = contextLength
         self.lazyEmbeddings = lazyEmbeddings
         self.f16Cache = f16Cache
+        self.expertsOnCPU = expertsOnCPU
     }
 }
 
@@ -166,7 +174,22 @@ public final class LlamaModel: @unchecked Sendable {
             return llama_model_load_from_file(path, mp)
         }
         #else
-        let loaded = llama_model_load_from_file(path, mp)
+        let loaded: OpaquePointer?
+        if options.expertsOnCPU {
+            // The pattern must outlive the load; the list ends with a null entry.
+            let pattern = strdup("\\.ffn_(up|down|gate|gate_up)_exps")
+            defer { free(pattern) }
+            let overrides = [
+                llama_model_tensor_buft_override(pattern: pattern, buft: ggml_backend_cpu_buffer_type()),
+                llama_model_tensor_buft_override(pattern: nil, buft: nil),
+            ]
+            loaded = overrides.withUnsafeBufferPointer { buf in
+                mp.tensor_buft_overrides = buf.baseAddress
+                return llama_model_load_from_file(path, mp)
+            }
+        } else {
+            loaded = llama_model_load_from_file(path, mp)
+        }
         #endif
         guard let model = loaded else {
             throw isCancelled?() == true ? LlamaError.cancelled : LlamaError.loadFailed(path)
