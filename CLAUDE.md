@@ -25,6 +25,17 @@ MainActor default isolation, SwiftData. Three modes behind one chat:
   the key window through `focusedSceneValue` (`SceneActions`, `ChatFocus`); `ChatList` holds the
   sidebar's grouping, the default mode for new chats and the undo snapshot; `ModelImport` copies a
   `.gguf` the user already has into Documents (Readiness's file picker and drop target).
+- `Lantern/System`: the ways in from outside the app. `LanternLink` is the `lantern://` scheme
+  (`new?mode=fast`, `ask?text=…&mode=`, `chat/<id>`), shared with the widgets. App Intents
+  (`LanternIntents`: Ask Lantern, Open Chat and the App Shortcuts phrases; `NewChatIntent`, shared
+  with the widgets for the control) all open the app and hand off to `SystemRouter`, which the key
+  window's `RootView` claims; URLs arrive through `onOpenURL` and Spotlight taps through
+  `onContinueUserActivity`, both in `RootView.handle`. `ChatEntity` is a chat for intents, Siri and
+  Spotlight; `SpotlightIndex` indexes title plus the first lines after every store save and removes
+  deleted chats, diffing against what it last indexed.
+- `LanternWidgets`: the widget extension (`com.merimerimeri.Lantern.Widgets`): Ask Lantern
+  (small/medium, mode buttons), a Lock Screen accessory and a Control Center control. Deep links
+  and static content only; the build expiry comes from the app's Info.plist (`../../Info.plist`).
 - Windows: one `WindowGroup(for: PersistentIdentifier.self)`. A plain window opens with no value;
   "Open in New Window" opens one with a chat's identifier. Each window restores its own selection
   with `@SceneStorage`; all share the app's one `Engine`, so a second chat can't send while one
@@ -52,6 +63,10 @@ simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't ma
 Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
 `-seedChats`, `-ui readiness|settings|inspector|search:<text>|delete|newchat|sidebar|next|window`,
 `-testflight` (show the expiry and reminders), `-importModel <path>`, and `-selftest`.
+For the system integration: `-openURL <lantern://…>` (the app opens the link through the system
+itself; `simctl openurl` stops at an "Open in Lantern?" prompt that needs a tap),
+`-intent ask:<text>|new:<mode>|open:<title>` (runs that intent's `perform()`) and
+`-spotlightQuery <text>` (searches Lantern's own Spotlight items after indexing).
 
 `scripts/fetch-tailscale.sh` builds TailscaleKit (needs Go) for signing into the tailnet; without it
 `Tailnet` compiles out.
@@ -104,6 +119,12 @@ Debug builds take launch arguments for checking the UI without tapping (`DebugLa
 - **Offline first.** Nothing may need the network to launch or to open an existing chat.
 - **Conversation changes are additive** (new stored properties with defaults, like `pinned`), so
   SwiftData migrates existing chats without a schema version.
+- **A chat's outside identity is `Conversation.stateID`** (`externalID`): deep links, Spotlight
+  items and `ChatEntity` all use it, so it must never change once set.
+- **No App Group.** It would have to be registered in the developer portal by hand. The widgets only
+  deep-link; there is no share extension, because one can't open the app without an unsupported
+  responder-chain trick. From the share sheet, a user's own Shortcut ("Show in Share Sheet",
+  Shortcut Input → Ask Lantern) does it.
 - **Menu bar shortcuts are idempotent.** ⌘1–3 and ⌘. exist both in `LanternCommands` and as
   `UIKeyCommand`s on `ChatViewController`; whichever UIKit routes the key to, it sets the same mode
   or cancels the same task.
@@ -111,3 +132,11 @@ Debug builds take launch arguments for checking the UI without tapping (`DebugLa
   upload; Readiness shows the date from `LanternBuildDate`, stamped into Info.plist at build time,
   and offers local reminders 14 and 3 days before (permission is asked from that button, never at
   launch).
+- **CI signs two targets.** `Tools/app_store_connect_signing.rb prepare` finds or creates an App Store
+  profile per bundle ID, named after the certificate: `Lantern App Store <cert id>` for
+  `com.merimerimeri.Lantern` and `Lantern Widgets App Store <cert id>` for
+  `com.merimerimeri.Lantern.Widgets`. The archive passes their names as `LANTERN_APP_PROFILE` and
+  `LANTERN_WIDGETS_PROFILE`, which each target's `PROVISIONING_PROFILE_SPECIFIER` reads (empty
+  locally, where signing is automatic). Never pass `PROVISIONING_PROFILE_SPECIFIER` itself: it would
+  apply to both targets. A new extension needs the same: bundle ID, profile, specifier variable and
+  an ExportOptions entry.
