@@ -7,24 +7,49 @@ import UniformTypeIdentifiers
 /// context it has used, how fast the last reply was, and the system prompt.
 struct ChatInspector: View {
     let conversation: Conversation
+    /// Hides it; used for the Done button when it's a sheet.
+    let close: () -> Void
     @Environment(Engine.self) private var engine
     @Environment(MacLink.self) private var mac
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     var body: some View {
         // Memory, battery and heat change while it's open.
-        TimelineView(.periodic(from: .now, by: 2)) { _ in form }
+        let content = TimelineView(.periodic(from: .now, by: 2)) { _ in form }
+        if sizeClass == .compact {
+            // On iPhone the inspector is a sheet with nothing above the form, so the first section
+            // started at the sheet's very edge. A header of its own gives it room and a way out.
+            // Not a NavigationStack with a toolbar: an inspector's toolbar items and title go to the
+            // chat's navigation bar, not the sheet's.
+            VStack(spacing: 0) {
+                ZStack {
+                    Text("Info").font(.headline)
+                    HStack {
+                        Spacer()
+                        Button("Done", action: close).fontWeight(.semibold)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 24)
+                .padding(.bottom, 8)
+                content
+            }
+            .background(Color(.systemGroupedBackground))
+            .presentationDragIndicator(.visible)
+        } else {
+            content
+        }
     }
 
     private var form: some View {
         Form {
             Section("Model") {
-                LabeledContent("Mode", value: conversation.mode.title)
                 LabeledContent("Model", value: modelName)
+                LabeledContent("Runs on", value: conversation.mode.isOnDevice ? "This device" : "Your Mac")
                 if conversation.mode == .mac {
                     LabeledContent("Connected by", value: mac.route.label)
                 }
-                LabeledContent("Thinking", value: conversation.mode == .smart && conversation.thinking == .off
-                               ? "A little (Smart always thinks)" : conversation.thinking.rawValue.capitalized)
+                LabeledContent("Thinking", value: conversation.thinking.rawValue.capitalized)
             }
 
             Section {
@@ -67,7 +92,8 @@ struct ChatInspector: View {
     private var modelName: String {
         switch conversation.mode {
         case .mac:
-            return mac.modelName.isEmpty ? "Ollama's first model" : mac.modelName
+            let name = conversation.resolvedMacModel
+            return name.isEmpty ? "Ollama's first model" : "\(MacLink.displayName(name)) (\(name))"
         case .fast, .smart:
             guard let model = engine.model(for: conversation.mode) else { return "None" }
             return engine.store.states[model.id] == .ready ? model.name : "\(model.name) (not on this device)"

@@ -20,9 +20,13 @@ private func styled<T: UITextView>(_ view: T, style: UIFont.TextStyle, color: UI
 }
 
 /// The answer's text view, on TextKit 1 with `BlockLayoutManager` so code blocks and tables get
-/// one even background each.
+/// one even background each. Each code block gets a real Copy button at the end of its first line,
+/// placed after layout, so it stays put while the reply streams.
 private final class AnswerTextView: UITextView {
     private let storage = NSTextStorage()  // the text view doesn't keep its own storage alive
+    private var copyButtons: [HitButton] = []
+    private var copied: Int?
+    private var copiedReset: Task<Void, Never>?
 
     init() {
         let layout = BlockLayoutManager()
@@ -31,9 +35,109 @@ private final class AnswerTextView: UITextView {
         container.widthTracksTextView = true
         layout.addTextContainer(container)
         super.init(frame: .zero, textContainer: container)
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
+            self.copyButtons.forEach { $0.setNeedsUpdateConfiguration() }
+            self.setNeedsLayout()
+        }
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override var attributedText: NSAttributedString! {
+        didSet { setNeedsLayout() }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        placeCopyButtons()
+    }
+
+    /// For a reused cell: no button still says "Copied".
+    func resetCopied() {
+        copiedReset?.cancel()
+        copied = nil
+        for button in copyButtons { style(button, copied: false) }
+    }
+
+    /// The character ranges of the code blocks' first lines, in order.
+    private var codeHeaders: [NSRange] {
+        var headers: [NSRange] = []
+        textStorage.enumerateAttribute(.lanternCode, in: NSRange(location: 0, length: textStorage.length)) { value, range, _ in
+            if value != nil { headers.append(range) }
+        }
+        return headers
+    }
+
+    private func placeCopyButtons() {
+        let headers = codeHeaders
+        while copyButtons.count < headers.count { copyButtons.append(makeCopyButton(index: copyButtons.count)) }
+        for (i, button) in copyButtons.enumerated() {
+            button.isHidden = i >= headers.count
+            guard i < headers.count else { continue }
+            let glyph = layoutManager.glyphIndexForCharacter(at: headers[i].location)
+            let line = layoutManager.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
+            let size = button.intrinsicContentSize
+            button.frame = CGRect(
+                x: bounds.width - Markdown.blockInset - size.width,
+                y: textContainerInset.top + line.midY - size.height / 2,
+                width: size.width, height: size.height
+            ).integral
+        }
+        // The text view is one accessibility element, so VoiceOver can't reach the buttons inside it.
+        let actions = headers.indices.map { i in
+            UIAccessibilityCustomAction(name: headers.count == 1 ? "Copy code" : "Copy code block \(i + 1)") { [weak self] _ in
+                self?.copyCode(i)
+                return true
+            }
+        }
+        if accessibilityCustomActions?.count != actions.count { accessibilityCustomActions = actions }
+    }
+
+    private func makeCopyButton(index: Int) -> HitButton {
+        let button = HitButton(configuration: .plain())
+        button.isPointerInteractionEnabled = true
+        style(button, copied: false)
+        button.addAction(UIAction { [weak self] _ in self?.copyCode(index) }, for: .primaryActionTriggered)
+        addSubview(button)
+        return button
+    }
+
+    private func style(_ button: UIButton, copied: Bool) {
+        var config = UIButton.Configuration.plain()
+        config.title = copied ? "Copied" : "Copy"
+        config.image = UIImage(systemName: copied ? "checkmark" : "doc.on.doc")
+        config.imagePadding = 4
+        config.contentInsets = NSDirectionalEdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6)
+        config.baseForegroundColor = copied ? .tintColor : .secondaryLabel
+        config.preferredSymbolConfigurationForImage = .init(textStyle: .caption1, scale: .small)
+        config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = UIFont.preferredFont(forTextStyle: .caption1).withTraits(.traitBold)
+            return attributes
+        }
+        button.configuration = config
+        button.accessibilityLabel = copied ? "Copied" : "Copy code"
+    }
+
+    private func copyCode(_ index: Int) {
+        let headers = codeHeaders
+        guard headers.indices.contains(index),
+              let code = textStorage.attribute(.lanternCode, at: headers[index].location, effectiveRange: nil) as? String
+        else { return }
+        UIPasteboard.general.string = code
+        UIAccessibility.post(notification: .announcement, argument: "Code copied")
+        if let old = copied, copyButtons.indices.contains(old) { style(copyButtons[old], copied: false) }
+        copied = index
+        style(copyButtons[index], copied: true)
+        setNeedsLayout()  // "Copied" is wider than "Copy"
+        copiedReset?.cancel()
+        copiedReset = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled, let self else { return }
+            resetCopied()
+            setNeedsLayout()
+        }
+    }
 }
 
 final class UserCell: UICollectionViewCell {
@@ -134,6 +238,8 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     private let thoughtTail = UILabel()
     private let thinkingButton = UIButton(configuration: .plain())
     private let thinkingText = makeTextView(style: .callout, color: .secondaryLabel)
+    /// The thought process, set off from the answer by a bar down its leading edge.
+    private let thinkingBox = UIView()
     private let answer = styled(AnswerTextView(), style: .body, color: .label)
     private let errorLabel = UILabel()
     private let errorRow = UIStackView()
@@ -156,8 +262,6 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
 
     private var text = ""
     private var renderedKey: String?
-    private var copiedBlock: Int?
-    private var copiedReset: Task<Void, Never>?
 
     /// The answer, for the context menu's preview.
     var previewView: UIView { answer.isHidden ? contentView : answer }
@@ -180,7 +284,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
 
         thoughtTail.font = .preferredFont(forTextStyle: .footnote)
         thoughtTail.adjustsFontForContentSizeCategory = true
-        thoughtTail.textColor = .tertiaryLabel
+        thoughtTail.textColor = .secondaryLabel  // tertiary is too faint for text read while it streams
         thoughtTail.numberOfLines = 2
         thoughtTail.accessibilityLabel = "Latest thought"
 
@@ -194,6 +298,24 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         thinkingButton.contentHorizontalAlignment = .leading
         thinkingButton.isPointerInteractionEnabled = true
         thinkingButton.addAction(UIAction { [weak self] _ in self?.onToggleThinking?() }, for: .primaryActionTriggered)
+
+        let thinkingBar = UIView()
+        thinkingBar.backgroundColor = .separator
+        thinkingBar.layer.cornerRadius = 1
+        thinkingBar.translatesAutoresizingMaskIntoConstraints = false
+        thinkingText.translatesAutoresizingMaskIntoConstraints = false
+        thinkingBox.addSubview(thinkingBar)
+        thinkingBox.addSubview(thinkingText)
+        NSLayoutConstraint.activate([
+            thinkingBar.leadingAnchor.constraint(equalTo: thinkingBox.leadingAnchor, constant: 2),
+            thinkingBar.widthAnchor.constraint(equalToConstant: 2),
+            thinkingBar.topAnchor.constraint(equalTo: thinkingBox.topAnchor, constant: 2),
+            thinkingBar.bottomAnchor.constraint(equalTo: thinkingBox.bottomAnchor, constant: -2),
+            thinkingText.leadingAnchor.constraint(equalTo: thinkingBar.trailingAnchor, constant: 12),
+            thinkingText.trailingAnchor.constraint(equalTo: thinkingBox.trailingAnchor),
+            thinkingText.topAnchor.constraint(equalTo: thinkingBox.topAnchor),
+            thinkingText.bottomAnchor.constraint(equalTo: thinkingBox.bottomAnchor),
+        ])
 
         answer.delegate = self
 
@@ -238,13 +360,14 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         errorRow.alignment = .leading
 
         let stack = UIStackView(arrangedSubviews: [
-            statusRow, progress, thoughtTail, thinkingButton, thinkingText, answer, errorLabel, errorRow, footerRow,
+            statusRow, progress, thoughtTail, thinkingButton, thinkingBox, answer, errorLabel, errorRow, footerRow,
         ])
         stack.axis = .vertical
         stack.spacing = 8
         stack.alignment = .fill
         stack.setCustomSpacing(4, after: statusRow)
         stack.setCustomSpacing(2, after: thinkingButton)
+        stack.setCustomSpacing(14, after: thinkingBox)
         stack.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -271,8 +394,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     override func prepareForReuse() {
         super.prepareForReuse()
         renderedKey = nil
-        copiedBlock = nil
-        copiedReset?.cancel()
+        answer.resetCopied()
     }
 
     func configure(_ content: AssistantContent) {
@@ -280,11 +402,15 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         let live = content.live
         let thinking = live?.thinking ?? message.thinking
         text = live?.text ?? message.content
+        #if DEBUG
+        if let sample = MarkdownSample.override { text = sample }
+        #endif
 
         // While it's being written: the glow, what it's doing and for how long, and progress.
         let statusText = content.status?.text ?? (message.finished ? nil : "Interrupted: Lantern closed before this finished.")
         statusRow.isHidden = statusText == nil
         status.text = statusText
+        status.accessibilityLabel = content.status?.accessibilityText
         if let s = content.status {
             glow.start()
             glow.intensity = s.intensity
@@ -303,8 +429,8 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         thinkingButton.configuration?.title = thinkingNow ? "Thinking" : "Thought process"
         thinkingButton.configuration?.image = UIImage(systemName: content.thinkingExpanded ? "chevron.down" : "chevron.right")
         thinkingButton.accessibilityValue = content.thinkingExpanded ? "Shown" : "Hidden"
-        thinkingText.isHidden = thinking.isEmpty || !content.thinkingExpanded
-        if !thinkingText.isHidden, thinkingText.text != thinking { thinkingText.text = thinking }
+        thinkingBox.isHidden = thinking.isEmpty || !content.thinkingExpanded
+        if !thinkingBox.isHidden, thinkingText.text != thinking { thinkingText.text = thinking }
         thoughtTail.isHidden = !(thinkingNow && !thinking.isEmpty && !content.thinkingExpanded)
         if !thoughtTail.isHidden { thoughtTail.text = Self.tail(of: thinking) }
 
@@ -361,40 +487,13 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     }
 
     private func renderAnswer() {
-        let key = "\(traitCollection.preferredContentSizeCategory.rawValue)|\(copiedBlock ?? -1)|\(text)"
+        let key = "\(traitCollection.preferredContentSizeCategory.rawValue)|\(text)"
         guard key != renderedKey else { return }
         renderedKey = key
-        answer.attributedText = Markdown.render(text, traits: traitCollection, copied: copiedBlock)
+        answer.attributedText = Markdown.render(text, traits: traitCollection)
     }
 
-    // MARK: - Code blocks' Copy links, and the answer's own actions in its text menu
-
-    func textView(_ textView: UITextView, primaryActionFor textItem: UITextItem, defaultAction: UIAction) -> UIAction? {
-        guard case .link(let url) = textItem.content, url.scheme == Markdown.copyScheme else { return defaultAction }
-        let code = textView.textStorage.attribute(.lanternCode, at: textItem.range.location, effectiveRange: nil) as? String
-        let index = Int(url.host() ?? "")
-        return UIAction { [weak self] _ in
-            guard let self, let code else { return }
-            UIPasteboard.general.string = code
-            UIAccessibility.post(notification: .announcement, argument: "Code copied")
-            copiedBlock = index
-            renderAnswer()
-            copiedReset?.cancel()
-            copiedReset = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(1.5))
-                guard !Task.isCancelled, let self else { return }
-                copiedBlock = nil
-                renderAnswer()
-            }
-        }
-    }
-
-    func textView(
-        _ textView: UITextView, menuConfigurationFor textItem: UITextItem, defaultMenu: UIMenu
-    ) -> UITextItem.MenuConfiguration? {
-        if case .link(let url) = textItem.content, url.scheme == Markdown.copyScheme { return nil }
-        return UITextItem.MenuConfiguration(menu: defaultMenu)
-    }
+    // MARK: - The answer's own actions in its text menu
 
     /// Long-press or right-click on the answer's text selects it; its menu gets the answer's actions too.
     func textView(_ textView: UITextView, editMenuForTextIn range: NSRange, suggestedActions: [UIMenuElement]) -> UIMenu? {

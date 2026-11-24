@@ -40,7 +40,7 @@ enum SpotlightIndex {
         var changed: [CSSearchableItem] = []
         for c in chats where !c.messages.isEmpty {  // an empty "New chat" isn't worth finding
             let id = c.externalID
-            let signature = "\(c.updated.timeIntervalSince1970)|\(c.title)"
+            let signature = "\(c.lastActive.timeIntervalSince1970)|\(c.title)"
             now[id] = signature
             guard before[id] != signature else { continue }
             let entity = ChatEntity(c)

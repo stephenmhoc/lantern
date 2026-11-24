@@ -16,11 +16,12 @@ struct RootView: View {
     @Environment(\.horizontalSizeClass) private var sizeClass
     @Environment(\.openWindow) private var openWindow
     @Environment(\.supportsMultipleWindows) private var supportsMultipleWindows
-    @Query(sort: \Conversation.updated, order: .reverse) private var conversations: [Conversation]
+    @Query(sort: \Conversation.lastActive, order: .reverse) private var conversations: [Conversation]
     @State private var selection: Conversation?
     @SceneStorage("selection") private var storedSelection: String?
     @State private var restored = false
     @State private var sheet: Sheet?
+    @State private var settingsPath: [SettingsPage] = []
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var query = ""
     @State private var searching = false
@@ -32,9 +33,15 @@ struct RootView: View {
     @State private var window = WindowProbe()
     private let router = SystemRouter.shared
 
+    /// Readiness lives inside Settings: showing it opens Settings with it pushed.
     enum Sheet: String, Identifiable {
-        case readiness, settings
+        case settings
         var id: String { rawValue }
+    }
+
+    private func showSettings(readiness: Bool = false) {
+        settingsPath = readiness ? [.readiness] : []
+        sheet = .settings
     }
 
     private var sections: [ChatSection] { ChatSection.group(ChatSection.filter(conversations, query: query)) }
@@ -58,12 +65,14 @@ struct RootView: View {
             // The message box keeps focus behind a sheet, and its keyboard would cover the sheet.
             if shown != nil { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
         }
-        .sheet(item: $sheet) { sheet in
-            NavigationStack {
-                switch sheet {
-                case .readiness: ReadinessView()
-                case .settings: SettingsView()
-                }
+        .sheet(item: $sheet) { _ in
+            NavigationStack(path: $settingsPath) {
+                SettingsView()
+                    .navigationDestination(for: SettingsPage.self) { page in
+                        switch page {
+                        case .readiness: ReadinessView { sheet = nil }
+                        }
+                    }
             }
             .presentationSizing(.page)
         }
@@ -72,8 +81,8 @@ struct RootView: View {
             Button("Rename") { rename() }
             Button("Cancel", role: .cancel) {}
         }
-        .environment(\.showReadiness, OpenSheetAction { sheet = .readiness })
-        .environment(\.showSettings, OpenSheetAction { sheet = .settings })
+        .environment(\.showReadiness, OpenSheetAction { showSettings(readiness: true) })
+        .environment(\.showSettings, OpenSheetAction { showSettings() })
         .environment(\.openChat, OpenChatAction { selection = $0 })
         .focusedSceneValue(\.sceneActions, actions)
         .onAppear(perform: restoreSelection)
@@ -136,7 +145,7 @@ struct RootView: View {
                     ForEach(section.chats) { c in
                         ChatRow(conversation: c, answering: engine.running == c.persistentModelID)
                             .tag(c)
-                            .swipeActions(edge: .trailing) {
+                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                                 Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
                                 Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
                             }
@@ -152,6 +161,8 @@ struct RootView: View {
             }
         }
         .searchable(text: $query, isPresented: $searching, placement: .sidebar, prompt: "Search chats")
+        // Rows carry a preview and a date: give them room on iPad.
+        .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 400)
         .navigationTitle("Lantern")
         // Our own sidebar button, at the far left of the header instead of beside New chat.
         .toolbar(removing: .sidebarToggle)
@@ -161,37 +172,37 @@ struct RootView: View {
                     Button("Hide sidebar", systemImage: "sidebar.left") { toggleSidebar() }
                 }
             }
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .bottomBar) {
+                // Readiness is inside Settings; a warning on the gear says when it needs a look.
+                let ready = Readiness.isReady(store: store, engine: engine)
+                Button { showSettings(readiness: !ready) } label: {
+                    Image(systemName: "gearshape")
+                        .overlay(alignment: .topTrailing) {
+                            if !ready {
+                                Image(systemName: "exclamationmark.circle.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.white, .orange)
+                                    .offset(x: 6, y: -6)
+                            }
+                        }
+                }
+                .accessibilityLabel(ready ? "Settings" : "Settings, not ready to work offline")
+                Spacer()
                 // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
                 Button("New chat", systemImage: "square.and.pencil", action: { newChat() })
-            }
-            ToolbarItemGroup(placement: .bottomBar) {
-                let ready = Readiness.isReady(store: store, engine: engine)
-                Button { sheet = .readiness } label: {
-                    // Not a Label: toolbars collapse a Label to its icon, and the word matters here.
-                    // Orange only on the icon: orange text on the bar is hard to read.
-                    HStack(spacing: 6) {
-                        Image(systemName: ready ? "checkmark.seal" : "exclamationmark.triangle")
-                            .foregroundStyle(ready ? Color.accentColor : .orange)
-                        Text("Readiness").foregroundStyle(.primary)
-                    }
-                }
-                .accessibilityLabel(ready ? "Readiness" : "Readiness, not ready")
-                Spacer()
-                Button("Settings", systemImage: "gearshape") { sheet = .settings }
             }
         }
         .overlay {
             if conversations.isEmpty {
                 ContentUnavailableView {
-                    Label("No chats", systemImage: "flame")
+                    Label(store.downloaded.isEmpty ? "Welcome to Lantern" : "No chats yet", systemImage: "flame")
                 } description: {
                     Text(store.downloaded.isEmpty
-                         ? "Get the models while you have internet, so Lantern works when you don't."
-                         : "Everything runs on this device.")
+                         ? "Get the models while you have internet. After that, Lantern answers on this device with no connection."
+                         : "Start one, and it stays on this device.")
                 } actions: {
                     if store.downloaded.isEmpty {
-                        Button("Get models") { sheet = .readiness }.buttonStyle(.borderedProminent)
+                        Button("Get models") { showSettings(readiness: true) }.buttonStyle(.borderedProminent)
                     } else {
                         Button("New chat", action: { newChat() }).buttonStyle(.borderedProminent)
                     }
@@ -227,8 +238,8 @@ struct RootView: View {
         let toggle: (() -> Void)? = hasSidebarToggle ? { toggleSidebar() } : nil
         return SceneActions(
             newChat: { newChat() },
-            showSettings: { sheet = .settings },
-            showReadiness: { sheet = .readiness },
+            showSettings: { showSettings() },
+            showReadiness: { showSettings(readiness: true) },
             find: { find() },
             deleteSelected: deleteSelected,
             previous: previous,
@@ -269,8 +280,8 @@ struct RootView: View {
         #if DEBUG
         DebugLaunch.seed(context)
         switch DebugLaunch.ui {
-        case "readiness"?: sheet = .readiness
-        case "settings"?: sheet = .settings
+        case "readiness"?: showSettings(readiness: true)
+        case "settings"?: showSettings()
         case let ui? where ui.hasPrefix("search:"):
             query = String(ui.dropFirst("search:".count))
             searching = true
@@ -305,7 +316,7 @@ struct RootView: View {
             selection = conversations.first
         }
         // First run: straight to getting the models (in the first window only).
-        if opened == nil, conversations.isEmpty, store.downloaded.isEmpty { sheet = .readiness }
+        if opened == nil, conversations.isEmpty, store.downloaded.isEmpty { showSettings(readiness: true) }
     }
 
     @discardableResult
@@ -315,7 +326,7 @@ struct RootView: View {
         // Reuse an empty chat rather than stacking up "New chat" rows.
         if let empty = conversations.first(where: { $0.messages.isEmpty && !$0.pinned }) {
             empty.mode = mode
-            empty.updated = .now
+            empty.lastActive = .now
             selection = empty
             return empty
         }

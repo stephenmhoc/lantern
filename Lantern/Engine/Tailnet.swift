@@ -63,6 +63,15 @@ final class Tailnet {
         #endif
     }
 
+    /// Waits while the node is still connecting (it starts at launch), up to `limit`, so a check of
+    /// the Mac right after launch goes through it instead of failing without it.
+    func waitWhileStarting(upTo limit: Duration) async {
+        let deadline = ContinuousClock.now + limit
+        while state == .starting, ContinuousClock.now < deadline, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
     func signIn() async {
         UserDefaults.standard.set(true, forKey: Self.signedInKey)
         await start()

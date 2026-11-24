@@ -21,6 +21,7 @@ final class ComposerView: UIView, UITextViewDelegate {
     private var heightConstraint: NSLayoutConstraint!
     private var modeTitle = ""
     private let usesGlass: Bool
+    private lazy var tap = UIImpactFeedbackGenerator(style: .light, view: self)
     /// The chat's text column; the field's text and the controls line up with its edges.
     let columnGuide = UILayoutGuide()
     private var columnLeading: NSLayoutConstraint!
@@ -49,6 +50,7 @@ final class ComposerView: UIView, UITextViewDelegate {
         didSet {
             renderChips()
             updateButton()
+            announceAdded(since: oldValue)
         }
     }
     var isListening = false { didSet { updateMic() } }
@@ -110,6 +112,8 @@ final class ComposerView: UIView, UITextViewDelegate {
         sendButton.setContentHuggingPriority(.required, for: .horizontal)
         sendButton.addAction(UIAction { [weak self] _ in
             guard let self else { return }
+            // A light tap to confirm the button did something; the keyboard's Return needs none.
+            tap.impactOccurred(intensity: isRunning ? 0.8 : 0.5)
             if isRunning { onStop?() } else { onSend?() }
         }, for: .primaryActionTriggered)
 
@@ -149,7 +153,12 @@ final class ComposerView: UIView, UITextViewDelegate {
         micButton.isHidden = true
         micButton.setContentHuggingPriority(.required, for: .horizontal)
         micButton.setContentCompressionResistancePriority(.required, for: .horizontal)
-        micButton.addAction(UIAction { [weak self] _ in self?.onMic?() }, for: .primaryActionTriggered)
+        micButton.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            // Before the microphone starts: haptics are muted while recording.
+            tap.impactOccurred(intensity: 0.6)
+            onMic?()
+        }, for: .primaryActionTriggered)
         updateMic()
 
         chipStack.spacing = 6
@@ -172,6 +181,14 @@ final class ComposerView: UIView, UITextViewDelegate {
         controls.spacing = 8
         controls.alignment = .center
         controls.setCustomSpacing(2, after: micButton)
+        // At accessibility text sizes the mode button is a bare symbol and the others are small
+        // for their text: touch and hold shows each one large, with its name.
+        controls.addInteraction(UILargeContentViewerInteraction())
+        for button in [modeButton, attachButton, micButton, sendButton] {
+            button.showsLargeContentViewer = true
+            button.scalesLargeContentImage = true
+        }
+        attachButton.largeContentTitle = "Attach"
         let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, textView, controls])
         stack.setCustomSpacing(2, after: textView)
         stack.setCustomSpacing(0, after: statusView)
@@ -247,6 +264,8 @@ final class ComposerView: UIView, UITextViewDelegate {
     func setMode(title: String, symbol: String) {
         modeTitle = title
         modeButton.configuration?.image = UIImage(systemName: symbol)
+        modeButton.largeContentTitle = title
+        modeButton.largeContentImage = UIImage(systemName: symbol)
         updateModeTitle()
     }
 
@@ -278,7 +297,12 @@ final class ComposerView: UIView, UITextViewDelegate {
     private func updateHeight() {
         let line = textView.font?.lineHeight ?? 20
         let minHeight = max(38, ceil(line) + 18)
-        let maxHeight = line * 6 + 18
+        // Six lines, but at the largest text sizes six lines would cover most of an iPhone over
+        // the keyboard: no more than a third of the window there, and always at least two lines.
+        var maxHeight = line * 6 + 18
+        if let window, isAccessibilitySize {
+            maxHeight = max(line * 2 + 18, min(maxHeight, window.bounds.height / 3))
+        }
         guard textView.bounds.width > 0 else {
             heightConstraint.constant = minHeight
             return
@@ -294,6 +318,9 @@ final class ComposerView: UIView, UITextViewDelegate {
         let name = isRunning ? "stop.circle.fill" : "arrow.up.circle.fill"
         sendButton.configuration?.image = UIImage(systemName: name)
         sendButton.accessibilityLabel = isRunning ? "Stop" : "Send"
+        sendButton.accessibilityUserInputLabels = isRunning ? ["Stop", "Stop answer"] : ["Send"]
+        sendButton.largeContentTitle = sendButton.accessibilityLabel
+        sendButton.largeContentImage = UIImage(systemName: name)
         sendButton.isEnabled = isRunning || (canSend && (hasText || !attachments.isEmpty))
     }
 
@@ -301,6 +328,10 @@ final class ComposerView: UIView, UITextViewDelegate {
         micButton.configuration?.image = UIImage(systemName: isListening ? "mic.fill" : "mic")
         micButton.configuration?.baseForegroundColor = isListening ? .systemRed : nil
         micButton.accessibilityLabel = isListening ? "Stop dictation" : "Dictate"
+        micButton.accessibilityUserInputLabels = isListening ? ["Stop dictation", "Stop listening"] : ["Dictate", "Microphone"]
+        micButton.accessibilityValue = isListening ? "Listening" : nil
+        micButton.largeContentTitle = micButton.accessibilityLabel
+        micButton.largeContentImage = micButton.configuration?.image
         if isListening {
             micButton.imageView?.addSymbolEffect(.pulse, options: .repeating)
         } else {
@@ -312,16 +343,38 @@ final class ComposerView: UIView, UITextViewDelegate {
         chipStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for attachment in attachments {
             chipStack.addArrangedSubview(AttachmentChip(attachment) { [weak self] in
-                guard let self else { return }
-                attachments.removeAll { $0.id == attachment.id }
-                onAttachmentsChange?()
+                self?.remove(attachment)
             })
         }
         chipScroll.isHidden = attachments.isEmpty
+        chipScroll.accessibilityContainerType = .semanticGroup
+        chipScroll.accessibilityLabel = attachments.count == 1 ? "1 attachment" : "\(attachments.count) attachments"
         if let last = chipStack.arrangedSubviews.last {
             layoutIfNeeded()
             chipScroll.scrollRectToVisible(last.frame, animated: false)
         }
+    }
+
+    private func remove(_ attachment: Attachment) {
+        guard let index = attachments.firstIndex(where: { $0.id == attachment.id }) else { return }
+        tap.impactOccurred(intensity: 0.5)
+        attachments.remove(at: index)
+        onAttachmentsChange?()
+        // The chip VoiceOver was on is gone: go on to the next one, or back to the field.
+        let chips = chipStack.arrangedSubviews.compactMap { $0 as? AttachmentChip }
+        let next: UIView = chips.isEmpty ? textView : chips[min(index, chips.count - 1)].info
+        UIAccessibility.post(notification: .layoutChanged, argument: next)
+        UIAccessibility.post(notification: .announcement, argument: "Removed \(attachment.name)")
+    }
+
+    /// Files and photos come in from menus, drops and paste with nothing else to show they've
+    /// arrived than a chip VoiceOver isn't on: say so.
+    private func announceAdded(since old: [Attachment]) {
+        let before = Set(old.map(\.id))
+        let added = attachments.filter { !before.contains($0.id) }
+        guard !added.isEmpty, UIAccessibility.isVoiceOverRunning else { return }
+        let names = added.count == 1 ? added[0].name : "\(added.count) files"
+        UIAccessibility.post(notification: .announcement, argument: "Attached \(names)")
     }
 }
 

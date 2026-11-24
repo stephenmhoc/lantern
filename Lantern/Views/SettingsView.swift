@@ -1,9 +1,15 @@
 import LlamaKit
 import SwiftUI
 
+/// Pages pushed inside the Settings sheet.
+enum SettingsPage: Hashable {
+    case readiness
+}
+
 struct SettingsView: View {
     @Environment(MacLink.self) private var mac
     @Environment(Engine.self) private var engine
+    @Environment(ModelStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @AppStorage(MacLink.lanKey) private var lanHost = MacLink.defaultLAN
@@ -17,6 +23,25 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
+                NavigationLink(value: SettingsPage.readiness) {
+                    let ready = Readiness.isReady(store: store, engine: engine)
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Readiness")
+                            Text(Readiness.summary(store: store, engine: engine))
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        // Coloured icon, primary text: orange text is hard to read.
+                        Image(systemName: ready ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(ready ? .green : .orange)
+                    }
+                }
+            } footer: {
+                Text("Models on this device, the Mac on each route, and when this build stops launching.")
+            }
+
+            Section {
                 LabeledContent("Home network") {
                     TextField(MacLink.defaultLAN, text: $lanHost)
                         .multilineTextAlignment(.trailing).autocorrectionDisabled().textInputAutocapitalization(.never)
@@ -27,8 +52,8 @@ struct SettingsView: View {
                 }
                 LabeledContent("Connected by", value: mac.route.label)
                 if !mac.models.isEmpty {
-                    Picker("Model", selection: $modelName) {
-                        ForEach(mac.models, id: \.self) { Text($0).tag($0) }
+                    Picker("New chats use", selection: $modelName) {
+                        ForEach(mac.models, id: \.self) { Text(MacLink.displayName($0)).tag($0) }
                     }
                 }
                 Button("Check connection") { Task { await mac.resolve() } }

@@ -2,8 +2,8 @@ import LlamaKit
 import SwiftUI
 import UIKit
 
-/// Above the message box, only when there's something to suggest: Fast when Smart is too slow or
-/// too costly on battery. What's loaded, memory, battery and heat are in the chat's info panel.
+/// Above the message box, only when there's something to suggest: Gemma 4 E2B when E4B is too slow
+/// or too costly on battery. What's loaded, memory, battery and heat are in the chat's info panel.
 struct StatusStrip: View {
     let conversation: Conversation
     @Environment(Engine.self) private var engine
@@ -38,12 +38,12 @@ struct StatusStrip: View {
         guard conversation.mode == .smart, fast else { return nil }
         let runningHere = engine.running == conversation.persistentModelID
         if runningHere, let live = engine.live, live.text.isEmpty, Date().timeIntervalSince(live.started) > 20 {
-            return Suggestion(text: "Taking a while.", symbol: "hourglass", action: "Use Fast") {
+            return Suggestion(text: "Taking a while.", symbol: "hourglass", action: "Use E2B") {
                 engine.restart(in: conversation, mode: .fast)
             }
         }
         if !engine.isBusy, let reason = Power.reasonToSave {
-            return Suggestion(text: "\(reason) Fast uses far less power.", symbol: "bolt.badge.clock", action: "Switch to Fast") {
+            return Suggestion(text: "\(reason) E2B uses less power.", symbol: "bolt.badge.clock", action: "Switch to E2B") {
                 conversation.mode = .fast
             }
         }

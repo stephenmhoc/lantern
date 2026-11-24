@@ -52,11 +52,18 @@ import NaturalLanguage
 
     /// A stopped utterance reports in after the next one has started: only the current one counts.
     private func finished(_ id: ObjectIdentifier) {
-        guard id == utterance else { return }
-        speaking = nil
-        utterance = nil
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        onChange?()
+        if id == utterance {
+            speaking = nil
+            utterance = nil
+            onChange?()
+        }
+        // Also after Stop, whose utterance is no longer current: until the session is let go,
+        // other apps' audio stays ducked. Not if dictation has taken the session over since
+        // (Stop comes just before it starts): that would cut off its microphone.
+        let session = AVAudioSession.sharedInstance()
+        if speaking == nil, !synthesizer.isSpeaking, session.category == .playback {
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {

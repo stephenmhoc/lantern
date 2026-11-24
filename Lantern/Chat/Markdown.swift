@@ -3,23 +3,29 @@ import UIKit
 extension NSAttributedString.Key {
     /// Marks a code block or table, so `BlockLayoutManager` can draw one even background behind it.
     nonisolated static let lanternBlock = NSAttributedString.Key("LanternBlock")
-    /// The code a code block's Copy link copies.
+    /// On a code block's first line (its language): the code its Copy button copies.
     nonisolated static let lanternCode = NSAttributedString.Key("LanternCode")
+    /// A block quote, drawn with a bar down its leading edge.
+    nonisolated static let lanternQuote = NSAttributedString.Key("LanternQuote")
+    /// A thematic break (`---`), drawn as a hairline across the text.
+    nonisolated static let lanternRule = NSAttributedString.Key("LanternRule")
+    /// A table's header row, drawn with a hairline under it.
+    nonisolated static let lanternTableHeader = NSAttributedString.Key("LanternTableHeader")
 }
 
-/// Renders a model's Markdown (headings, lists, code, tables, emphasis, links) for a UITextView.
-/// Foundation parses it; this turns the parsed block and inline intents into fonts and paragraph
-/// styles. Cheap enough to redo on every streaming tick: a long answer parses in a millisecond or two.
+/// Renders a model's Markdown (headings, lists, code, tables, quotes, emphasis, links) for a
+/// UITextView. Foundation parses it; this turns the parsed block and inline intents into fonts and
+/// paragraph styles. Cheap enough to redo on every streaming tick: a long answer parses in a
+/// millisecond or two. An unclosed code fence mid-stream parses as a code block running to the end,
+/// so a half-written block already looks like one.
 enum Markdown {
-    /// Code blocks start with a "Copy" link to `lantern-copy://<index>`; `AssistantCell` handles it.
-    static let copyScheme = "lantern-copy"
+    /// How far code blocks' and tables' text sits inside their background.
+    nonisolated static let blockInset: CGFloat = 12
+    /// How far each level of a list is indented.
+    private static let listIndent: CGFloat = 24
+    private static let paragraphGap: CGFloat = 10
 
-    private static let blockInset: CGFloat = 12
-
-    /// `copied` is the code block whose link should read "Copied" for a moment.
-    static func render(
-        _ text: String, color: UIColor = .label, traits: UITraitCollection = .current, copied: Int? = nil
-    ) -> NSAttributedString {
+    static func render(_ text: String, color: UIColor = .label, traits: UITraitCollection = .current) -> NSAttributedString {
         let body = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .full, failurePolicy: .returnPartiallyParsedIfPossible)
@@ -27,8 +33,27 @@ enum Markdown {
             return NSAttributedString(string: text, attributes: [.font: body, .foregroundColor: color])
         }
 
+        // Each ordered list's marker column fits its widest number, so "10." doesn't push its text
+        // onto the next line. Components run from the innermost out: an item's list follows it.
+        let digits = UIFont.monospacedDigitSystemFont(ofSize: body.pointSize, weight: .regular)
+        var columns: [Int: CGFloat] = [:]
+        for run in parsed.runs {
+            guard let components = run.presentationIntent?.components else { continue }
+            for (k, component) in components.enumerated() where k + 1 < components.count {
+                guard case .listItem(let ordinal) = component.kind, case .orderedList = components[k + 1].kind else { continue }
+                let width = ceil(("\(ordinal)." as NSString).size(withAttributes: [.font: digits]).width) + 10
+                columns[components[k + 1].identity] = max(columns[components[k + 1].identity] ?? listIndent, width)
+            }
+        }
+
         let out = NSMutableAttributedString()
         var previousBlock: PresentationIntent?
+        var previousQuote: Int?
+        var previousGroup = Group.none
+        // The paragraph that carries its list item's marker: a second paragraph (or a code block)
+        // in the same item is indented under it without a marker of its own.
+        var markedItem: Int?
+        var markedBlock: PresentationIntent?
         var table: TableBuilder?
         var codeBlocks = 0
 
@@ -38,31 +63,40 @@ enum Markdown {
             var font = body
             var attributes: [NSAttributedString.Key: Any] = [.foregroundColor: color]
             let paragraph = NSMutableParagraphStyle()
-            paragraph.paragraphSpacing = 8
+            paragraph.paragraphSpacing = paragraphGap
 
+            // Components run from the innermost out.
             var listDepth = 0
-            var listItem: (ordinal: Int, ordered: Bool)?
+            var listIndentation: CGFloat = 0
+            var innermostColumn: CGFloat?
+            var listItem: (identity: Int, ordinal: Int, ordered: Bool)?
             var codeHint: String??
+            var heading: Int?
+            var quote: Int?
+            var rule: Int?
             var cell: TableBuilder.Cell?
             for component in block?.components ?? [] {
                 switch component.kind {
                 case .header(let level):
-                    font = .preferredFont(forTextStyle: level == 1 ? .title2 : level == 2 ? .title3 : .headline,
-                                          compatibleWith: traits)
-                    font = font.withTraits(.traitBold)
+                    heading = level
                 case .codeBlock(let hint):
                     codeHint = .some(hint)
                 case .blockQuote:
-                    attributes[.foregroundColor] = UIColor.secondaryLabel
-                    paragraph.firstLineHeadIndent = 12
-                    paragraph.headIndent = 12
+                    quote = component.identity  // the outermost, so nested quotes share one bar
+                case .thematicBreak:
+                    rule = component.identity
                 case .listItem(let ordinal):
-                    if listItem == nil { listItem = (ordinal, false) }
+                    if listItem == nil { listItem = (component.identity, ordinal, false) }
                 case .orderedList:
                     listDepth += 1
-                    if listDepth == 1, let item = listItem { listItem = (item.ordinal, true) }
+                    let column = columns[component.identity] ?? listIndent
+                    listIndentation += column
+                    if innermostColumn == nil { innermostColumn = column }
+                    if listDepth == 1, let item = listItem { listItem = (item.identity, item.ordinal, true) }
                 case .unorderedList:
                     listDepth += 1
+                    listIndentation += listIndent
+                    if innermostColumn == nil { innermostColumn = listIndent }
                 case .table(let columns):
                     cell = cell ?? TableBuilder.Cell(table: component.identity, row: 0, column: 0, header: false)
                     cell?.table = component.identity
@@ -81,6 +115,7 @@ enum Markdown {
                     break
                 }
             }
+            let group: Group = codeHint != nil || cell != nil ? .none : listItem != nil ? .list : quote != nil ? .quote : .none
 
             // A table ends when a run outside it (or in another table) arrives.
             if let t = table, cell?.table != t.identity {
@@ -88,40 +123,89 @@ enum Markdown {
                 table = nil
             }
 
-            // A new block starts on a new line (a new cell, on a tab); list items get their marker.
-            if block != previousBlock {
+            let startsBlock = block != previousBlock
+            let atStart = out.length == 0
+            // A new block starts on a new line (a new cell, on a tab).
+            if startsBlock {
                 if let cell, let t = table, t.lastRow == cell.row {
                     out.append(NSAttributedString(string: "\t"))
-                } else if out.length > 0 {
-                    out.append(NSAttributedString(string: "\n"))
+                } else if !atStart {
+                    // Inside one quote the line break carries the quote too, so its bar is unbroken.
+                    let sameQuote = quote != nil && quote == previousQuote
+                    out.append(NSAttributedString(string: "\n", attributes: sameQuote ? [.lanternQuote: quote!] : [:]))
                 }
                 if let cell, table == nil {
                     table = TableBuilder(identity: cell.table, start: out.length, alignments: cell.alignments)
                 }
-                if let item = listItem {
-                    let marker = item.ordered ? "\(item.ordinal).\t" : "•\t"
-                    let indent = CGFloat(listDepth) * 22
-                    paragraph.tabStops = [NSTextTab(textAlignment: .left, location: indent)]
-                    paragraph.firstLineHeadIndent = indent - 22
-                    paragraph.headIndent = indent
-                    out.append(NSAttributedString(string: marker, attributes: [
-                        .font: body, .foregroundColor: color, .paragraphStyle: paragraph,
-                    ]))
-                }
-                if let hint = codeHint {
-                    appendCodeHeader(to: out, hint: hint, code: piece, index: codeBlocks, copied: copied == codeBlocks,
-                                     traits: traits)
-                }
-                previousBlock = block
-            } else if listItem != nil {
-                paragraph.headIndent = CGFloat(listDepth) * 22
-                paragraph.firstLineHeadIndent = paragraph.headIndent - 22
             }
 
-            if codeHint != nil {
+            // Lists and quotes are set tighter inside; leaving one gets the usual gap back.
+            if startsBlock, !atStart, previousGroup != .none, group != previousGroup {
+                paragraph.paragraphSpacingBefore = 6
+            }
+
+            if let level = heading {
+                let style: UIFont.TextStyle = level == 1 ? .title2 : level == 2 ? .title3 : .headline
+                font = UIFont.preferredFont(forTextStyle: style, compatibleWith: traits).withTraits(.traitBold)
+                paragraph.paragraphSpacingBefore = atStart && startsBlock ? 0 : level <= 2 ? 14 : 8
+                paragraph.paragraphSpacing = level <= 2 ? 6 : 4
+            }
+            if let quote {
+                attributes[.foregroundColor] = UIColor.secondaryLabel
+                attributes[.lanternQuote] = quote
+                paragraph.firstLineHeadIndent = 16
+                paragraph.headIndent = 16
+                paragraph.paragraphSpacing = 6
+            }
+            if let item = listItem, codeHint == nil, cell == nil {
+                let indent = listIndentation
+                let column = innermostColumn ?? listIndent
+                paragraph.headIndent = indent
+                paragraph.firstLineHeadIndent = indent
+                paragraph.paragraphSpacing = 4
+                if startsBlock, markedItem != item.identity {
+                    markedItem = item.identity
+                    markedBlock = block
+                    // The marker ends at a right tab, so "9." and "10." line up on their dots.
+                    let markerStyle = markerParagraph(paragraph, indent: indent, column: column)
+                    let marker: String
+                    var markerFont = body
+                    if item.ordered {
+                        marker = "\t\(item.ordinal).\t"
+                        markerFont = digits
+                    } else {
+                        marker = "\t" + ["•", "◦", "▪︎"][min(listDepth, 3) - 1] + "\t"
+                    }
+                    out.append(NSAttributedString(string: marker, attributes: [
+                        .font: markerFont, .foregroundColor: item.ordered ? color : UIColor.secondaryLabel,
+                        .paragraphStyle: markerStyle,
+                    ]))
+                }
+                if block == markedBlock {
+                    paragraph.setParagraphStyle(markerParagraph(paragraph, indent: indent, column: column))
+                }
+            }
+
+            if let hint = codeHint {
+                if startsBlock {
+                    appendCodeHeader(to: out, hint: hint, code: piece, index: codeBlocks, traits: traits)
+                }
                 appendCode(to: out, piece, index: codeBlocks, color: color, traits: traits)
                 codeBlocks += 1
+                previousBlock = block
+                previousQuote = nil
+                previousGroup = .none
                 continue
+            }
+
+            if let rule {
+                // The parser gives a break as "⸻"; it stays in the text (for copying) but invisible,
+                // and BlockLayoutManager draws a hairline through its line instead.
+                attributes[.foregroundColor] = UIColor.clear
+                attributes[.lanternRule] = rule
+                font = .systemFont(ofSize: 8)
+                paragraph.paragraphSpacingBefore = 4
+                paragraph.paragraphSpacing = 14
             }
 
             if let cell {
@@ -133,7 +217,8 @@ enum Markdown {
                 if inline.contains(.emphasized) { font = font.withTraits(.traitItalic) }
                 if inline.contains(.code) {
                     font = codeFont(size: font.pointSize * 0.9 / traitsScale(traits), traits: traits)
-                    attributes[.backgroundColor] = UIColor.secondarySystemFill
+                    // A table already sits on the same fill; a second one inside it only looks muddy.
+                    if cell == nil { attributes[.backgroundColor] = UIColor.tertiarySystemFill }
                 }
                 if inline.contains(.strikethrough) { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             }
@@ -143,10 +228,24 @@ enum Markdown {
             let start = out.length
             out.append(NSAttributedString(string: piece, attributes: attributes))
             if let cell { table?.add(cell, range: NSRange(location: start, length: out.length - start)) }
+            previousBlock = block
+            previousQuote = quote
+            previousGroup = group
         }
         table?.finish(in: out, inset: blockInset)
         padBlocksAtEdges(out)
         return out
+    }
+
+    private enum Group { case none, list, quote }
+
+    /// A list item's first line: hangs out to the marker, which ends at a right tab before the text.
+    private static func markerParagraph(_ base: NSParagraphStyle, indent: CGFloat, column: CGFloat) -> NSMutableParagraphStyle {
+        let p = base.mutableCopy() as! NSMutableParagraphStyle
+        p.firstLineHeadIndent = indent - column
+        p.headIndent = indent
+        p.tabStops = [NSTextTab(textAlignment: .right, location: indent - 8), NSTextTab(textAlignment: .left, location: indent)]
+        return p
     }
 
     /// A text view clips to its text, and a block's background reaches a little past it: give a
@@ -213,25 +312,19 @@ enum Markdown {
         return p
     }
 
-    /// The block's first line: the language, if given, and a Copy link.
+    /// The block's first line: its language, if given. `AnswerTextView` puts a Copy button at the
+    /// line's trailing end, which is why the line is there even without a language.
     private static func appendCodeHeader(
-        to out: NSMutableAttributedString, hint: String?, code: String, index: Int, copied: Bool, traits: UITraitCollection
+        to out: NSMutableAttributedString, hint: String?, code: String, index: Int, traits: UITraitCollection
     ) {
         let small = UIFont.preferredFont(forTextStyle: .caption1, compatibleWith: traits)
-        let paragraph = blockParagraph(before: 14, after: 4)
-        let block = "code-\(index)"
-        if let hint, !hint.isEmpty {
-            out.append(NSAttributedString(string: hint + "   ", attributes: [
-                .font: small, .foregroundColor: UIColor.secondaryLabel, .paragraphStyle: paragraph, .lanternBlock: block,
-            ]))
-        }
         var trimmed = code
         if trimmed.hasSuffix("\n") { trimmed.removeLast() }
-        out.append(NSAttributedString(string: copied ? "Copied" : "Copy", attributes: [
-            .font: small.withTraits(.traitBold), .paragraphStyle: paragraph, .lanternBlock: block,
-            .link: URL(string: "\(copyScheme)://\(index)")!, .lanternCode: trimmed,
+        let label = hint.flatMap { $0.isEmpty ? nil : $0 } ?? "\u{200B}"
+        out.append(NSAttributedString(string: label + "\n", attributes: [
+            .font: small, .foregroundColor: UIColor.secondaryLabel, .paragraphStyle: blockParagraph(before: 10, after: 6),
+            .lanternBlock: "code-\(index)", .lanternCode: trimmed,
         ]))
-        out.append(NSAttributedString(string: "\n", attributes: [.paragraphStyle: paragraph, .lanternBlock: block]))
     }
 
     private static func appendCode(
@@ -239,13 +332,19 @@ enum Markdown {
     ) {
         var code = code
         if code.hasSuffix("\n") { code.removeLast() }
-        let font = codeFont(size: 15, traits: traits)
+        let font = codeFont(size: 14, traits: traits)
+        let column = ("0" as NSString).size(withAttributes: [.font: font]).width
         let lines = code.components(separatedBy: "\n")
         for (i, line) in lines.enumerated() {
             let last = i == lines.count - 1
+            // A line too long for the width wraps two columns deeper than its own indentation, so
+            // it reads as one line rather than as the next.
+            let leading = line.prefix { $0 == " " || $0 == "\t" }.reduce(0) { $0 + ($1 == "\t" ? 4 : 1) }
+            let paragraph = blockParagraph(after: last ? 20 : 0)
+            paragraph.headIndent = blockInset + CGFloat(leading + 2) * column
+            paragraph.lineSpacing = 2
             out.append(NSAttributedString(string: last ? line : line + "\n", attributes: [
-                .font: font, .foregroundColor: color, .lanternBlock: "code-\(index)",
-                .paragraphStyle: blockParagraph(after: last ? 18 : 0),
+                .font: font, .foregroundColor: color, .lanternBlock: "code-\(index)", .paragraphStyle: paragraph,
             ]))
         }
     }
@@ -315,39 +414,68 @@ enum Markdown {
                 p.defaultTabInterval = gap
                 p.firstLineHeadIndent = inset
                 p.headIndent = inset
-                p.paragraphSpacingBefore = i == 0 ? 14 : 0
-                p.paragraphSpacing = i == rows.count - 1 ? 18 : i == 0 ? 8 : 5
+                p.paragraphSpacingBefore = i == 0 ? 10 : 0
+                p.paragraphSpacing = i == rows.count - 1 ? 20 : i == 0 ? 10 : 6
                 out.addAttribute(.paragraphStyle, value: p, range: row)
+            }
+            if rows.count > 1, let header = rows.first {
+                out.addAttribute(.lanternTableHeader, value: identity, range: header)
             }
             out.addAttribute(.lanternBlock, value: "table-\(identity)", range: range)
         }
     }
 }
 
-/// Draws one even, rounded background behind each code block and table, the full width of the
-/// text, instead of a ragged highlight behind each line's characters.
+/// Draws what sits behind the answer's text: one even, rounded background behind each code block
+/// and table (the full width of the text, instead of a ragged highlight behind each line's
+/// characters), a hairline under a table's header row, a bar beside each block quote and a hairline
+/// for each thematic break.
 nonisolated final class BlockLayoutManager: NSLayoutManager {
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
         guard let storage = textStorage, let container = textContainers.first, storage.length > 0 else { return }
         let characters = characterRange(forGlyphRange: glyphsToShow, actualGlyphRange: nil)
+        let width = container.size.width
+        let hairline: CGFloat = 0.5
+
+        eachRun(of: .lanternBlock, in: characters, storage: storage) { used in
+            let rect = CGRect(x: 0, y: used.minY - 8, width: width, height: used.height + 16)
+            UIColor.secondarySystemFill.setFill()
+            UIBezierPath(roundedRect: rect.offsetBy(dx: origin.x, dy: origin.y), cornerRadius: 10).fill()
+        }
+        eachRun(of: .lanternTableHeader, in: characters, storage: storage) { used in
+            let inset = Markdown.blockInset
+            UIColor.separator.setFill()
+            UIBezierPath(rect: CGRect(x: origin.x + inset, y: origin.y + used.maxY + 4.5, width: width - 2 * inset, height: hairline)).fill()
+        }
+        eachRun(of: .lanternQuote, in: characters, storage: storage) { used in
+            UIColor.tertiaryLabel.setFill()
+            let bar = CGRect(x: origin.x + 2, y: origin.y + used.minY + 1, width: 3, height: used.height - 2)
+            UIBezierPath(roundedRect: bar, cornerRadius: 1.5).fill()
+        }
+        eachRun(of: .lanternRule, in: characters, storage: storage) { used in
+            UIColor.separator.setFill()
+            UIBezierPath(rect: CGRect(x: origin.x, y: origin.y + used.midY.rounded(), width: width, height: hairline)).fill()
+        }
+    }
+
+    /// Calls `draw` once with the used rect of each whole run of `key` that `characters` touches,
+    /// even when only part of it is being drawn.
+    private func eachRun(
+        of key: NSAttributedString.Key, in characters: NSRange, storage: NSTextStorage, draw: (CGRect) -> Void
+    ) {
         let everything = NSRange(location: 0, length: storage.length)
         var drawn = Set<Int>()
-        storage.enumerateAttribute(.lanternBlock, in: characters) { value, range, _ in
+        storage.enumerateAttribute(key, in: characters) { value, range, _ in
             guard value != nil else { return }
             var full = NSRange()
-            _ = storage.attribute(.lanternBlock, at: range.location, longestEffectiveRange: &full, in: everything)
+            _ = storage.attribute(key, at: range.location, longestEffectiveRange: &full, in: everything)
             guard drawn.insert(full.location).inserted else { return }
             var rect = CGRect.null
             enumerateLineFragments(forGlyphRange: glyphRange(forCharacterRange: full, actualCharacterRange: nil)) {
                 _, used, _, _, _ in rect = rect.union(used)
             }
-            guard !rect.isNull else { return }
-            rect.origin.x = 0
-            rect.size.width = container.size.width
-            rect = rect.insetBy(dx: 0, dy: -8).offsetBy(dx: origin.x, dy: origin.y)
-            UIColor.secondarySystemFill.setFill()
-            UIBezierPath(roundedRect: rect, cornerRadius: 10).fill()
+            if !rect.isNull { draw(rect) }
         }
     }
 }

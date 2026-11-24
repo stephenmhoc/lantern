@@ -1,7 +1,6 @@
 import BackgroundTasks
 import Foundation
 import LlamaKit
-import Metal
 import Observation
 import os
 import SwiftData
@@ -79,15 +78,17 @@ final class Engine {
 
     /// Replaces the last reply with a new one, optionally from another mode. The answer it replaces
     /// (and its own earlier versions) are kept as the new one's other versions.
-    func retry(in conversation: Conversation, mode: Mode) {
+    /// `macModel`: for `.mac`, which of the Mac's models (nil keeps the chat's).
+    func retry(in conversation: Conversation, mode: Mode, macModel: String? = nil) {
         guard !isBusy, let old = conversation.messages.last, !old.isUser else { return }
         let kept = old.allVersions.list.filter { !$0.content.isEmpty }
         conversation.messages.removeLast()
         conversation.mode = mode
+        if let macModel { conversation.macModel = macModel }
         generate(in: conversation, versions: kept)
     }
 
-    /// Stops the running reply and starts it again in `mode` (e.g. Smart is too slow: use Fast).
+    /// Stops the running reply and starts it again in `mode` (e.g. E4B is too slow: use E2B).
     /// What it had written so far is kept as a version, as Retry does.
     func restart(in conversation: Conversation, mode: Mode) {
         let previous = task
@@ -106,7 +107,7 @@ final class Engine {
         var reply = StoredMessage(isUser: false, finished: false)
         reply.versions = versions.isEmpty ? nil : versions
         conversation.messages.append(reply)
-        conversation.updated = .now
+        conversation.lastActive = .now
         try? conversation.modelContext?.save()
 
         let mode = conversation.mode
@@ -114,7 +115,10 @@ final class Engine {
         let system = ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))
         var history = [system] + conversation.history(before: conversation.messages.count - 1)
         let checkpoint = Self.stateDirectory(for: conversation)
+        let macModel = conversation.resolvedMacModel
+        if mode == .mac, conversation.macModel.isEmpty, !macModel.isEmpty { conversation.macModel = macModel }
         let live = LiveReply(id: reply.id, mode: mode)
+        live.macModel = macModel
         self.live = live
         running = conversation.persistentModelID
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
@@ -127,16 +131,23 @@ final class Engine {
             var lastProgress = Date()
             var pieces = 0
             var statsKey: String?
-            attempts: while true { do {
+            do {
                 let stream: AsyncThrowingStream<Generation, Error>
                 if mode == .mac {
                     live.phase = .waiting
-                    stream = try await mac.stream(history, thinking: thinking)
-                    statsKey = "mac:\(mac.modelName)"
+                    var macModel = macModel
+                    if macModel.isEmpty {
+                        // No model picked yet (a fresh install): ask the Mac, which picks a default.
+                        if mac.route.host == nil { await mac.resolve() }
+                        macModel = mac.modelName
+                        live.macModel = macModel
+                        if conversation.modelContext != nil, !conversation.isDeleted { conversation.macModel = macModel }
+                    }
+                    stream = try await mac.stream(history, thinking: thinking, model: macModel)
+                    statsKey = "mac:\(macModel)"
                     conversation.tokenLimit = mac.contextLength
                 } else {
                     guard let model = model(for: mode) else { throw EngineError.notDownloaded(mode) }
-                    if case .converting = store.states[model.id] { throw EngineError.converting(model.name) }
                     guard store.states[model.id] == .ready else { throw EngineError.notDownloaded(mode) }
                     let llama = try await load(model)
                     try Task.checkCancellation()
@@ -178,18 +189,11 @@ final class Engine {
                         lastSave = .now
                     }
                 }
-            } catch LlamaError.processFailed where mode != .mac && model(for: mode).map(Self.canMoveExperts) == true {
-                // The GPU gave up (Metal out of memory, error -3): from now on this model keeps its
-                // experts on the CPU. Try again at once if nothing has been shown yet.
-                if let model = model(for: mode) { UserDefaults.standard.set(true, forKey: Self.cpuExpertsKey(model)) }
-                if let old = llama { llama = nil; loadedModel = nil; await old.flush() }
-                if live.text.isEmpty && live.thinking.isEmpty { continue attempts }
-                failure = LlamaError.processFailed(-3)
             } catch is CancellationError {
             } catch LlamaError.cancelled {
             } catch {
                 failure = error
-            }; break attempts }
+            }
             finish(live, in: conversation, stats: stats, error: failure, statsKey: statsKey)
         }
     }
@@ -197,9 +201,22 @@ final class Engine {
     private func finish(
         _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?
     ) {
-        var parts = [live.mode == .mac ? "Mac · \(mac.modelName)" : loadedModel?.name ?? live.mode.title]
+        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) on your Mac" : loadedModel?.name ?? live.mode.title]
         if let stats, stats.generatedTokens > 0 { parts.append(String(format: "%.1f tok/s", stats.tokensPerSecond)) }
         if let first = live.firstTokenSeconds { parts.append(String(format: "%.1f s to first token", first)) }
+        if live.mode == .mac, stats != nil {
+            // Where the wait before the first token went: finding the Mac, connecting, the Mac
+            // loading the model, reading the chat. Only the parts that took noticeable time.
+            let t = mac.lastTimings
+            if case .tailnet(_, let viaApp) = mac.route { parts.append(viaApp ? "via the Tailscale app" : "via tailnet") }
+            let steps: [(String, Double?)] = [
+                ("found the Mac", t.findSeconds), ("connected", t.connectSeconds),
+                ("loaded the model", t.loadSeconds), ("read the chat", t.readSeconds),
+            ]
+            for (what, seconds) in steps {
+                if let seconds, seconds >= 0.3 { parts.append(String(format: "\(what) in %.1f s", seconds)) }
+            }
+        }
         if stats == nil && error == nil { parts.insert(live.stopNote ?? "Stopped", at: 0) }
         if live.trimmed { parts.append("Earlier messages left out to fit") }
         // A reply that ran into a limit says so instead of just ending.
@@ -226,7 +243,8 @@ final class Engine {
         }
         if let stats, stats.generatedTokens > 0, let statsKey, let first = live.firstTokenSeconds {
             // A reply that had to load the model first says nothing about the usual wait.
-            TypicalSpeed.record(firstToken: live.waitedForLoad ? nil : first, tokensPerSecond: stats.tokensPerSecond, for: statsKey)
+            let loaded = live.waitedForLoad || (live.mode == .mac && mac.lastTimings.loadSeconds >= 1)
+            TypicalSpeed.record(firstToken: loaded ? nil : first, tokensPerSecond: stats.tokensPerSecond, for: statsKey)
         }
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)  // you may have put it down
@@ -253,7 +271,7 @@ final class Engine {
         conversation.messages[i].thinking = live.thinking
         conversation.messages[i].finished = finished
         extra(&conversation.messages[i])
-        conversation.updated = .now
+        conversation.lastActive = .now
         try? conversation.modelContext?.save()
     }
 
@@ -276,7 +294,6 @@ final class Engine {
     private static func kind(of error: Error) -> ReplyErrorKind {
         switch error {
         case EngineError.notDownloaded: .notDownloaded
-        case EngineError.converting: .modelBusy
         case LlamaError.contextFull: .contextFull
         case LlamaError.loadFailed, LlamaError.contextFailed: .loadFailed
         case let error as MacError: error.kind
@@ -352,19 +369,16 @@ final class Engine {
         return Int(model(for: mode)?.options.contextLength ?? ModelOptions().contextLength)
     }
 
-    /// Whether images attached in this mode are seen: Fast once its projector is downloaded, the
-    /// Mac if its model has vision (checked when sending). Smart has no projector.
+    /// Whether images attached in this mode are seen: on this device once the model's projector
+    /// is downloaded, on the Mac if its model has vision (checked when sending).
     func canSeeImages(_ mode: Mode) -> Bool {
-        switch mode {
-        case .mac: true
-        case .smart: false
-        case .fast: model(for: .fast)?.projector.map { store.states[$0.id] == .ready } ?? false
-        }
+        guard mode.isOnDevice else { return true }
+        return model(for: mode)?.projector.map { store.states[$0.id] == .ready } ?? false
     }
 
     /// What this mode's model usually does on this device, from past replies. Nil until it has answered.
-    func typicalSpeed(for mode: Mode) -> TypicalSpeed? {
-        if mode == .mac { return TypicalSpeed.stored(for: "mac:\(mac.modelName)") }
+    func typicalSpeed(for mode: Mode, macModel: String? = nil) -> TypicalSpeed? {
+        if mode == .mac { return TypicalSpeed.stored(for: "mac:\(macModel ?? mac.modelName)") }
         return model(for: mode).flatMap { TypicalSpeed.stored(for: $0.id) }
     }
 
@@ -377,7 +391,7 @@ final class Engine {
         guard !isBusy, !inBackground, conversation.modelContext != nil, !conversation.isDeleted else { return }
         prepared = (mode, conversation)
         if mode == .mac {
-            if mac.route == .unknown { Task { await mac.resolve() } }
+            mac.warm(conversation.resolvedMacModel)  // Ollama loads the model while the question is typed
             return
         }
         guard let model = model(for: mode), store.states[model.id] == .ready else { return }
@@ -396,8 +410,8 @@ final class Engine {
     // MARK: - Saved state
 
     private static let stateRoot = URL.cachesDirectory.appending(path: "kv")
-    /// Above this, the least recently used chats' states are deleted. A long Inkling chat is
-    /// about 200 MB (twice that with the turn before, kept for Retry); Gemma's are a tenth of it.
+    /// Above this, the least recently used chats' states are deleted. A long Gemma chat's state is
+    /// a few tens of MB.
     private static let stateBudget: Int64 = 3_000_000_000
 
     /// Where a chat's model state is saved: Caches/kv/<id>. iOS may empty Caches when storage
@@ -487,11 +501,12 @@ final class Engine {
         }
     }
 
-    /// Back in front: load the model for the chat that was open again, and start any model
-    /// conversion that was waiting.
+    /// Back in front: load the model for the chat that was open again.
     func didBecomeActive() {
         inBackground = false
-        store.convertPending()
+        // Connections, and Lantern's own tailnet node's paths, may not have survived suspension:
+        // check the route again and keep the model warm while the user reads and types.
+        if prepared?.mode == .mac { mac.cameToFront() }
         if let prepared, llama == nil { prepare(mode: prepared.mode, for: prepared.conversation) }
     }
 
@@ -602,26 +617,6 @@ final class Engine {
         Task { await old.flush() }  // `old` is freed when this is done
     }
 
-    /// Whether a mixture-of-experts model should keep its experts on the CPU: when it's bigger than
-    /// three quarters of what iOS lets the GPU use, or after the GPU has already failed with it once.
-    /// Inkling's 9-12 GB doesn't fit a 12 GB iPhone or iPad mini's GPU budget; Metal then fails the
-    /// first command buffer instead of paging.
-    static func needsCPUExperts(_ model: CatalogModel) -> Bool {
-        guard canMoveExperts(model) else { return false }
-        if UserDefaults.standard.bool(forKey: cpuExpertsKey(model)) { return true }
-        #if DEBUG
-        // `-allgpu`: skip the size check, to see the GPU fail and the fallback take over.
-        if ProcessInfo.processInfo.arguments.contains("-allgpu") { return false }
-        #endif
-        guard let budget = MTLCreateSystemDefaultDevice()?.recommendedMaxWorkingSetSize, budget > 0 else { return true }
-        return Double(model.bytes) > Double(budget) * 0.75
-    }
-
-    /// Only the mixture-of-experts models (Smart) have experts to move.
-    nonisolated static func canMoveExperts(_ model: CatalogModel) -> Bool { model.tier == .smart }
-
-    nonisolated static func cpuExpertsKey(_ model: CatalogModel) -> String { "cpuExperts.\(model.id)" }
-
     /// One load at a time, shared by whoever asks for the same model (a `prepare` and the message
     /// sent while it was still loading). Cancelling the caller's task (Stop) abandons the load.
     private func load(_ model: CatalogModel) async throws -> LlamaModel {
@@ -644,8 +639,7 @@ final class Engine {
                 if llama != nil || pendingLoad != nil { return try await load(model) }
             }
             let path = store.url(for: model).path
-            var options = model.options
-            options.expertsOnCPU = Self.needsCPUExperts(model)
+            let options = model.options
             let cancel = CancelFlag()
             let report: @Sendable (Float) -> Void = { progress in
                 Task { @MainActor in
@@ -760,6 +754,8 @@ final class LiveReply {
 
     let id: UUID
     let mode: Mode
+    /// For `.mac`: the Ollama model answering.
+    var macModel = ""
     let started = Date()
     var phase: Phase = .waiting {
         didSet {
@@ -813,11 +809,10 @@ final class LiveReply {
 }
 
 nonisolated enum EngineError: LocalizedError {
-    case notDownloaded(Mode), converting(String), busy
+    case notDownloaded(Mode), busy
     var errorDescription: String? {
         switch self {
-        case .notDownloaded(let mode): "There's no \(mode.title) model on this device yet. Get one in Readiness."
-        case .converting(let name): "\(name) is being made faster for this device. Try again in a minute or two."
+        case .notDownloaded(let mode): "\(mode.title) isn't on this device yet. Get it in Settings > Readiness."
         case .busy: "Lantern is answering. Try again when it's done."
         }
     }

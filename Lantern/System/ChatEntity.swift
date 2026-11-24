@@ -36,7 +36,7 @@ nonisolated struct ChatEntity: IndexedEntity {
         title = c.title
         snippet = c.snippet
         modeSymbol = c.mode.symbol
-        updated = c.updated
+        updated = c.lastActive
     }
 
     var displayRepresentation: DisplayRepresentation {
@@ -78,7 +78,7 @@ nonisolated struct ChatQuery: EntityStringQuery {
 
     @MainActor
     private func fetch(limit: Int? = nil) -> [Conversation] {
-        var descriptor = FetchDescriptor<Conversation>(sortBy: [SortDescriptor(\.updated, order: .reverse)])
+        var descriptor = FetchDescriptor<Conversation>(sortBy: [SortDescriptor(\.lastActive, order: .reverse)])
         descriptor.fetchLimit = limit
         return (try? LanternApp.container.mainContext.fetch(descriptor)) ?? []
     }

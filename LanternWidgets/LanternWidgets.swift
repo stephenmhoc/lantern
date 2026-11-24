@@ -68,9 +68,9 @@ private struct ModeLink: Identifiable {
     var url: URL { LanternLink.new(mode: mode).url }
 
     static let all = [
-        ModeLink(mode: "fast", title: "Fast", symbol: "hare"),
-        ModeLink(mode: "smart", title: "Smart", symbol: "brain"),
-        ModeLink(mode: "mac", title: "Mac", symbol: "desktopcomputer"),
+        ModeLink(mode: "fast", title: "E2B", symbol: "cpu"),
+        ModeLink(mode: "smart", title: "E4B", symbol: "cpu"),
+        ModeLink(mode: "mac", title: "Mac", symbol: "cloud"),
     ]
 }
 

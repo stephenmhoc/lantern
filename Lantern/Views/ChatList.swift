@@ -18,9 +18,9 @@ struct ChatSection: Identifiable {
         var weeks: [Conversation] = [], older: [Conversation] = []
         for c in chats {
             if c.pinned { pinned.append(c) }
-            else if c.updated >= today { todays.append(c) }
-            else if c.updated >= yesterday { yesterdays.append(c) }
-            else if c.updated >= week { weeks.append(c) }
+            else if c.lastActive >= today { todays.append(c) }
+            else if c.lastActive >= yesterday { yesterdays.append(c) }
+            else if c.lastActive >= week { weeks.append(c) }
             else { older.append(c) }
         }
         return [
@@ -43,7 +43,7 @@ struct ChatSection: Identifiable {
 }
 
 /// The mode a new chat starts in: the last one used if it works right now, else the quickest that
-/// does (the Mac if it answers, then Fast, then Smart).
+/// does (the Mac if it answers, then Gemma 4 E2B, then E4B).
 enum DefaultMode {
     static let key = "chat.lastMode"
 
@@ -72,7 +72,7 @@ struct DeletedChat: Identifiable {
     init(_ c: Conversation) {
         title = c.title
         created = c.created
-        updated = c.updated
+        updated = c.lastActive
         mode = c.mode
         thinking = c.thinking
         pinned = c.pinned
@@ -91,7 +91,7 @@ struct DeletedChat: Identifiable {
         let c = Conversation(mode: mode)
         c.title = title
         c.created = created
-        c.updated = updated
+        c.lastActive = updated
         c.thinking = thinking
         c.pinned = pinned
         c.messages = messages
@@ -101,23 +101,62 @@ struct DeletedChat: Identifiable {
     }
 }
 
-/// One chat in the sidebar.
+/// One chat in the sidebar: title and when, the last message, and the model.
 struct ChatRow: View {
     let conversation: Conversation
     let answering: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(conversation.title).lineLimit(1)
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(conversation.title).font(.body.weight(.medium)).lineLimit(1)
+                Spacer(minLength: 0)
+                if answering {
+                    // Animates on its own: the row isn't redrawn while the reply streams.
+                    Image(systemName: "ellipsis")
+                        .symbolEffect(.variableColor.iterative, options: .repeat(.continuous))
+                        .foregroundStyle(.tint)
+                        .accessibilityLabel("Answering")
+                } else {
+                    Text(Self.when(conversation.lastActive)).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            if let preview = Self.preview(conversation.messages) {
+                Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            }
+            // Pinned chats have their own section, so the row doesn't mark them again.
             HStack(spacing: 4) {
-                Label(conversation.mode.title, systemImage: conversation.mode.symbol)
-                if answering { Text("· Answering") }
+                Label(conversation.modelTitle, systemImage: conversation.mode.symbol)
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.tertiary)
+            .labelStyle(.titleAndIcon)
         }
+        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityValue(conversation.pinned ? "Pinned" : "")
+    }
+
+    /// The last thing said, on one line. Messages are only written at a turn's start and end (and
+    /// every few seconds while streaming), so this doesn't redraw the row per token.
+    static func preview(_ messages: [StoredMessage]) -> String? {
+        guard let text = messages.last(where: { !$0.content.isEmpty })?.content else { return nil }
+        // Markdown marks and line breaks read as noise in one line.
+        let flat = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "#>*-` \t")) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+            .replacingOccurrences(of: "**", with: "")
+        return flat.isEmpty ? nil : String(flat.prefix(160))
+    }
+
+    /// Like Mail: the time today, "Yesterday", the weekday this week, else the date.
+    static func when(_ date: Date, now: Date = .now, calendar: Calendar = .current) -> String {
+        if calendar.isDateInToday(date) { return date.formatted(date: .omitted, time: .shortened) }
+        if calendar.isDateInYesterday(date) { return "Yesterday" }
+        let week = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)) ?? now
+        if date >= week { return date.formatted(.dateTime.weekday(.wide)) }
+        return date.formatted(date: .numeric, time: .omitted)
     }
 }
 

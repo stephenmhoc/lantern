@@ -78,7 +78,8 @@ final class GlowView: UIView {
         CATransaction.setAnimationDuration(0.4)
         halo.opacity = Float(0.35 + 0.65 * intensity)
         core.opacity = Float(0.55 + 0.45 * intensity)
-        let scale = 0.7 + 0.3 * intensity
+        // With Reduce Motion it doesn't grow either: one size, only brighter or dimmer.
+        let scale = UIAccessibility.isReduceMotionEnabled ? 0.85 : 0.7 + 0.3 * intensity
         container.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
         CATransaction.commit()
     }
@@ -96,7 +97,10 @@ final class GlowView: UIView {
         halo.add(a, forKey: "breathe")
     }
 
-    @objc private func motionChanged() { addBreathing() }
+    @objc private func motionChanged() {
+        applyIntensity(animated: false)
+        addBreathing()
+    }
 
     override func didMoveToWindow() {
         super.didMoveToWindow()

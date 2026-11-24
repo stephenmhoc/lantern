@@ -44,8 +44,8 @@ enum DebugLaunch {
         for (title, age, mode, pinned) in samples {
             let c = Conversation(mode: mode)
             c.title = title
-            c.updated = Date(timeIntervalSinceNow: age)
-            c.created = c.updated
+            c.lastActive = Date(timeIntervalSinceNow: age)
+            c.created = c.lastActive
             c.pinned = pinned
             c.messages = [
                 StoredMessage(isUser: true, content: title + "?"),

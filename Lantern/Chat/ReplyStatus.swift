@@ -7,47 +7,28 @@ struct ReplyStatus: Equatable {
     var progress: Double?
     var intensity: Double
     var isSlow: Bool
+    /// The same for VoiceOver, in words: "Thinking, 12 seconds" rather than "Thinking · 12 s".
+    var accessibilityText: String
 }
 
-/// Times each phase of the live reply and the thinking, seen from the chat screen's ticks.
-///
-/// Stopgap: `LiveReply` will carry its own phase start time and time to first token. When it does,
-/// read those here instead and drop the bookkeeping; the cell only sees `ReplyStatus`.
+/// Times the thinking, seen from the chat screen's ticks; each phase's own start comes from
+/// `LiveReply.phaseStarted`, so a chat reopened part-way through a reply counts from the right time.
 struct PhaseClock {
     private(set) var replyID: UUID?
-    private var phaseKind: Int?
-    private var phaseStarted = Date()
     private(set) var thinkingStarted: Date?
     private(set) var thinkingEnded: Date?
 
-    /// Waiting longer than this with no text counts as slow. Stopgap until there's a per-model
-    /// typical time to first token.
+    /// Waiting longer than this with nothing coming in counts as slow. Stopgap until there's a
+    /// per-model typical time to first token.
     static let slowAfter: TimeInterval = 20
-
-    private static func kind(_ phase: LiveReply.Phase) -> Int {
-        switch phase {
-        case .loading: 0
-        case .waiting: 1
-        case .reading: 2
-        case .thinking: 3
-        case .answering: 4
-        }
-    }
 
     /// Notes the live reply's phase now; call on every tick.
     mutating func observe(_ live: LiveReply, now: Date = .now) {
         if replyID != live.id {
             self = PhaseClock()
             replyID = live.id
-            // Seeing a reply for the first time part-way (the chat was reopened): count from its start.
-            phaseStarted = live.started
         }
-        let kind = Self.kind(live.phase)
-        if kind != phaseKind {
-            if phaseKind != nil { phaseStarted = now }
-            phaseKind = kind
-        }
-        if live.phase == .thinking, thinkingStarted == nil { thinkingStarted = phaseStarted }
+        if live.phase == .thinking, thinkingStarted == nil { thinkingStarted = live.phaseStarted }
         if live.phase != .thinking, thinkingStarted != nil, thinkingEnded == nil { thinkingEnded = now }
     }
 
@@ -58,26 +39,55 @@ struct PhaseClock {
     }
 
     func status(for live: LiveReply, modelName: String?, now: Date = .now) -> ReplyStatus {
-        let seconds = Int(now.timeIntervalSince(phaseStarted))
-        let elapsed = Self.format(seconds)
-        let slow = live.text.isEmpty && now.timeIntervalSince(live.started) > Self.slowAfter
+        let seconds = max(0, Int(now.timeIntervalSince(live.phaseStarted)))
+        // Thinking streams too: only a reply with nothing at all to show yet is slow.
+        let slow = live.text.isEmpty && live.thinking.isEmpty && now.timeIntervalSince(live.started) > Self.slowAfter
+        let what: String
+        var progress: Double?
+        let intensity: Double
+        var hint: String?
         switch live.phase {
         case .loading(let p):
-            return ReplyStatus(text: "Loading \(modelName ?? "the model") · \(elapsed)", progress: p, intensity: 0.2,
-                               isSlow: slow)
+            what = "Loading \(modelName ?? "the model")"
+            progress = p
+            intensity = 0.2
         case .waiting:
-            let what = live.mode == .mac ? "Asking the Mac" : "Reading your question"
-            return ReplyStatus(text: "\(what) · \(elapsed)", progress: nil, intensity: 0.3, isSlow: slow)
+            what = live.mode == .mac ? "Asking the Mac" : "Reading your question"
+            intensity = 0.3
+            // Ollama loads the model on the first question after it was unloaded, with no word
+            // back until then: the usual reason for a long wait.
+            if slow, live.mode == .mac { hint = "The Mac may be loading the model" }
         case .reading(let p):
-            return ReplyStatus(text: "Reading the chat · \(elapsed)", progress: p, intensity: 0.35, isSlow: slow)
+            what = "Reading the chat"
+            progress = p
+            intensity = 0.35
         case .thinking:
-            return ReplyStatus(text: "Thinking · \(elapsed)", progress: nil, intensity: 0.55, isSlow: slow)
+            what = "Thinking"
+            intensity = 0.55
         case .answering:
-            return ReplyStatus(text: "Writing · \(elapsed)", progress: nil, intensity: 1, isSlow: false)
+            what = "Writing"
+            intensity = 1
         }
+        // The bar shows progress; the number says it for anyone who can't judge the bar.
+        let percent = progress.map { "\(Int(($0 * 100).rounded()))%" }
+        let text = ([what, percent, Self.format(seconds)].compactMap { $0 } + [hint].compactMap { $0 })
+            .joined(separator: " · ")
+        let spokenPercent = progress.map { "\(Int(($0 * 100).rounded())) percent" }
+        let spoken = ([what, spokenPercent, Self.spoken(seconds)].compactMap { $0 } + [hint].compactMap { $0 })
+            .joined(separator: ", ")
+        return ReplyStatus(text: text, progress: progress, intensity: intensity,
+                           isSlow: slow && live.phase != .answering, accessibilityText: spoken)
     }
 
     static func format(_ seconds: Int) -> String {
         seconds < 60 ? "\(seconds) s" : "\(seconds / 60) min \(seconds % 60) s"
+    }
+
+    /// "12 seconds", "1 minute, 5 seconds": "s" alone is read as the letter.
+    static func spoken(_ seconds: Int) -> String {
+        let formatter = DateComponentsFormatter()
+        formatter.unitsStyle = .full
+        formatter.allowedUnits = seconds < 60 ? [.second] : [.minute, .second]
+        return formatter.string(from: TimeInterval(seconds)) ?? format(seconds)
     }
 }

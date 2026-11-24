@@ -6,8 +6,16 @@ import SwiftData
 final class Conversation {
     var title: String = "New chat"
     var created: Date = Date()
+    /// Never used: Core Data, under SwiftData, reads the key `updated` as NSManagedObject's
+    /// `isUpdated`, so every save stored it as 0 (1 January 2001). Kept so existing stores open.
     var updated: Date = Date()
+    /// When the chat last changed (a turn started or ended): the sidebar's order and dates.
+    /// Set to the reference date in chats from before it existed until `repairActivity` fills it.
+    var lastActive: Date = Date(timeIntervalSinceReferenceDate: 0)
     var mode: Mode = Mode.fast
+    /// In `.mac` mode, which of Ollama's models answers ("gemma4:31b-mlx"). Empty means the one
+    /// last picked (`MacLink.modelKey`); the first reply fixes it, so the chat keeps its model.
+    var macModel: String = ""
     var thinking: Thinking = Thinking.off
     /// Kept at the top of the sidebar.
     var pinned: Bool = false
@@ -27,6 +35,16 @@ final class Conversation {
     /// The context the last reply left in use, and the model's limit, for showing how full the chat is.
     var tokensUsed: Int = 0
     var tokenLimit: Int = 0
+
+    /// Fills `lastActive` in chats from before it existed: from `updated` where a save didn't
+    /// zero it, else from when the chat began. Cheap; run once at launch.
+    static func repairActivity(in context: ModelContext) {
+        let unset = Date(timeIntervalSinceReferenceDate: 0)
+        let chats = (try? context.fetch(FetchDescriptor<Conversation>(predicate: #Predicate { $0.lastActive == unset }))) ?? []
+        guard !chats.isEmpty else { return }
+        for c in chats { c.lastActive = c.updated > unset ? c.updated : c.created }
+        try? context.save()
+    }
 
     init(mode: Mode) {
         self.mode = mode
@@ -51,6 +69,14 @@ final class Conversation {
     }
 
     func index(of id: UUID) -> Int? { messages.firstIndex { $0.id == id } }
+
+    /// The Ollama model this chat uses on the Mac.
+    var resolvedMacModel: String {
+        macModel.isEmpty ? UserDefaults.standard.string(forKey: MacLink.modelKey) ?? "" : macModel
+    }
+
+    /// What answers, for the picker, the sidebar and the inspector: "Gemma 4 E2B", "Gemma 4 31B".
+    var modelTitle: String { mode == .mac ? MacLink.displayName(resolvedMacModel) : mode.title }
 }
 
 struct StoredMessage: Codable, Hashable, Identifiable {
@@ -58,7 +84,7 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     var isUser: Bool
     var content = ""
     var thinking = ""
-    /// Which model wrote it and how fast, e.g. "Inkling 2 Mini (Q2_K_XL) · 4.1 tok/s".
+    /// Which model wrote it and how fast, e.g. "Gemma 4 E4B · 14.1 tok/s".
     var footnote: String?
     var error: String?
     /// False until a reply ends (finished, stopped or failed). A reply still false when nothing is
@@ -86,7 +112,7 @@ struct StoredMessage: Codable, Hashable, Identifiable {
 
     /// This turn as the model sees it, or nil if it isn't sent (failed or empty). A question's text
     /// is preceded by its date note and its files' text, in a fixed format, so the turn renders
-    /// byte for byte the same each time (Inkling's cache is only ever appended to).
+    /// byte for byte the same each time (a saved cache is only reused for an identical prefix).
     nonisolated var chatMessage: ChatMessage? {
         guard error == nil, !content.isEmpty || hasAttachments else { return nil }
         guard isUser else { return ChatMessage(role: .assistant, content: content) }
@@ -157,14 +183,14 @@ struct ReplyVersion: Codable, Hashable {
 nonisolated enum ReplyErrorKind: String, Codable, Sendable {
     /// The mode's model isn't on this device: offer Readiness.
     case notDownloaded
-    /// The model file is being converted: try again shortly.
+    /// The model file was being converted (Inkling, in earlier builds). Kept so saved replies decode.
     case modelBusy
     /// The model couldn't be loaded (usually memory).
     case loadFailed
     /// The chat no longer fits the model's context: offer `Engine.continueTrimmed(in:)` or
     /// `Engine.continueInNewChat(from:)`.
     case contextFull
-    /// Ollama on the Mac didn't answer on either route: offer Fast or Smart.
+    /// Ollama on the Mac didn't answer on either route: offer the on-device models.
     case macUnreachable
     /// Ollama answered but has no usable model (none at all, or the chosen one is gone).
     case macNoModel

@@ -6,7 +6,8 @@ import Foundation
 /// - `lantern://ask?text=…&mode=smart`: a new chat that sends `text` straight away.
 /// - `lantern://chat/<id>`: opens a chat. The id is `Conversation.stateID`.
 ///
-/// Modes are `Mode` raw values (`fast`, `smart`, `mac`); anything else means the usual mode.
+/// Modes are `Mode` raw values (`fast` is Gemma 4 E2B, `smart` Gemma 4 E4B, `mac` the Mac);
+/// anything else means the usual mode.
 nonisolated enum LanternLink: Equatable, Sendable {
     case new(mode: String?)
     case ask(text: String, mode: String?)

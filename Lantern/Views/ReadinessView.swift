@@ -7,6 +7,8 @@ import UserNotifications
 /// "Will Lantern work without internet?" Models on this device (get, test, delete), the
 /// Mac on each route, and when this build stops launching.
 struct ReadinessView: View {
+    /// Closes the sheet it's in (it's pushed inside Settings, where `dismiss` would only go back).
+    var close: (() -> Void)?
     @Environment(Engine.self) private var engine
     @Environment(ModelStore.self) private var store
     @Environment(\.dismiss) private var dismiss
@@ -20,6 +22,7 @@ struct ReadinessView: View {
     @State private var importError: String?
     @State private var dropTargeted = false
     @State private var reminders: UNAuthorizationStatus?
+    @State private var deletingRetired = false
 
     var body: some View {
         List {
@@ -27,7 +30,13 @@ struct ReadinessView: View {
                 let ready = Readiness.isReady(store: store, engine: engine)
                 // Coloured icon, primary text: green or orange text is hard to read on white.
                 Label {
-                    Text(Readiness.summary(store: store, engine: engine)).font(.headline)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(Readiness.summary(store: store, engine: engine)).font(.headline)
+                        Text(ready
+                             ? "Lantern answers on this device with no connection at all."
+                             : "Get them while you have internet. After that, Lantern answers on this device with no connection at all.")
+                            .font(.subheadline).foregroundStyle(.secondary)
+                    }
                 } icon: {
                     Image(systemName: ready ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                         .foregroundStyle(ready ? .green : .orange)
@@ -43,6 +52,20 @@ struct ReadinessView: View {
                     Download while you have internet. Without it, copy the file from your Mac: in Finder, \
                     select this device, then Files, and drag it onto Lantern, using the name shown.
                     """)
+            }
+
+            if !store.retired.isEmpty {
+                Section {
+                    ForEach(store.retired, id: \.name) { file in
+                        LabeledContent(file.name, value: size(file.bytes))
+                            .font(.callout.monospaced())
+                    }
+                    Button("Delete Unused Files", systemImage: "trash", role: .destructive) { deletingRetired = true }
+                } header: {
+                    Text("No longer used")
+                } footer: {
+                    Text("Inkling 2 Mini no longer runs on this device: it was too big and slow for it. Your Mac can still run it.")
+                }
             }
 
             Section {
@@ -89,9 +112,17 @@ struct ReadinessView: View {
         }
         .navigationTitle("Readiness")
         .toolbar {
-            ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            ToolbarItem(placement: .confirmationAction) { Button("Done") { if let close { close() } else { dismiss() } } }
         }
-        .onAppear { store.refresh() }
+        .onAppear {
+            store.refresh()
+            store.refreshRetired()
+        }
+        .confirmationDialog("Delete files no longer used?", isPresented: $deletingRetired, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) { store.deleteRetired() }
+        } message: {
+            Text("Frees \(size(store.retired.reduce(0) { $0 + $1.bytes })).")
+        }
         .task { checkMac() }
         .task { reminders = await ExpiryReminders.status() }
         .fileImporter(isPresented: $choosingFile, allowedContentTypes: [.gguf]) { result in
@@ -145,8 +176,9 @@ struct ReadinessView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Label(model.name, systemImage: model.isExtra ? "photo" : model.tier.symbol).font(.headline)
-                if CatalogModel.preferred(for: model.tier, downloaded: []) == model {
-                    Text("Best fit").font(.caption).padding(.horizontal, 6).background(.tint.opacity(0.2), in: .capsule)
+                if !CatalogModel.fits(model) {
+                    Text("Needs \(model.minDeviceGB) GB").font(.caption).padding(.horizontal, 6)
+                        .background(.orange.opacity(0.2), in: .capsule)
                 }
             }
             Text(model.detail).font(.callout).foregroundStyle(.secondary)
@@ -154,17 +186,17 @@ struct ReadinessView: View {
                 .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
             switch state {
             case .missing:
-                Button("Download") { store.download(model) }.buttonStyle(.borderedProminent)
+                // Image reading is optional, so its button doesn't compete with the models'.
+                if model.isExtra {
+                    Button("Download") { store.download(model) }.buttonStyle(.bordered)
+                } else {
+                    Button("Download") { store.download(model) }.buttonStyle(.borderedProminent)
+                }
             case .downloading(let p):
                 HStack {
                     ProgressView(value: p).accessibilityLabel("Downloading")
                     Text("\(Int(p * 100))%").font(.caption.monospacedDigit())
                     Button("Cancel") { store.cancel(model) }
-                }
-            case .converting(let p):
-                HStack {
-                    ProgressView(value: p).accessibilityLabel("Making it faster")
-                    Text("Making it faster for this device · \(Int(p * 100))%").font(.caption.monospacedDigit())
                 }
             case .incomplete(let bytes):
                 Label("Incomplete: \(size(bytes)) of \(size(model.bytes)). If it's still copying, wait.",
@@ -181,14 +213,6 @@ struct ReadinessView: View {
                     Spacer()
                     if !model.isExtra { Button("Test") { test(model) }.disabled(engine.isBusy) }
                     Button("Delete", role: .destructive) { deleting = model }.disabled(engine.isBusy)
-                }
-                if store.unconverted.contains(model.id) {
-                    HStack {
-                        Text(store.conversionErrors[model.id] ?? "Part of this model runs on the CPU. Converting it once makes it several times faster.")
-                            .font(.caption).foregroundStyle(store.conversionErrors[model.id] == nil ? Color.secondary : Color.orange)
-                        Spacer()
-                        Button("Make faster") { store.convert(model) }.disabled(engine.isBusy)
-                    }
                 }
             }
         }
@@ -316,8 +340,8 @@ enum Readiness {
 
     static var expiresSoon: Bool { expiry.map { $0.timeIntervalSinceNow < 30 * 86_400 } ?? false }
 
-    /// Ready means a Fast model and the best-fitting Smart model are complete on this device and the
-    /// build isn't about to expire. The Mac is a bonus.
+    /// Ready means every on-device model that fits this device (Gemma 4 E2B, and E4B with 8 GB) is
+    /// complete and the build isn't about to expire. Image reading and the Mac are a bonus.
     static func isReady(store: ModelStore, engine: Engine) -> Bool {
         missing(store: store, engine: engine).isEmpty && !expiresSoon
     }
@@ -330,7 +354,8 @@ enum Readiness {
 
     private static func missing(store: ModelStore, engine: Engine) -> [String] {
         [Mode.fast, .smart].compactMap { mode in
-            guard let model = CatalogModel.preferred(for: mode, downloaded: store.downloaded) else { return nil }
+            guard let model = CatalogModel.preferred(for: mode, downloaded: store.downloaded),
+                  mode == .fast || CatalogModel.fits(model) else { return nil }
             return store.states[model.id] == .ready ? nil : model.name
         }
     }

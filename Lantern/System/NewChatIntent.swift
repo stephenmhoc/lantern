@@ -9,9 +9,9 @@ nonisolated enum ChatModeChoice: String, AppEnum {
     static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mode")
     static let caseDisplayRepresentations: [ChatModeChoice: DisplayRepresentation] = [
         .usual: DisplayRepresentation(title: "Usual", subtitle: "The mode you used last, if it's ready"),
-        .fast: DisplayRepresentation(title: "Fast", subtitle: "Gemma on this device", image: .init(systemName: "hare")),
-        .smart: DisplayRepresentation(title: "Smart", subtitle: "Inkling on this device", image: .init(systemName: "brain")),
-        .computer: DisplayRepresentation(title: "Computer", subtitle: "Ollama on your computer", image: .init(systemName: "desktopcomputer")),
+        .fast: DisplayRepresentation(title: "Gemma 4 E2B", subtitle: "On this device", image: .init(systemName: "cpu")),
+        .smart: DisplayRepresentation(title: "Gemma 4 E4B", subtitle: "On this device", image: .init(systemName: "cpu")),
+        .computer: DisplayRepresentation(title: "Computer", subtitle: "The model last used on your computer", image: .init(systemName: "cloud")),
     ]
 
     /// The `Mode` raw value for a `LanternLink`; nil for the usual mode.

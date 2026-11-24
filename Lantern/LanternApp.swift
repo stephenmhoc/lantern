@@ -13,6 +13,7 @@ struct LanternApp: App {
     }()
 
     init() {
+        Conversation.repairActivity(in: Self.container.mainContext)
         SpotlightIndex.start(Self.container)
     }
 
@@ -80,15 +81,6 @@ private struct EngineTest: ViewModifier {
     func body(content: Content) -> some View {
         content.task {
             guard ProcessInfo.processInfo.arguments.contains("-enginetest") else { return }
-            if ProcessInfo.processInfo.arguments.contains("-convert") {
-                // Also convert whatever needs it first, as tapping Make faster in Readiness would.
-                for model in CatalogModel.all where engine.store.unconverted.contains(model.id) {
-                    engine.store.convert(model)
-                    while case .converting = engine.store.states[model.id] { try? await Task.sleep(for: .seconds(1)) }
-                    print("ENGINETEST converted \(model.name): \(engine.store.states[model.id] == .ready), still unconverted:",
-                          engine.store.unconverted.contains(model.id), engine.store.conversionErrors[model.id] ?? "")
-                }
-            }
             // Chats from an older build must still open: their stored messages predate newer fields.
             for old in (try? context.fetch(FetchDescriptor<Conversation>())) ?? [] {
                 print("ENGINETEST existing chat: \(old.messages.count) messages, \(old.history(before: old.messages.count).count) in history")
