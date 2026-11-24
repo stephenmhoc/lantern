@@ -35,7 +35,9 @@ env:
 jobs:
   release:
     name: Archive, Upload, and Publish
-    runs-on: macos-26
+    # App Store Connect wants the iOS 27 SDK from April 2027 (ITMS-90725); macos-26 tops out at
+    # Xcode 26.6 and the iOS 26.5 SDK. GitHub's Xcode 27 image is its own label.
+    runs-on: xcode-27
     timeout-minutes: 90
 
     steps:
@@ -43,6 +45,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      # Pinned rather than the image's default, so a build doesn't change SDK when the image does.
+      # The same Xcode as local builds.
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_27.2.app
 
       - name: Show Build Environment
         run: |
