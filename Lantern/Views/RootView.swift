@@ -141,7 +141,7 @@ struct RootView: View {
         // Selection-driven rows (no NavigationLink): on iPhone a NavigationLink here pushes twice.
         List(selection: $selection) {
             ForEach(sections) { section in
-                Section(section.title) {
+                Section {
                     ForEach(section.chats) { c in
                         ChatRow(conversation: c, answering: engine.running == c.persistentModelID)
                             .tag(c)
@@ -157,6 +157,13 @@ struct RootView: View {
                             }
                             .contextMenu { menu(for: c) }
                     }
+                } header: {
+                    // On the title's (and the cards') edge rather than indented to the rows' text.
+                    // The list ignores header insets, so it's pulled out by the card's inset.
+                    Text(section.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, -16)
                 }
             }
         }
@@ -164,6 +171,9 @@ struct RootView: View {
         // Rows carry a preview and a date: give them room on iPad.
         .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 400)
         .navigationTitle("Lantern")
+        // The large title in the bar's own row: nothing else sits up there now that New chat is
+        // at the bottom, so a separate row for it was only empty space.
+        .toolbarTitleDisplayMode(.inlineLarge)
         // Our own sidebar button, at the far left of the header instead of beside New chat.
         .toolbar(removing: .sidebarToggle)
         .toolbar {

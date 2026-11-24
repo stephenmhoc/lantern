@@ -125,12 +125,13 @@ struct ChatRow: View {
                 Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
             }
             // Pinned chats have their own section, so the row doesn't mark them again.
+            // Not a Label: in a List it gets a fixed-width icon column, which left a gap.
             HStack(spacing: 4) {
-                Label(conversation.modelTitle, systemImage: conversation.mode.symbol)
+                Image(systemName: conversation.mode.symbol).imageScale(.small)
+                Text(conversation.modelTitle)
             }
             .font(.caption)
             .foregroundStyle(.tertiary)
-            .labelStyle(.titleAndIcon)
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
