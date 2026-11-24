@@ -32,13 +32,13 @@ struct ChatSection: Identifiable {
         ].filter { !$0.chats.isEmpty }
     }
 
-    /// In-memory search over titles and message text.
+    /// The chats matching `query` anywhere the sidebar's search looks (`ChatSearch`): titles,
+    /// questions and answers with their other versions, attached files and thinking. For callers
+    /// that only need the chats (`ChatQuery`); the sidebar shows `ChatSearch.run`'s results.
     static func filter(_ chats: [Conversation], query: String) -> [Conversation] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return chats }
-        return chats.filter { c in
-            c.title.localizedStandardContains(q) || c.messages.contains { $0.content.localizedStandardContains(q) }
-        }
+        return chats.filter { ChatSearch.matches($0, query: q) }
     }
 }
 
@@ -65,19 +65,37 @@ struct DeletedChat: Identifiable {
     let created: Date
     let updated: Date
     let mode: Mode
+    let macModel: String
     let thinking: Thinking
     let pinned: Bool
+    let systemPrompt: String
+    let historyStart: Int
     let messages: [StoredMessage]
 
-    init(_ c: Conversation) {
+    /// `comparing`: the id of the comparison running in `c` (`Engine.comparisonInProgress`). The
+    /// unfinished B is left out and the chat is put back as it was before it: A shown, on A's model.
+    init(_ c: Conversation, comparing: UUID? = nil) {
         title = c.title
         created = c.created
         updated = c.lastActive
-        mode = c.mode
         thinking = c.thinking
         pinned = c.pinned
+        systemPrompt = c.systemPrompt
+        historyStart = c.historyStart
+        var messages = c.messages
+        var mode = c.mode, macModel = c.macModel
+        if let comparing, let last = messages.indices.last, !messages[last].isUser, !messages[last].finished,
+           let a = Self.withoutB(messages[last], comparing: comparing) {
+            messages[last] = a
+            if let m = a.metrics, let aMode = Mode(rawValue: m.modeRaw) {
+                mode = aMode
+                if aMode == .mac, let model = m.macModel, !model.isEmpty { macModel = model }
+            }
+        }
+        self.mode = mode
+        self.macModel = macModel
         // A reply cut off by the delete is kept as stopped, not left looking unfinished.
-        messages = c.messages.map { m in
+        self.messages = messages.map { m in
             var m = m
             if !m.finished {
                 m.finished = true
@@ -87,13 +105,40 @@ struct DeletedChat: Identifiable {
         }
     }
 
+    /// The reply with the running B (the shown, newest answer) removed and A shown, no longer
+    /// paired. Nil if A isn't among its versions.
+    private static func withoutB(_ reply: StoredMessage, comparing: UUID) -> StoredMessage? {
+        var (list, current) = reply.allVersions
+        list.remove(at: current)
+        guard let ai = list.lastIndex(where: { $0.metrics?.compareID == comparing }) ?? list.indices.last else { return nil }
+        let a = list.remove(at: ai)
+        var m = reply
+        m.content = a.content
+        m.thinking = a.thinking
+        m.footnote = a.footnote
+        m.error = a.error
+        m.errorKind = nil
+        m.cutOff = nil
+        m.thoughtSeconds = a.thoughtSeconds
+        m.metrics = a.metrics
+        m.metrics?.compareID = nil
+        m.metrics?.preferred = nil
+        m.finished = true
+        m.versions = list.isEmpty ? nil : list
+        m.versionIndex = ai >= list.count ? nil : ai
+        return m
+    }
+
     func restore(into context: ModelContext) -> Conversation {
         let c = Conversation(mode: mode)
         c.title = title
         c.created = created
         c.lastActive = updated
+        c.macModel = macModel
         c.thinking = thinking
         c.pinned = pinned
+        if !systemPrompt.isEmpty { c.systemPrompt = systemPrompt }  // frozen per chat
+        c.historyStart = historyStart
         c.messages = messages
         context.insert(c)
         try? context.save()

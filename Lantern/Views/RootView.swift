@@ -25,9 +25,16 @@ struct RootView: View {
     @State private var columns = NavigationSplitViewVisibility.all
     @State private var query = ""
     @State private var searching = false
+    @State private var scope = SearchScope.all
+    /// What the sidebar shows while a query is typed, computed off the main actor in `search`.
+    @State private var results: [ChatSearch.Result] = []
+    /// The query and scope `results` are for: "No results" waits until the current one has run.
+    @State private var resultsFor: SearchKey?
     @State private var renaming: Conversation?
     @State private var renameText = ""
     @State private var deleted: DeletedChat?
+    /// The chat this window last asked `ChatJump` to scroll, to clear only its own request.
+    @State private var jumpRequested: PersistentIdentifier?
     @AppStorage(DefaultMode.key) private var lastMode = ""
     @Environment(\.scenePhase) private var scenePhase
     @State private var window = WindowProbe()
@@ -44,8 +51,15 @@ struct RootView: View {
         sheet = .settings
     }
 
-    private var sections: [ChatSection] { ChatSection.group(ChatSection.filter(conversations, query: query)) }
-    private var ordered: [Conversation] { sections.flatMap(\.chats) }
+    private var sections: [ChatSection] { ChatSection.group(conversations) }
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var isSearching: Bool { !trimmedQuery.isEmpty }
+    /// The chats in the order the sidebar shows them, for ⌘↑/⌘↓ and moving on after a delete.
+    private var ordered: [Conversation] {
+        guard isSearching else { return sections.flatMap(\.chats) }
+        let byID = Dictionary(conversations.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { a, _ in a })
+        return results.compactMap { byID[$0.id] }
+    }
     private var hasSidebarToggle: Bool { sizeClass == .regular }
 
     var body: some View {
@@ -140,34 +154,32 @@ struct RootView: View {
     private var sidebar: some View {
         // Selection-driven rows (no NavigationLink): on iPhone a NavigationLink here pushes twice.
         List(selection: $selection) {
-            ForEach(sections) { section in
-                Section {
-                    ForEach(section.chats) { c in
-                        ChatRow(conversation: c, answering: engine.running == c.persistentModelID)
-                            .tag(c)
-                            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                                Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
-                                Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
-                            }
-                            .swipeActions(edge: .leading) {
-                                Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") {
-                                    togglePin(c)
-                                }
-                                .tint(.orange)
-                            }
-                            .contextMenu { menu(for: c) }
-                    }
-                } header: {
-                    // On the title's (and the cards') edge rather than indented to the rows' text.
-                    // The list ignores header insets, so it's pulled out by the card's inset.
-                    Text(section.title)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .padding(.leading, -16)
-                }
+            if isSearching {
+                searchResults
+            } else {
+                chatSections
             }
         }
         .searchable(text: $query, isPresented: $searching, placement: .sidebar, prompt: "Search chats")
+        .searchScopes($scope, activation: .onSearchPresentation) {
+            ForEach(SearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
+        }
+        .task(id: searchKey) { await search(searchKey) }
+        .onChange(of: searching) { _, on in if !on { SearchIndex.shared.clear() } }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            SearchIndex.shared.clear()
+        }
+        .onChange(of: selection) { _, c in
+            if isSearching, let c, let r = results.first(where: { $0.id == c.persistentModelID }) {
+                // Arrow keys onto a result: jump to its match too (a tap already set it).
+                requestJump(to: r)
+            } else if let requested = jumpRequested, requested != c?.persistentModelID {
+                // This window's jump nobody took shouldn't fire on some later visit. Only its own:
+                // another window's is for the chat that window shows.
+                ChatJump.shared.clear(for: requested)
+                jumpRequested = nil
+            }
+        }
         // Rows carry a preview and a date: give them room on iPad.
         .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 400)
         .navigationTitle("Lantern")
@@ -182,26 +194,11 @@ struct RootView: View {
                     Button("Hide sidebar", systemImage: "sidebar.left") { toggleSidebar() }
                 }
             }
-            ToolbarItemGroup(placement: .bottomBar) {
-                // Readiness is inside Settings; a warning on the gear says when it needs a look.
-                let ready = Readiness.isReady(store: store, engine: engine)
-                Button { showSettings(readiness: !ready) } label: {
-                    Image(systemName: "gearshape")
-                        .overlay(alignment: .topTrailing) {
-                            if !ready {
-                                Image(systemName: "exclamationmark.circle.fill")
-                                    .font(.caption2)
-                                    .foregroundStyle(.white, .orange)
-                                    .offset(x: 6, y: -6)
-                            }
-                        }
-                }
-                .accessibilityLabel(ready ? "Settings" : "Settings, not ready to work offline")
-                Spacer()
-                // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
-                Button("New chat", systemImage: "square.and.pencil", action: { newChat() })
-            }
         }
+        // Settings and New chat sit in the list's own bottom inset, not the navigation toolbar:
+        // on iPhone the sidebar and the chat share one navigation controller, and a toolbar item
+        // of the sidebar's stayed drawn over a chat opened by a link.
+        .modifier(BottomBar { sidebarButtons })
         .overlay {
             if conversations.isEmpty {
                 ContentUnavailableView {
@@ -217,18 +214,158 @@ struct RootView: View {
                         Button("New chat", action: { newChat() }).buttonStyle(.borderedProminent)
                     }
                 }
-            } else if sections.isEmpty {
-                ContentUnavailableView.search(text: query)
+            } else if isSearching, resultsFor == searchKey, results.isEmpty {
+                ContentUnavailableView.search(text: trimmedQuery)
             }
         }
     }
 
+    /// Settings on the left (badged when not ready), New chat on the right, as round glass buttons.
+    private var sidebarButtons: some View {
+        // Readiness is inside Settings; a warning on the gear says when it needs a look.
+        let ready = Readiness.isReady(store: store, engine: engine)
+        return HStack {
+            Button { showSettings(readiness: !ready) } label: {
+                Label("Settings", systemImage: "gearshape")
+                    .labelStyle(.iconOnly)
+                    .font(.title3)
+                    .frame(width: 28, height: 28)
+            }
+            .modifier(RoundGlass(prominent: false))
+            .overlay(alignment: .topTrailing) {
+                if !ready {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.white, .orange)
+                        .offset(x: 2, y: -2)
+                        .accessibilityHidden(true)
+                }
+            }
+            .accessibilityLabel(ready ? "Settings" : "Settings, not ready to work offline")
+            Spacer()
+            // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
+            Button { newChat() } label: {
+                Label("New chat", systemImage: "square.and.pencil")
+                    .labelStyle(.iconOnly)
+                    .font(.title3.weight(.medium))
+                    // Dark on the amber: white on it is about 2.3:1, under the 3:1 icons need;
+                    // black is about 9:1, in light and dark mode alike (the fill doesn't change).
+                    .foregroundStyle(.black)
+                    .frame(width: 28, height: 28)
+            }
+            .modifier(RoundGlass(prominent: true))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    /// The chats by date, with their swipe actions and menu.
+    private var chatSections: some View {
+        ForEach(sections) { section in
+            Section {
+                ForEach(section.chats) { c in
+                    rowActions(ChatRow(conversation: c, answering: engine.running == c.persistentModelID).tag(c), c)
+                }
+            } header: {
+                // On the title's (and the cards') edge rather than indented to the rows' text.
+                // The list ignores header insets, so it's pulled out by the card's inset.
+                Text(section.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, -16)
+            }
+        }
+    }
+
+    /// While a query is typed: chats with a match, title matches first, each showing where it matched.
+    private var searchResults: some View {
+        let byID = Dictionary(conversations.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { a, _ in a })
+        return ForEach(results) { r in
+            if let c = byID[r.id] {
+                // The list's selection opens the chat (onChange(of: selection) sets the jump); the
+                // tap also sets it, for the chat already shown on iPad, whose selection doesn't change.
+                rowActions(SearchResultRow(result: r).tag(c), c, result: r)
+                    .simultaneousGesture(TapGesture().onEnded { requestJump(to: r) })
+            }
+        }
+    }
+
+    /// A row's swipe actions and menu, the same for a chat and a search result. `result`: open
+    /// windows at its match too.
+    private func rowActions(_ row: some View, _ c: Conversation, result: ChatSearch.Result? = nil) -> some View {
+        row
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
+                Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
+            }
+            .swipeActions(edge: .leading) {
+                Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") {
+                    togglePin(c)
+                }
+                .tint(.orange)
+            }
+            .contextMenu { menu(for: c, result: result) }
+    }
+
+    /// Asks the chat screen showing `r`'s chat to scroll to its match. Keyed by the chat, so it
+    /// can't be taken or cleared by another window showing another chat.
+    private func requestJump(to r: ChatSearch.Result) {
+        if let requested = jumpRequested, requested != r.id { ChatJump.shared.clear(for: requested) }
+        guard let hit = r.target else { ChatJump.shared.clear(for: r.id); jumpRequested = nil; return }
+        ChatJump.shared.request(.init(conversation: r.id, message: hit.message, version: hit.version, query: trimmedQuery))
+        jumpRequested = r.id
+    }
+
+    /// What `results` depends on. `revision` changes when a chat is added, removed, renamed, has a
+    /// turn start or end, or shows another answer (a version switch, Continue With), so results
+    /// don't go stale while the query stays the same. Votes don't change what's searched.
+    struct SearchKey: Hashable {
+        var query: String
+        var scope: SearchScope
+        var revision: Int
+    }
+
+    private var searchKey: SearchKey {
+        // Only while searching: it reads every chat's messages.
+        guard isSearching else { return SearchKey(query: "", scope: scope, revision: 0) }
+        var h = Hasher()
+        h.combine(conversations.count)
+        for c in conversations {
+            h.combine(c.lastActive)
+            h.combine(c.title)
+            for m in c.messages where !m.isUser {
+                h.combine(m.id)
+                h.combine(m.versionIndex)
+            }
+        }
+        return SearchKey(query: trimmedQuery, scope: scope, revision: h.finalize())
+    }
+
+    /// Runs the search for `key` after a short pause for typing, off the main actor.
+    private func search(_ key: SearchKey) async {
+        guard !key.query.isEmpty else {
+            if !results.isEmpty { results = [] }
+            if resultsFor != nil { resultsFor = nil }
+            SearchIndex.shared.clear()  // folded text of every chat: not kept between searches
+            return
+        }
+        // Typing restarts the task (its id changes), which cancels this sleep: a debounce.
+        try? await Task.sleep(for: .milliseconds(180))
+        guard !Task.isCancelled else { return }
+        let documents = ChatSearch.documents(conversations)
+        let found = await ChatSearch.search(documents, query: key.query, scope: key.scope)
+        guard !Task.isCancelled else { return }
+        results = found
+        resultsFor = key
+    }
+
     @ViewBuilder
-    private func menu(for c: Conversation) -> some View {
+    private func menu(for c: Conversation, result: ChatSearch.Result? = nil) -> some View {
         Button("Rename", systemImage: "pencil") { startRename(c) }
         Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") { togglePin(c) }
         if supportsMultipleWindows {
             Button("Open in New Window", systemImage: "macwindow.badge.plus") {
+                if let result { requestJump(to: result) }
                 try? context.save()  // so the window gets a permanent identifier
                 openWindow(id: LanternApp.mainWindow, value: c.persistentModelID)
             }
@@ -289,6 +426,7 @@ struct RootView: View {
         restored = true
         #if DEBUG
         DebugLaunch.seed(context)
+        ChatSearch.benchmark()
         switch DebugLaunch.ui {
         case "readiness"?: showSettings(readiness: true)
         case "settings"?: showSettings()
@@ -356,8 +494,17 @@ struct RootView: View {
     /// A `lantern://` link, an App Intent or a Spotlight result, in this window.
     private func handle(_ link: LanternLink) {
         restoreSelection()  // first, in case this arrives before the window appeared
-        sheet = nil
         searching = false
+        guard sheet == nil else {
+            // Selecting while the sheet goes away can be lost: dismiss, then go on next turn.
+            sheet = nil
+            DispatchQueue.main.async { open(link) }
+            return
+        }
+        open(link)
+    }
+
+    private func open(_ link: LanternLink) {
         switch link {
         case .new(let mode):
             newChat(mode: mode.flatMap(Mode.init(rawValue:)))
@@ -389,6 +536,9 @@ struct RootView: View {
     }
 
     private func delete(_ c: Conversation) {
+        // Before stopping: a comparison still running is put back as it was before it (A shown, on
+        // A's model), not with B's model and an empty B.
+        let snapshot = DeletedChat(c, comparing: engine.comparisonInProgress(in: c))
         if engine.running == c.persistentModelID { engine.stop() }
         engine.forgetState(for: c)  // its saved model state in Caches/kv
         if selection == c {
@@ -397,7 +547,7 @@ struct RootView: View {
             let next = list.firstIndex(of: c).flatMap { i in list.indices.contains(i + 1) ? list[i + 1] : i > 0 ? list[i - 1] : nil }
             selection = hasSidebarToggle ? next : nil
         }
-        withAnimation { deleted = DeletedChat(c) }
+        withAnimation { deleted = snapshot }
         context.delete(c)
         try? context.save()
     }
@@ -406,5 +556,41 @@ struct RootView: View {
         let c = d.restore(into: context)
         withAnimation { deleted = nil }
         selection = c
+    }
+}
+
+/// The sidebar's bottom buttons in the list's own bottom inset: a glass bar on iOS 26, the system
+/// bar material before.
+private struct BottomBar<Bar: View>: ViewModifier {
+    @ViewBuilder let bar: () -> Bar
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content.safeAreaBar(edge: .bottom) { bar() }
+        } else {
+            content.safeAreaInset(edge: .bottom, spacing: 0) { bar().background(.bar) }
+        }
+    }
+}
+
+/// A round button: glass on iOS 26 (prominent glass in the accent colour for the main action),
+/// bordered before.
+private struct RoundGlass: ViewModifier {
+    let prominent: Bool
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            if prominent {
+                content.buttonStyle(.glassProminent).tint(.accentColor).buttonBorderShape(.circle).controlSize(.large)
+            } else {
+                content.buttonStyle(.glass).buttonBorderShape(.circle).controlSize(.large)
+            }
+        } else {
+            if prominent {
+                content.buttonStyle(.borderedProminent).tint(.accentColor).buttonBorderShape(.circle).controlSize(.large)
+            } else {
+                content.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
+            }
+        }
     }
 }

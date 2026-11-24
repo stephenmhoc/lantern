@@ -24,6 +24,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     /// Called when typing starts in a chat whose model isn't loaded (or whose Mac route isn't known),
     /// to get it ready before Send. Must return at once (e.g. start `Engine.prepare` in a Task).
     var onBeginTyping: (() -> Void)?
+    /// Opens `CompareView` for a reply (its id, and whether to start on B).
+    var onShowComparison: ((UUID, Bool) -> Void)?
 
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, UUID>!
@@ -163,12 +165,23 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         scrollToBottom(animated: false)
+        takeJump()
+        observeJump()
         // Ready to type on iPad and Mac; on iPhone the keyboard would cover a chat you came to read.
         // Not behind a sheet (Settings, Readiness), whose keyboard-covered content would be hidden.
         if traitCollection.userInterfaceIdiom != .phone, view.window?.rootViewController?.presentedViewController == nil {
             composer.textView.becomeFirstResponder()
         }
         engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
+        #if DEBUG
+        // -ui compare (or compare:b, with :metrics to scroll to the table): the seeded comparison, once the chat has settled.
+        if let ui = DebugLaunch.ui, ui.hasPrefix("compare"), let reply = conversation.messages.last, reply.comparison != nil {
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                self?.showComparison(reply.id, startOnB: ui.hasPrefix("compare:b"))
+            }
+        }
+        #endif
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -313,6 +326,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         }
         cell.onSwitchVersion = { [unowned self] delta in switchVersion(id, by: delta) }
         cell.onStopSpeaking = { Speaker.shared.stop() }
+        cell.onCompare = { [unowned self] in showComparison(id) }
     }
 
     private func modelName(for mode: Mode) -> String? {
@@ -357,6 +371,21 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         isPinned = true
         engine.retry(in: conversation, mode: mode, macModel: macModel)
         refresh()
+    }
+
+    /// Answers the last question again with `other`, keeping both answers as a pair to compare.
+    private func compare(with other: ModelChoice) {
+        guard let old = conversation.messages.last, !old.isUser, !engine.isBusy else { return }
+        if Speaker.shared.speaking == old.id { Speaker.shared.stop() }
+        isPinned = true
+        engine.compare(in: conversation, with: other)
+        refresh()
+    }
+
+    /// The two answers side by side, with how each was made. Presented by `ChatScreen` in
+    /// SwiftUI, so the sheet goes away with this chat when another one is selected or opened.
+    func showComparison(_ id: UUID, startOnB: Bool = false) {
+        onShowComparison?(id, startOnB)
     }
 
     private func switchVersion(_ id: UUID, by delta: Int) {
@@ -416,23 +445,17 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     }
 
     /// One entry per model: the Gemmas on this device, then each of Ollama's models on the Mac.
-    private struct Choice {
-        let mode: Mode
-        let macModel: String?
-        var title: String { macModel.map(MacLink.displayName) ?? mode.title }
-    }
-
-    private var choices: (device: [Choice], mac: [Choice]) {
-        let device = Mode.allCases.filter(\.isOnDevice).map { Choice(mode: $0, macModel: nil) }
+    private var choices: (device: [ModelChoice], mac: [ModelChoice]) {
+        let device = Mode.allCases.filter(\.isOnDevice).map { ModelChoice(mode: $0, macModel: nil) }
         var names = engine.mac.models
         // The chat's own model even if the Mac hasn't been checked yet (or no longer lists it).
         let current = conversation.resolvedMacModel
         if !current.isEmpty, !names.contains(current) { names.insert(current, at: 0) }
-        let mac = names.isEmpty ? [Choice(mode: .mac, macModel: nil)] : names.map { Choice(mode: .mac, macModel: $0) }
+        let mac = names.isEmpty ? [ModelChoice(mode: .mac, macModel: nil)] : names.map { ModelChoice(mode: .mac, macModel: $0) }
         return (device, mac)
     }
 
-    private func isCurrent(_ choice: Choice) -> Bool {
+    private func isCurrent(_ choice: ModelChoice) -> Bool {
         guard choice.mode == conversation.mode else { return false }
         return choice.mode != .mac || choice.macModel == nil || choice.macModel == conversation.resolvedMacModel
     }
@@ -549,6 +572,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             }
             items.append(UIMenu(options: .displayInline, children: basics))
         }
+        if m.comparison != nil {
+            items.append(UIAction(title: "Compare Answers", image: UIImage(systemName: "rectangle.split.2x1")) {
+                [unowned self] _ in showComparison(id)
+            })
+        }
         if isLast(id), !engine.isBusy {
             let current = conversation.mode
             let (device, mac) = choices
@@ -557,13 +585,37 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                          image: UIImage(systemName: c.mode.symbol),
                          attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in retry(c.mode, macModel: c.macModel) }
             }
-            items.append(UIMenu(options: .displayInline, children: [
+            // A second answer from another model, kept beside this one (see CompareView).
+            let own = answeredBy(m)
+            let rivals = (device + mac).filter { !isSame($0, own) }.map { c in
+                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On your Mac",
+                         image: UIImage(systemName: c.mode.symbol),
+                         attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in compare(with: c) }
+            }
+            var retries: [UIMenuElement] = [
                 UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise"),
                          attributes: isAvailable(current) ? [] : .disabled) { [unowned self] _ in retry(current) },
-                UIMenu(title: "Retry with…", image: UIImage(systemName: "arrow.triangle.branch"), children: others),
-            ]))
+                UIMenu(title: "Retry With", image: UIImage(systemName: "arrow.triangle.branch"), children: others),
+            ]
+            if m.finished, m.error == nil, !m.content.isEmpty, !rivals.isEmpty {
+                retries.append(UIMenu(title: "Compare With", image: UIImage(systemName: "rectangle.split.2x1"), children: rivals))
+            }
+            items.append(UIMenu(options: .displayInline, children: retries))
         }
         return items
+    }
+
+    /// The model that wrote an answer: from its metrics, else its footnote, else the chat's.
+    private func answeredBy(_ m: StoredMessage) -> ModelChoice {
+        conversation.model(of: m.metrics, footnote: m.footnote, macModels: engine.mac.models)
+    }
+
+    /// Whether two choices name the same model. A Mac choice without a model means the chat's.
+    private func isSame(_ a: ModelChoice, _ b: ModelChoice) -> Bool {
+        guard a.mode == b.mode else { return false }
+        guard a.mode == .mac else { return true }
+        let resolve = { (c: ModelChoice) in c.macModel ?? self.conversation.resolvedMacModel }
+        return resolve(a) == resolve(b)
     }
 
     /// Copy, and Edit & Resend.
@@ -671,6 +723,92 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         if scrollView.isTracking || scrollView.isDecelerating { isPinned = distanceFromBottom < 44 }
         jumpButton.isHidden = isPinned || distanceFromBottom < 44
     }
+
+    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+        focusJumpTarget()
+    }
+
+    // MARK: - Jumping to a search result
+
+    /// Scrolls to the message a sidebar search result was tapped for (`ChatJump`), if it's for this
+    /// chat. The shown version is left alone: switching it would change the history sent next.
+    private func takeJump() {
+        guard view.window != nil,
+              let target = ChatJump.shared.claim(for: conversation.persistentModelID),
+              let path = dataSource.indexPath(for: target.message) else { return }
+        isPinned = false  // or the next layout snaps back to the bottom
+        collectionView.layoutIfNeeded()
+        jumpFocus = target.message
+        let before = collectionView.contentOffset
+        collectionView.scrollToItem(at: path, at: .centeredVertically, animated: true)
+        jumpButton.isHidden = false
+        // Already in place: no scrolling animation will end to move VoiceOver there.
+        if collectionView.contentOffset == before, collectionView.cellForItem(at: path) != nil,
+           !collectionView.isDragging { DispatchQueue.main.async { [weak self] in self?.focusJumpTarget() } }
+        // The match is in another answer to that question, which isn't switched to (that would
+        // change the history sent next): say where it is.
+        if let version = target.version, let m = message(target.message) {
+            let (list, current) = m.allVersions
+            if version != current, list.indices.contains(version) {
+                showToast("Match is in answer \(version + 1) of \(list.count)")
+            }
+        }
+    }
+
+    /// The message a search jump scrolled to, until VoiceOver has been moved to it.
+    private var jumpFocus: UUID?
+
+    /// Moves VoiceOver to the jumped-to message, once its cell is on screen (after the scroll, so
+    /// it works for a message that was far off).
+    private func focusJumpTarget() {
+        guard let id = jumpFocus, let path = dataSource.indexPath(for: id),
+              let cell = collectionView.cellForItem(at: path) else { return }
+        jumpFocus = nil
+        UIAccessibility.post(notification: .layoutChanged, argument: cell)
+    }
+
+    /// A short note over the transcript that fades on its own; VoiceOver reads it too.
+    private func showToast(_ text: String) {
+        let label = PaddedLabel()
+        label.text = text
+        label.font = .preferredFont(forTextStyle: .footnote)
+        label.adjustsFontForContentSizeCategory = true
+        label.textColor = .label
+        label.numberOfLines = 0
+        label.textAlignment = .center
+        label.backgroundColor = .secondarySystemBackground
+        label.layer.cornerRadius = 12
+        label.layer.cornerCurve = .continuous
+        label.clipsToBounds = true
+        label.isAccessibilityElement = false  // announced below instead
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.alpha = 0
+        view.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            label.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -32),
+        ])
+        UIView.animate(withDuration: 0.2) { label.alpha = 1 }
+        UIView.animate(withDuration: 0.4, delay: 2.5, options: []) { label.alpha = 0 } completion: { _ in label.removeFromSuperview() }
+        UIAccessibility.post(notification: .announcement, argument: text)
+    }
+
+    /// On iPad the tapped chat may already be on screen: take a target set while it's showing.
+    private func observeJump() {
+        guard !observingJump else { return }
+        observingJump = true
+        withObservationTracking { _ = ChatJump.shared.pending } onChange: { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.observingJump = false
+                guard self.view.window != nil else { return }  // viewDidAppear starts it again
+                self.takeJump()
+                self.observeJump()
+            }
+        }
+    }
+    private var observingJump = false
 
     private func scrollToBottom(animated: Bool) {
         let inset = collectionView.adjustedContentInset
@@ -940,9 +1078,19 @@ struct ChatScreen: View {
     @Environment(\.showReadiness) private var showReadiness
     @Environment(\.showSettings) private var showSettings
     @Environment(\.openChat) private var openChat
+    @State private var comparing: ComparisonRequest?
+
+    /// The reply `CompareView` shows, and which side it starts on.
+    struct ComparisonRequest: Identifiable {
+        let reply: UUID
+        let startOnB: Bool
+        var id: UUID { reply }
+    }
 
     var body: some View {
-        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness, showSettings: showSettings, openChat: openChat)
+        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness,
+                           showSettings: showSettings, openChat: openChat,
+                           showComparison: { comparing = ComparisonRequest(reply: $0, startOnB: $1) })
             .ignoresSafeArea(.keyboard)  // the UIKit side follows the keyboard itself
             .safeAreaInset(edge: .top, spacing: 0) { BusyBanner(conversation: conversation) }
             .navigationTitle(title)
@@ -961,6 +1109,12 @@ struct ChatScreen: View {
                     }
                     .keyboardShortcut("i", modifiers: [.command, .option])
                 }
+            }
+            // Here rather than presented from UIKit: the screen is rebuilt per chat (`.id`), so the
+            // sheet can't outlive it and act on the chat it came from.
+            .sheet(item: $comparing) { request in
+                CompareView(conversation: conversation, replyID: request.reply, startOnB: request.startOnB)
+                    .presentationDetents([.large])
             }
             .inspector(isPresented: $showInspector) {
                 ChatInspector(conversation: conversation) { withAnimation { showInspector = false } }
@@ -1046,17 +1200,31 @@ private struct ChatControllerView: UIViewControllerRepresentable {
     let showReadiness: OpenSheetAction
     let showSettings: OpenSheetAction
     let openChat: OpenChatAction
+    let showComparison: (UUID, Bool) -> Void
 
     func makeUIViewController(context: Context) -> ChatViewController {
         let controller = ChatViewController(conversation: conversation, engine: engine)
         controller.onOpenReadiness = { showReadiness() }
         controller.onOpenSettings = { showSettings() }
         controller.onOpenChat = { openChat($0) }
+        controller.onShowComparison = { showComparison($0, $1) }
         controller.onBeginTyping = { [conversation, engine] in engine.prepare(mode: conversation.mode, for: conversation) }
         return controller
     }
 
     func updateUIViewController(_ controller: ChatViewController, context: Context) {
         controller.refresh()
+    }
+}
+
+/// A label with room around its text, for `showToast`.
+private final class PaddedLabel: UILabel {
+    private let insets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+
+    override func drawText(in rect: CGRect) { super.drawText(in: rect.inset(by: insets)) }
+
+    override func textRect(forBounds bounds: CGRect, limitedToNumberOfLines n: Int) -> CGRect {
+        let rect = super.textRect(forBounds: bounds.inset(by: insets), limitedToNumberOfLines: n)
+        return rect.inset(by: UIEdgeInsets(top: -insets.top, left: -insets.left, bottom: -insets.bottom, right: -insets.right))
     }
 }

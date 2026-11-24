@@ -66,8 +66,10 @@ struct ChatInspector: View {
             }
 
             Section("Last reply") {
-                LabeledContent("Speed", value: lastReply.speed ?? "—")
-                LabeledContent("First token", value: lastReply.firstToken ?? "—")
+                let last = lastReply
+                LabeledContent("Speed", value: last.speed ?? "—")
+                LabeledContent("First token", value: last.firstToken ?? "—")
+                if let load = last.load { LabeledContent("Loading the model", value: load) }
             }
 
             Section("This device") {
@@ -105,16 +107,22 @@ struct ChatInspector: View {
         return chars / 4
     }
 
-    /// Read from the last reply's footnote, e.g. "Gemma 4 E2B · 14.2 tok/s · 0.8 s to first token".
-    private var lastReply: (speed: String?, firstToken: String?) {
-        guard let footnote = conversation.messages.last(where: { !$0.isUser && $0.footnote != nil })?.footnote else {
-            return (nil, nil)
+    /// From the last reply's metrics (the version shown), or for a reply from before them, read
+    /// from its footnote, e.g. "Gemma 4 E2B · 14.2 tok/s · 0.8 s to first token". The metrics'
+    /// first token leaves out loading the model, shown on its own line when it took a moment.
+    private var lastReply: (speed: String?, firstToken: String?, load: String?) {
+        let reply = conversation.messages.last { !$0.isUser && ($0.metrics != nil || $0.footnote != nil) }
+        if let m = reply?.metrics {
+            return (m.tokensPerSecond.map { String(format: "%.1f tok/s", $0) },
+                    m.firstTokenSeconds.map { String(format: "%.1f s", $0) },
+                    m.loadSeconds.flatMap { $0 >= 0.1 ? String(format: "%.1f s", $0) : nil })
         }
+        guard let footnote = reply?.footnote else { return (nil, nil, nil) }
         let parts = footnote.components(separatedBy: " · ")
         let speed = parts.first { $0.contains("tok/s") }
         let first = parts.first { $0.localizedCaseInsensitiveContains("first token") || $0.contains("TTFT") }
             .flatMap { part in part.firstMatch(of: /[0-9]+(\.[0-9]+)?\s*s/).map { String($0.output.0) } }
-        return (speed, first)
+        return (speed, first, nil)
     }
 }
 

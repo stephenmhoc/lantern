@@ -696,6 +696,34 @@ public final class LlamaModel: @unchecked Sendable {
         unsaved = nil
     }
 
+    /// Legacy directories already looked at by this model, so adopting costs nothing after the first time.
+    private var adoptedFrom: Set<URL> = []
+
+    private func adopt(from legacy: URL, into directory: URL) {
+        guard legacy.standardizedFileURL != directory.standardizedFileURL,
+              adoptedFrom.insert(legacy.standardizedFileURL).inserted else { return }
+        let fm = FileManager.default
+        let file = stateKey.split(separator: "|").dropFirst().first
+        for slot in Slot.allCases {
+            let state = Self.stateFile(legacy, slot), meta = Self.metaFile(legacy, slot)
+            let hasState = fm.fileExists(atPath: state.path), hasMeta = fm.fileExists(atPath: meta.path)
+            guard hasState || hasMeta else { continue }
+            let key = (try? Data(contentsOf: meta)).flatMap { try? JSONDecoder().decode(SavedTranscript.self, from: $0) }?.key
+            if let key, key.split(separator: "|").dropFirst().first != file { continue }  // another model's: left for it
+            if hasState, key == stateKey, !fm.fileExists(atPath: Self.metaFile(directory, slot).path) {
+                try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+                // State first, transcript last: a state is trusted only with its transcript.
+                try? fm.removeItem(at: Self.stateFile(directory, slot))
+                if (try? fm.moveItem(at: state, to: Self.stateFile(directory, slot))) != nil,
+                   (try? fm.moveItem(at: meta, to: Self.metaFile(directory, slot))) != nil { continue }
+            }
+            // This model's with other settings or file (never usable), already superseded in
+            // `directory`, half-written or unreadable: nothing will ever adopt it.
+            try? fm.removeItem(at: meta)
+            try? fm.removeItem(at: state)
+        }
+    }
+
     private func takePrefixSnapshot() {
         let size = llama_state_seq_get_size(ctx, 0)
         var data = [UInt8](repeating: 0, count: size)
@@ -769,6 +797,16 @@ public final class LlamaModel: @unchecked Sendable {
 
     /// Saves the current conversation's state if a clean turn end hasn't been saved yet (normally it
     /// has, right after the reply). Call before the model is dropped or the app is suspended.
+    /// Moves a conversation's state saved in `legacy` (where it sat before each model had a
+    /// directory of its own) into `directory`, if this model file made it with these settings.
+    /// Queued like a generation, so the `generate` or `prepare` called after it sees the result;
+    /// looks at each legacy directory once per load, so it's free to call every time. A legacy
+    /// state of this model that can't be used (other settings, an older file, already superseded
+    /// in `directory`, or half-written) is deleted; another model's is left for that model.
+    public func adoptLegacyState(from legacy: URL, into directory: URL) {
+        queue.async { self.adopt(from: legacy, into: directory) }
+    }
+
     public func flush() async {
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
             queue.async {

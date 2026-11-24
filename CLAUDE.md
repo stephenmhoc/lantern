@@ -85,9 +85,9 @@ itself; `simctl openurl` stops at an "Open in Lantern?" prompt that needs a tap)
 `-spotlightQuery <text>` (searches Lantern's own Spotlight items after indexing).
 
 `scripts/mac-ollama-setup.sh install` (run on the Mac Studio) installs a login agent that gives
-Ollama.app `OLLAMA_KEEP_ALIVE=-1`, `OLLAMA_MAX_LOADED_MODELS=3` and `OLLAMA_CONTEXT_LENGTH=16384`
+Ollama.app `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=3` and `OLLAMA_CONTEXT_LENGTH=16384`
 (the app only passes launchd's environment to `ollama serve` when it starts after it, and ignores a
-polite quit, so the script kills and reopens it) and preloads the three models.
+polite quit, so the script kills and reopens it) and preloads Inkling, the one model kept for good.
 
 `scripts/fetch-tailscale.sh` builds TailscaleKit (needs Go) for signing into the tailnet; without it
 `Tailnet` compiles out.
@@ -112,7 +112,9 @@ polite quit, so the script kills and reopens it) and preloads the three models.
   cleared, and history passed back must be byte-identical to what was streamed. Gemma rewinds;
   with thinking on it re-renders, because its template drops old thinking.
 - **Going back means restoring.** Each clean turn end is saved to
-  `Caches/kv/<Conversation.stateID>` (`llama_state_seq_save_file` plus the transcript it holds,
+  `Caches/kv/<Conversation.stateID>/<model id>` (each model its own, so a comparison or Retry With
+  never overwrites another's; states from before sat in the chat's folder and are moved by
+  `LlamaModel.adoptLegacyState`) (`llama_state_seq_save_file` plus the transcript it holds,
   keyed by model file, context length and KV type); a model that can't rewind also keeps the turn
   before, and an in-memory snapshot taken right after the system prompt. Reopening a chat, Retry, a message
   after Stop and a new chat start from one of those instead of reading everything again. All of
@@ -141,8 +143,9 @@ polite quit, so the script kills and reopens it) and preloads the three models.
   Without a started task it's the old behaviour: on-device stops ("Stopped when you left
   Lantern"), Mac gets the usual few seconds. A reply that finishes in the background posts a
   local notification (provisional authorization, never a prompt).
-- **Mac latency.** Every Ollama request carries `keep_alive: -1` (a request's value overrides the
-  server's; Ollama's 5-minute default meant reloading the model for most questions), and `Engine.prepare` calls
+- **Mac latency.** Requests for Inkling carry `keep_alive: -1` (a request's value overrides the
+  server's; Ollama's 5-minute default meant reloading the model for most questions); the other Mac
+  models send none, so the server's 30 minutes applies (all three resident held ~60 GB), and `Engine.prepare` calls
   `MacLink.warm()` (an empty `/api/chat` with the same `num_ctx`, which loads the model) when a Mac
   chat opens or typing starts. `resolve()` races the home network and the tailnet; a network change
   (`NWPathMonitor`) marks the route stale so a send re-checks instead of hanging on a dead route.
@@ -186,3 +189,12 @@ polite quit, so the script kills and reopens it) and preloads the three models.
   locally, where signing is automatic). Never pass `PROVISIONING_PROFILE_SPECIFIER` itself: it would
   apply to both targets. A new extension needs the same: bundle ID, profile, specifier variable and
   an ExportOptions entry.
+- **Comparing two models** is a second answer to the last question, not a mode: the answer menu's
+  "Compare With" (`Engine.compare`) keeps the current answer as A and runs only B; both sit in the
+  reply's `versions` with a shared `ReplyMetrics.compareID` (`StoredMessage.comparison`). A B that
+  fails or is stopped before any text shows A again and undoes the pair. The footer's Compare
+  button opens `CompareView` (`Lantern/Compare`, a sheet of `ChatScreen`: columns on iPad, A | B on
+  iPhone, the metrics table, Prefer and Continue With). Only speed and the time to answer after
+  reading (first answer word less reading, finding the Mac and connecting) are ranked; load,
+  reading, first token and answer time depend on memory, the network or the answer's length.
+  `-ui compare[:b][:metrics]` seeds and shows one.

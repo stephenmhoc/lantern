@@ -88,6 +88,93 @@ final class Engine {
         generate(in: conversation, versions: kept)
     }
 
+    // MARK: - Compare (see CompareView)
+
+    /// The comparison running now, if any: its id, which reply, and the model still to answer.
+    /// Set by `compare` just before B starts (`running` is set in the same turn); cleared in
+    /// `finish` when B ends however it ends (answered, failed, stopped, chat deleted), after B's
+    /// metrics are stamped and the chat is back on A's model. `next` is B's model while it runs.
+    private(set) var comparing: (id: UUID, conversation: PersistentIdentifier, next: ModelChoice?)?
+    /// The live reply that is B, and the model to put the chat back on when it ends (A's).
+    @ObservationIgnored private var comparison: (reply: UUID, mode: Mode, macModel: String)?
+
+    /// Answers the last question again with `other` and keeps both answers as a pair (the current
+    /// answer is A, the new one B), the current answer stays as a version like Retry.
+    ///
+    /// Only B runs, through Retry's path, with the chat switched to `other`. Like Retry With, the
+    /// chat then continues with the model of the answer it shows (B, the newest), so the next
+    /// question goes to the model that wrote the history it continues and can reuse its cache.
+    /// If B produced nothing (failed or stopped empty) the chat goes back to A's model.
+    /// `continueWith` is how the user picks an answer and its model together.
+    func compare(in conversation: Conversation, with other: ModelChoice) {
+        guard !isBusy, let last = conversation.messages.indices.last else { return }
+        let reply = conversation.messages[last]
+        guard !reply.isUser, reply.finished, reply.error == nil, !reply.content.isEmpty else { return }
+        // An answer from before metrics: its model from its footnote, else the chat's.
+        let own = conversation.model(of: reply.metrics, footnote: reply.footnote, macModels: mac.models)
+        var a = reply.metrics ?? ReplyMetrics(
+            modeRaw: own.mode.rawValue,
+            macModel: own.mode == .mac ? own.macModel ?? conversation.resolvedMacModel : nil,
+            modelTitle: own.mode == .mac ? MacLink.displayName(own.macModel ?? conversation.resolvedMacModel) : own.mode.title)
+        let otherMac = other.mode == .mac ? other.macModel ?? conversation.resolvedMacModel : nil
+        guard other.mode.rawValue != a.modeRaw || (other.mode == .mac && otherMac != a.macModel) else { return }
+        // A was already one side of an earlier comparison: that pair is undone rather than left
+        // with one side, so its partner is an ordinary answer again (no compareID, no vote).
+        if let earlier = a.compareID {
+            let (list, current) = reply.allVersions
+            for v in list.indices where v != current && list[v].metrics?.compareID == earlier {
+                conversation.messages[last].updateMetrics(ofVersion: v) { $0?.compareID = nil; $0?.preferred = nil }
+            }
+        }
+        let id = UUID()
+        a.compareID = id
+        a.preferred = nil
+        conversation.messages[last].metrics = a
+        let back = (mode: conversation.mode, macModel: conversation.macModel)
+        comparing = (id, conversation.persistentModelID, other)
+        retry(in: conversation, mode: other.mode, macModel: other.mode == .mac ? otherMac : nil)
+        guard let live, running == conversation.persistentModelID else {  // didn't start
+            comparing = nil
+            return
+        }
+        comparison = (live.id, back.mode, back.macModel)
+    }
+
+    /// For a chat whose comparison is still running: its id, so a snapshot (delete, then Undo) can
+    /// keep A and leave out the unfinished B.
+    func comparisonInProgress(in conversation: Conversation) -> UUID? {
+        guard let comparing, comparing.conversation == conversation.persistentModelID else { return nil }
+        return comparing.id
+    }
+
+    /// Records a vote on answer `index` of the last reply's `allVersions` (nil clears it).
+    /// The voted answer gets `preferred = true`, its pair partner `false`; nil clears both.
+    func vote(in conversation: Conversation, preferring index: Int?) {
+        guard running != conversation.persistentModelID, let last = conversation.messages.indices.last,
+              !conversation.messages[last].isUser, let pair = conversation.messages[last].comparison else { return }
+        if let index, index != pair.a, index != pair.b { return }
+        for i in [pair.a, pair.b] {
+            conversation.messages[last].updateMetrics(ofVersion: i) { $0?.preferred = index.map { $0 == i } }
+        }
+        try? conversation.modelContext?.save()
+    }
+
+    /// Makes answer `index` of the last reply the one shown and switches the chat to its model.
+    /// An answer without metrics (from before they existed) leaves the model as it is.
+    func continueWith(in conversation: Conversation, version index: Int) {
+        guard running != conversation.persistentModelID, let last = conversation.messages.indices.last,
+              !conversation.messages[last].isUser,
+              conversation.messages[last].allVersions.list.indices.contains(index) else { return }
+        conversation.messages[last].showVersion(index)
+        if let m = conversation.messages[last].metrics, let mode = Mode(rawValue: m.modeRaw) {
+            conversation.mode = mode
+            if mode == .mac, let macModel = m.macModel, !macModel.isEmpty { conversation.macModel = macModel }
+        }
+        try? conversation.modelContext?.save()
+        // Load its model and restore its saved state (kept per model) before the next question.
+        prepare(mode: conversation.mode, for: conversation)
+    }
+
     /// Stops the running reply and starts it again in `mode` (e.g. E4B is too slow: use E2B).
     /// What it had written so far is kept as a version, as Retry does.
     func restart(in conversation: Conversation, mode: Mode) {
@@ -114,11 +201,11 @@ final class Engine {
         let thinking = conversation.thinking
         let system = ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))
         var history = [system] + conversation.history(before: conversation.messages.count - 1)
-        let checkpoint = Self.stateDirectory(for: conversation)
         let macModel = conversation.resolvedMacModel
         if mode == .mac, conversation.macModel.isEmpty, !macModel.isEmpty { conversation.macModel = macModel }
         let live = LiveReply(id: reply.id, mode: mode)
         live.macModel = macModel
+        live.thinkingAsked = thinking != .off
         self.live = live
         running = conversation.persistentModelID
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
@@ -131,6 +218,7 @@ final class Engine {
             var lastProgress = Date()
             var pieces = 0
             var statsKey: String?
+            var request: MacLink.Request?
             do {
                 let stream: AsyncThrowingStream<Generation, Error>
                 if mode == .mac {
@@ -143,12 +231,15 @@ final class Engine {
                         live.macModel = macModel
                         if conversation.modelContext != nil, !conversation.isDeleted { conversation.macModel = macModel }
                     }
-                    stream = try await mac.stream(history, thinking: thinking, model: macModel)
+                    (stream, request) = try await mac.stream(history, thinking: thinking, model: macModel)
+                    if MacLink.alwaysThinks(macModel) { live.thinkingAsked = true }
                     statsKey = "mac:\(macModel)"
                     conversation.tokenLimit = mac.contextLength
                 } else {
                     guard let model = model(for: mode) else { throw EngineError.notDownloaded(mode) }
                     guard store.states[model.id] == .ready else { throw EngineError.notDownloaded(mode) }
+                    live.modelTitle = model.name
+                    let loadStarted = Date()
                     let llama = try await load(model)
                     try Task.checkCancellation()
                     // A chat with images: load the projector beside the model, if it's here.
@@ -157,6 +248,8 @@ final class Engine {
                         try await llama.loadVision(projector: store.url(for: projector).path)
                         try Task.checkCancellation()
                     }
+                    live.loadSeconds = Date().timeIntervalSince(loadStarted)
+                    let checkpoint = self.checkpoint(for: conversation, model: model, llama: llama)
                     live.phase = .waiting
                     statsKey = model.id
                     conversation.tokenLimit = llama.contextLength
@@ -194,12 +287,13 @@ final class Engine {
             } catch {
                 failure = error
             }
-            finish(live, in: conversation, stats: stats, error: failure, statsKey: statsKey)
+            finish(live, in: conversation, stats: stats, error: failure, statsKey: statsKey, request: request)
         }
     }
 
     private func finish(
-        _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?
+        _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?,
+        request: MacLink.Request?
     ) {
         var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) on your Mac" : loadedModel?.name ?? live.mode.title]
         if let stats, stats.generatedTokens > 0 { parts.append(String(format: "%.1f tok/s", stats.tokensPerSecond)) }
@@ -207,8 +301,8 @@ final class Engine {
         if live.mode == .mac, stats != nil {
             // Where the wait before the first token went: finding the Mac, connecting, the Mac
             // loading the model, reading the chat. Only the parts that took noticeable time.
-            let t = mac.lastTimings
-            if case .tailnet(_, let viaApp) = mac.route { parts.append(viaApp ? "via the Tailscale app" : "via tailnet") }
+            let t = request?.timings ?? MacLink.Timings()
+            if case .tailnet(_, let viaApp) = request?.route ?? mac.route { parts.append(viaApp ? "via the Tailscale app" : "via tailnet") }
             let steps: [(String, Double?)] = [
                 ("found the Mac", t.findSeconds), ("connected", t.connectSeconds),
                 ("loaded the model", t.loadSeconds), ("read the chat", t.readSeconds),
@@ -230,11 +324,36 @@ final class Engine {
         case .contextFull?: parts.append("Cut off: this chat is full")
         default: break
         }
+        // B of a comparison: stamped with A's compareID. The chat stays on B's model, which wrote
+        // the answer it shows, unless B has nothing to show.
+        let pair = comparison.flatMap { $0.reply == live.id ? $0 : nil }
+        var metrics = Self.metrics(of: live, stats: stats, request: request, cutOff: cutOff, stopped: stats == nil && error == nil)
+        if pair != nil, let id = comparing?.id { metrics.compareID = id }
         write(live, to: conversation, finished: true) {
             $0.footnote = parts.joined(separator: " · ")
             $0.error = error?.localizedDescription
             $0.errorKind = error.map(Self.kind)
             $0.cutOff = cutOff
+            $0.metrics = metrics
+        }
+        if let pair {
+            // B produced nothing (failed, or stopped before any answer): A is shown again, so the
+            // question keeps its answer in the history, and the pair is undone, since there's
+            // nothing to compare. A B stopped with some text stays a pair.
+            if live.text.isEmpty || error != nil, conversation.modelContext != nil, !conversation.isDeleted,
+               let i = conversation.index(of: live.id) {
+                if let c = conversation.messages[i].comparison {
+                    for v in [c.a, c.b] {
+                        conversation.messages[i].updateMetrics(ofVersion: v) { $0?.compareID = nil; $0?.preferred = nil }
+                    }
+                    conversation.messages[i].showVersion(c.a)
+                }
+                conversation.mode = pair.mode
+                conversation.macModel = pair.macModel
+                try? conversation.modelContext?.save()
+            }
+            comparison = nil
+            comparing = nil
         }
         lastStats = stats
         if let stats, conversation.modelContext != nil, !conversation.isDeleted {
@@ -243,7 +362,7 @@ final class Engine {
         }
         if let stats, stats.generatedTokens > 0, let statsKey, let first = live.firstTokenSeconds {
             // A reply that had to load the model first says nothing about the usual wait.
-            let loaded = live.waitedForLoad || (live.mode == .mac && mac.lastTimings.loadSeconds >= 1)
+            let loaded = live.waitedForLoad || (live.mode == .mac && (request?.timings.loadSeconds ?? 0) >= 1)
             TypicalSpeed.record(firstToken: loaded ? nil : first, tokensPerSecond: stats.tokensPerSecond, for: statsKey)
         }
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
@@ -273,6 +392,49 @@ final class Engine {
         extra(&conversation.messages[i])
         conversation.lastActive = .now
         try? conversation.modelContext?.save()
+    }
+
+    /// How a reply was made and how fast. Load time is kept out of `firstTokenSeconds`,
+    /// `firstAnswerSeconds` and `tokensPerSecond` on both routes, and reported as `loadSeconds`:
+    /// on device it's measured around loading the model (and its projector) and subtracted from the
+    /// times since sending; on the Mac it's Ollama's `load_duration`, which falls inside the request
+    /// and is subtracted the same way. `totalSeconds` includes everything, load too.
+    private static func metrics(
+        of live: LiveReply, stats: GenerationStats?, request: MacLink.Request?, cutOff: StopReason?, stopped: Bool
+    ) -> ReplyMetrics {
+        let mac = live.mode == .mac
+        var m = ReplyMetrics(
+            modeRaw: live.mode.rawValue,
+            macModel: mac ? live.macModel : nil,
+            modelTitle: mac ? MacLink.displayName(live.macModel) : live.modelTitle ?? live.mode.title)
+        let timings = request?.timings
+        let load: Double? = mac ? timings.flatMap { $0.serverSeconds != nil ? $0.loadSeconds : nil } : live.loadSeconds
+        m.loadSeconds = load
+        m.firstTokenSeconds = live.firstTokenSeconds.map { max(0, $0 - (load ?? 0)) }
+        m.firstAnswerSeconds = live.firstAnswerSeconds.map { max(0, $0 - (load ?? 0)) }
+        if let stats {
+            m.promptTokens = stats.promptTokens
+            m.promptSeconds = stats.promptSeconds
+            m.generatedTokens = stats.generatedTokens
+            m.generateSeconds = stats.generateSeconds
+            if stats.generatedTokens > 0, stats.generateSeconds > 0 { m.tokensPerSecond = stats.tokensPerSecond }
+            if !mac {
+                m.reusedTokens = stats.reusedTokens
+                m.restored = stats.restored
+            }
+        }
+        m.totalSeconds = (live.lastTokenAt ?? Date()).timeIntervalSince(live.started)
+        if mac {
+            m.findSeconds = timings?.findSeconds
+            m.connectSeconds = timings?.connectSeconds
+            m.serverSeconds = timings?.serverSeconds
+            m.route = request?.route.label
+        }
+        m.thinking = live.thinkingAsked
+        m.trimmed = live.trimmed ? true : nil
+        m.cutOff = cutOff?.rawValue
+        m.stopped = stopped ? true : nil
+        return m
     }
 
     /// The prompt new chats are created with. The date is the day the chat starts: it's stored on
@@ -398,11 +560,12 @@ final class Engine {
         let history = [ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))]
             + conversation.history(before: conversation.messages.count)
         let thinking = conversation.thinking
-        let checkpoint = Self.stateDirectory(for: conversation)
         prepareCount += 1
         let turn = prepareCount
         Task {
-            guard let llama = try? await load(model), turn == prepareCount, !isBusy else { return }
+            guard let llama = try? await load(model), turn == prepareCount, !isBusy,
+                  conversation.modelContext != nil, !conversation.isDeleted else { return }
+            let checkpoint = self.checkpoint(for: conversation, model: model, llama: llama)
             await llama.prepare(history, thinking: thinking, checkpoint: checkpoint)
         }
     }
@@ -419,6 +582,23 @@ final class Engine {
     static func stateDirectory(for conversation: Conversation) -> URL {
         if conversation.stateID.isEmpty { conversation.stateID = UUID().uuidString }
         return stateRoot.appending(path: conversation.stateID)
+    }
+
+    /// Where one model's state for a chat is saved: Caches/kv/<id>/<model id>. Each model keeps
+    /// its own, so answering with another model (a comparison, Retry in another mode) never
+    /// overwrites the state of the first: going back to it restores instead of reading the chat
+    /// again. States saved before this sat in the chat's directory itself: `checkpoint` has the
+    /// loaded model adopt its own from there (`LlamaModel.adoptLegacyState`, on its queue).
+    static func stateDirectory(for conversation: Conversation, model: CatalogModel) -> URL {
+        stateDirectory(for: conversation).appending(path: model.id)
+    }
+
+    /// The model's state directory for this chat, after queueing the move of any state it saved
+    /// in the chat's directory before each model had its own. No file I/O here.
+    private func checkpoint(for conversation: Conversation, model: CatalogModel, llama: LlamaModel) -> URL {
+        let directory = Self.stateDirectory(for: conversation, model: model)
+        llama.adoptLegacyState(from: directory.deletingLastPathComponent(), into: directory)
+        return directory
     }
 
     /// Saves the loaded model's state for the chat it holds, if the last clean turn end isn't on
@@ -442,7 +622,8 @@ final class Engine {
             let fm = FileManager.default
             let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey]
             let chats = ((try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []).map { directory in
-                let files = (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys))) ?? []
+                // Each model's state is in a folder of its own (and older ones beside them).
+                let files = (fm.enumerator(at: directory, includingPropertiesForKeys: Array(keys))?.allObjects as? [URL]) ?? []
                 let values = files.compactMap { try? $0.resourceValues(forKeys: keys) }
                 return (directory, values.reduce(Int64(0)) { $0 + Int64($1.fileSize ?? 0) },
                         values.compactMap(\.contentModificationDate).max() ?? .distantPast)
@@ -773,6 +954,17 @@ final class LiveReply {
     private(set) var phaseStarted = Date()
     /// Seconds from sending to the first token of thinking or answer. Nil until it arrives.
     private(set) var firstTokenSeconds: Double?
+    /// Seconds from sending to the first token of the answer itself (after any thinking).
+    private(set) var firstAnswerSeconds: Double?
+    /// When the last token arrived.
+    private(set) var lastTokenAt: Date?
+    /// On device: seconds spent loading the model (and its projector) for this reply; about 0 when
+    /// it was already loaded. Nil on the Mac, where Ollama reports its own.
+    var loadSeconds: Double?
+    /// On device: the model's name ("Gemma 4 E2B"), once known.
+    var modelTitle: String?
+    /// Asked to think, or a Mac model that always does.
+    var thinkingAsked = false
     /// The oldest turns were left out of what the model saw, to fit its context.
     var trimmed = false
     /// The model had to be loaded before this reply could start.
@@ -786,12 +978,15 @@ final class LiveReply {
     func append(thinking t: String) {
         if firstTokenSeconds == nil { firstTokenSeconds = Date().timeIntervalSince(started) }
         thinking += t
+        lastTokenAt = Date()
         phase = .thinking
     }
 
     func append(text t: String) {
         if firstTokenSeconds == nil { firstTokenSeconds = Date().timeIntervalSince(started) }
+        if firstAnswerSeconds == nil { firstAnswerSeconds = Date().timeIntervalSince(started) }
         text += t
+        lastTokenAt = Date()
         phase = .answering
     }
 

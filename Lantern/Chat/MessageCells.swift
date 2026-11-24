@@ -19,6 +19,12 @@ private func styled<T: UITextView>(_ view: T, style: UIFont.TextStyle, color: UI
     return view
 }
 
+/// A selectable, non-scrolling text view that draws Markdown like an answer in the transcript
+/// (code blocks with their Copy buttons, tables), for showing answers elsewhere (CompareView).
+func makeAnswerTextView() -> UITextView {
+    styled(AnswerTextView(), style: .body, color: .label)
+}
+
 /// The answer's text view, on TextKit 1 with `BlockLayoutManager` so code blocks and tables get
 /// one even background each. Each code block gets a real Copy button at the end of its first line,
 /// placed after layout, so it stays put while the reply streams.
@@ -249,14 +255,17 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     private let versionLabel = UILabel()
     private let stopSpeakingButton = HitButton(configuration: .plain())
     private let moreButton = HitButton(configuration: .plain())
+    /// Opens the comparison, on an answer that has one.
+    private let compareButton = HitButton(configuration: .plain())
     private lazy var statusRow = UIStackView(arrangedSubviews: [glow, status])
     private lazy var versionRow = UIStackView(arrangedSubviews: [previousButton, versionLabel, nextButton])
-    private lazy var footerRow = UIStackView(arrangedSubviews: [versionRow, footnote, stopSpeakingButton, moreButton])
+    private lazy var footerRow = UIStackView(arrangedSubviews: [versionRow, footnote, compareButton, stopSpeakingButton, moreButton])
 
     var onToggleThinking: (() -> Void)?
     /// -1 for the previous answer to this question, +1 for the next.
     var onSwitchVersion: ((Int) -> Void)?
     var onStopSpeaking: (() -> Void)?
+    var onCompare: (() -> Void)?
     /// The message's actions, built when a menu opens so they're never stale.
     var menuItems: (() -> [UIMenuElement])?
 
@@ -340,6 +349,24 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         moreButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] done in
             done(self?.menuItems?() ?? [])
         }])
+        var compare = UIButton.Configuration.plain()
+        compare.title = "Compare"
+        compare.image = UIImage(systemName: "rectangle.split.2x1")
+        compare.imagePadding = 4
+        compare.contentInsets = .zero
+        compare.baseForegroundColor = .secondaryLabel
+        compare.preferredSymbolConfigurationForImage = .init(textStyle: .caption1, scale: .small)
+        compare.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = UIFont.preferredFont(forTextStyle: .caption1)
+            return attributes
+        }
+        compareButton.configuration = compare
+        compareButton.isPointerInteractionEnabled = true
+        compareButton.accessibilityLabel = "Compare answers"
+        compareButton.setContentHuggingPriority(.required, for: .horizontal)
+        compareButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        compareButton.addAction(UIAction { [weak self] _ in self?.onCompare?() }, for: .primaryActionTriggered)
         stopSpeakingButton.configuration?.baseForegroundColor = GlowView.amber
         stopSpeakingButton.addAction(UIAction { [weak self] _ in self?.onStopSpeaking?() }, for: .primaryActionTriggered)
         previousButton.addAction(UIAction { [weak self] _ in self?.onSwitchVersion?(-1) }, for: .primaryActionTriggered)
@@ -472,6 +499,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         nextButton.isEnabled = current < versions.count - 1
         versionLabel.accessibilityLabel = "Answer \(current + 1) of \(versions.count)"
 
+        compareButton.isHidden = message.comparison == nil || live != nil
         stopSpeakingButton.isHidden = !content.isSpeaking
         moreButton.isHidden = live != nil
         footerRow.isHidden = live != nil

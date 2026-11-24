@@ -14,6 +14,9 @@ import UIKit
 /// - `-openURL <lantern://…>`: the app opens the link itself two seconds after launch, through the
 ///   system like any other app would, without `simctl openurl`'s "Open in Lantern?" prompt.
 /// - `-ui inspector` opens the chat's info panel.
+/// - `-ui compare` (or `compare:b`): adds a chat whose last reply is a comparison (Gemma 4 E2B on
+///   this device against Inkling 2 Mini on the Mac, with sample metrics), opens it and shows the
+///   compare sheet on A (or B). Add `:metrics` (`compare:b:metrics`) to scroll to the table.
 /// - `-intent ask:<text>|new:<mode>|open:<chat title>`: runs that App Intent's `perform()`.
 /// - `-spotlightQuery <text>`: searches Lantern's own Spotlight items after indexing and prints them.
 enum DebugLaunch {
@@ -31,6 +34,7 @@ enum DebugLaunch {
     }
 
     static func seed(_ context: ModelContext) {
+        if ui?.hasPrefix("compare") == true { seedComparison(context) }
         guard arguments.contains("-seedChats"),
               (try? context.fetchCount(FetchDescriptor<Conversation>())) == 0 else { return }
         let day: TimeInterval = 86_400
@@ -59,6 +63,95 @@ enum DebugLaunch {
 }
 
 extension DebugLaunch {
+    /// The `-ui compare` chat's `stateID`, for opening it by its link.
+    static let comparisonChatID = "debug-compare"
+
+    /// A chat whose last reply holds a comparison: A from Gemma 4 E2B on this device, B from
+    /// Inkling 2 Mini on the Mac. Added once; it becomes the latest chat.
+    static func seedComparison(_ context: ModelContext) {
+        let id = comparisonChatID
+        let existing = (try? context.fetch(FetchDescriptor<Conversation>(predicate: #Predicate { $0.stateID == id }))) ?? []
+        if let chat = existing.first {
+            chat.lastActive = .now
+            try? context.save()
+            return
+        }
+        let chat = Conversation(mode: .mac)
+        chat.stateID = id
+        chat.title = "Keeping bread fresh"
+        chat.macModel = "inkling-2-mini:latest"
+        chat.lastActive = .now
+        let compareID = UUID()
+        let question = "What's the best way to keep a loaf of sourdough fresh for a few days?"
+
+        var a = ReplyMetrics(modeRaw: Mode.fast.rawValue, modelTitle: Mode.fast.title)
+        a.compareID = compareID
+        a.loadSeconds = 3.8
+        a.firstTokenSeconds = 0.6
+        a.firstAnswerSeconds = 0.6
+        a.promptTokens = 412
+        a.reusedTokens = 380
+        a.promptSeconds = 0.4
+        a.restored = false
+        a.generatedTokens = 236
+        a.generateSeconds = 11.2
+        a.tokensPerSecond = 21.1
+        a.totalSeconds = 15.6
+        a.thinking = false
+
+        var b = ReplyMetrics(modeRaw: Mode.mac.rawValue, macModel: "inkling-2-mini:latest", modelTitle: "Inkling 2 Mini")
+        b.compareID = compareID
+        b.loadSeconds = 0
+        b.firstTokenSeconds = 0.9
+        b.firstAnswerSeconds = 6.4
+        b.promptTokens = 431
+        b.promptSeconds = 0.3
+        b.generatedTokens = 512
+        b.generateSeconds = 36.5
+        b.tokensPerSecond = 14.0
+        b.totalSeconds = 37.8
+        b.findSeconds = 0.2
+        b.connectSeconds = 0.05
+        b.route = "Home network"
+        b.thinking = true
+
+        var reply = StoredMessage(isUser: false)
+        reply.content = """
+        Keep it **cut side down** on a wooden board for the first day, then in a bread bag or box.
+
+        1. **Day 1:** leave it uncovered, crust out, cut side on the board.
+        2. **Days 2–3:** a paper or cloth bag; plastic softens the crust.
+        3. **Longer:** slice it and freeze; toast slices straight from the freezer.
+
+        Avoid the fridge: it goes stale faster there than on the counter.
+        """
+        reply.thinking = "The user wants storage advice. Cover crust, cut side, fridge vs freezer."
+        reply.thoughtSeconds = 5
+        reply.footnote = "Inkling 2 Mini · 14.0 tok/s · 0.9 s to first token"
+        reply.metrics = b
+        var older = StoredMessage(isUser: false)
+        older.content = """
+        Sourdough keeps well for **2–3 days** at room temperature:
+
+        - Store it **cut side down** on a board so the crumb doesn't dry out.
+        - After the first day, use a **paper bag** or a bread box.
+        - For longer, **slice and freeze** it:
+
+        ```text
+        freezer bag → up to 3 months
+        toast from frozen
+        ```
+
+        Don't refrigerate it; that makes it stale faster.
+        """
+        older.footnote = "Gemma 4 E2B · 21.1 tok/s · 0.6 s to first token"
+        older.metrics = a
+        reply.versions = [ReplyVersion(older)]
+        chat.messages = [StoredMessage(isUser: true, content: question), reply]
+        context.insert(chat)
+        try? context.save()
+    }
+
     private static var ranSystem = false
 
     static func value(after flag: String) -> String? {
@@ -71,6 +164,9 @@ extension DebugLaunch {
         guard !ranSystem else { return }
         ranSystem = true
         try? await Task.sleep(for: .seconds(2))
+        if ui?.hasPrefix("compare") == true {
+            _ = await UIApplication.shared.open(LanternLink.chat(id: comparisonChatID).url)
+        }
         if let string = value(after: "-openURL"), let url = URL(string: string) {
             let opened = await UIApplication.shared.open(url)
             print("OPENURL \(string): \(opened)")

@@ -107,6 +107,9 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     /// "(Today is …)", put before a question sent on a later day than the chat began (see
     /// `Conversation.dateNote`). Fixed once sent.
     var dateNote: String?
+    /// How the reply was made and how fast (`ReplyMetrics`). Nil for questions, for replies from
+    /// before it existed and for ones that failed before any timing.
+    var metrics: ReplyMetrics?
 
     nonisolated var hasAttachments: Bool { !(attachments ?? []).isEmpty }
 
@@ -145,6 +148,7 @@ struct StoredMessage: Codable, Hashable, Identifiable {
         footnote = chosen.footnote
         error = chosen.error
         thoughtSeconds = chosen.thoughtSeconds
+        metrics = chosen.metrics
         versions = list
         versionIndex = index == list.count ? nil : index
     }
@@ -169,6 +173,7 @@ struct ReplyVersion: Codable, Hashable {
     var footnote: String?
     var error: String?
     var thoughtSeconds: Double?
+    var metrics: ReplyMetrics?
 
     init(_ m: StoredMessage) {
         content = m.content
@@ -176,7 +181,119 @@ struct ReplyVersion: Codable, Hashable {
         footnote = m.footnote
         error = m.error
         thoughtSeconds = m.thoughtSeconds
+        metrics = m.metrics
     }
+}
+
+extension StoredMessage {
+    /// The two answers of a comparison on this reply, oldest (A) first, with their indices in
+    /// `allVersions`: the newest pair sharing a `ReplyMetrics.compareID`. Nil when there's none.
+    var comparison: (a: Int, b: Int, versions: (ReplyVersion, ReplyVersion))? {
+        let list = allVersions.list
+        for j in list.indices.reversed() {
+            guard let id = list[j].metrics?.compareID else { continue }
+            if let i = list[..<j].lastIndex(where: { $0.metrics?.compareID == id }) {
+                return (i, j, (list[i], list[j]))
+            }
+        }
+        return nil
+    }
+
+    /// Changes the metrics of answer `index` of `allVersions`, wherever it's kept (this message or
+    /// one of `versions`).
+    mutating func updateMetrics(ofVersion index: Int, _ change: (inout ReplyMetrics?) -> Void) {
+        let current = allVersions.current
+        if index == current { return change(&metrics) }
+        let i = index < current ? index : index - 1
+        guard versions?.indices.contains(i) == true else { return }
+        change(&versions![i].metrics)
+    }
+}
+
+extension Conversation {
+    /// The model that wrote an answer: from its metrics; for one from before them, from the model
+    /// named in its footnote ("Gemma 4 E2B", "Inkling 2 Mini on your Mac"), matched against the
+    /// on-device models and `macModels` (Ollama's names); else the chat's own model.
+    func model(of metrics: ReplyMetrics?, footnote: String?, macModels: [String]) -> ModelChoice {
+        if let metrics, let mode = Mode(rawValue: metrics.modeRaw) {
+            return ModelChoice(mode: mode, macModel: mode == .mac ? metrics.macModel : nil)
+        }
+        if let name = ChatSearch.modelName(footnote) {
+            if let mode = Mode.allCases.first(where: { $0.isOnDevice && $0.title == name }) {
+                return ModelChoice(mode: mode, macModel: nil)
+            }
+            let suffix = " on your Mac"
+            let macName = name.hasSuffix(suffix) ? String(name.dropLast(suffix.count)) : name
+            if let model = ([resolvedMacModel] + macModels).first(where: { !$0.isEmpty && MacLink.displayName($0) == macName }) {
+                return ModelChoice(mode: .mac, macModel: model)
+            }
+        }
+        return ModelChoice(mode: mode, macModel: mode == .mac ? resolvedMacModel : nil)
+    }
+}
+
+/// A model to answer with: an on-device mode, or the Mac with one of its Ollama models.
+struct ModelChoice: Hashable, Sendable {
+    let mode: Mode
+    /// For `.mac`, which Ollama model; nil means the chat's (or the Mac's default).
+    let macModel: String?
+
+    nonisolated var title: String { macModel.map(MacLink.displayName) ?? mode.title }
+}
+
+/// How one reply was made and how fast, kept on the reply (and its versions) for the info panel,
+/// comparisons and per-model averages. Everything is optional: what a route can't measure is nil.
+/// Times are seconds. Codable and additive: saved with the messages, never renamed.
+nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
+    /// `Mode` raw value of the model that answered.
+    var modeRaw: String
+    /// For the Mac: the Ollama model name.
+    var macModel: String?
+    /// The display name, as shown then ("Gemma 4 E4B", "Inkling 2 Mini").
+    var modelTitle: String
+    /// Shared by the two answers of one comparison.
+    var compareID: UUID?
+    /// The user's vote in a comparison: true for this answer.
+    var preferred: Bool?
+
+    /// Loading the model before the reply could start (on device, or Ollama's load on the Mac).
+    /// About 0 when it was already loaded. Never included in the first-token times or tokens/s.
+    var loadSeconds: Double?
+    /// From the request to the first token of thinking or answer, less `loadSeconds`. On the Mac
+    /// it includes finding the Mac, connecting and Ollama reading the prompt (not its load).
+    var firstTokenSeconds: Double?
+    /// From the request to the first token of the answer itself (after any thinking), less
+    /// `loadSeconds`.
+    var firstAnswerSeconds: Double?
+    /// Reading the prompt (prefill). On device `promptTokens` is the whole prompt, `reusedTokens`
+    /// of it already in the cache; on the Mac it's what Ollama evaluated (its cache excluded) and
+    /// `reusedTokens` is nil.
+    var promptTokens: Int?
+    var reusedTokens: Int?
+    var promptSeconds: Double?
+    /// Continued a saved state (on device).
+    var restored: Bool?
+    /// Generated tokens (thinking included) and the time spent generating them.
+    var generatedTokens: Int?
+    var generateSeconds: Double?
+    var tokensPerSecond: Double?
+    /// From the request to the last token, everything included (load too).
+    var totalSeconds: Double?
+
+    /// Mac only: finding the Mac, connecting, and the route ("Home network", "Tailnet").
+    var findSeconds: Double?
+    var connectSeconds: Double?
+    var route: String?
+    /// Mac only: Ollama's own `total_duration` (load, read and generate on the Mac, no network).
+    var serverSeconds: Double?
+
+    /// Asked to think (or the model always thinks).
+    var thinking: Bool?
+    /// The oldest turns were left out to fit the context.
+    var trimmed: Bool?
+    /// Cut off by a limit (`StopReason` raw value) or stopped by the user.
+    var cutOff: String?
+    var stopped: Bool?
 }
 
 /// What went wrong with a reply, so the chat can offer something better than the message alone.

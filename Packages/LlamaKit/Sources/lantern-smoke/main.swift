@@ -163,9 +163,17 @@ if args.contains("--state") {
         if model.canRewind && thinking != .off {
             print("(this model re-renders with thinking on, so nothing is saved for it)")
         } else {
+            // States used to sit in the chat's directory itself; now each model has its own. The
+            // ones saved above are adopted into a model directory and reopened from there.
+            let legacy = checkpoint
+            let checkpoint = legacy.appending(path: "model")
+            model.adoptLegacyState(from: legacy, into: checkpoint)
             let full = history + [.init(role: .user, content: second), .init(role: .assistant, content: expected.text)]
             await model.prepare(full, thinking: thinking, checkpoint: checkpoint)
             check("reopening the chat loaded its state", model.tokensInContext > 0)
+            let left = ((try? FileManager.default.contentsOfDirectory(atPath: legacy.path)) ?? []).filter { $0 != "model" }
+            check("the legacy state was adopted, nothing left behind", left.isEmpty
+                  && FileManager.default.fileExists(atPath: checkpoint.appending(path: "latest.json").path))
             print("> (retry) \(second)")
             let retried = try await ask(model, history + [.init(role: .user, content: second)], checkpoint: checkpoint, quiet: true)
             check("retry didn't re-read the chat", retried.stats.reusedTokens > firstReply.stats.promptTokens)

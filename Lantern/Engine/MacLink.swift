@@ -44,6 +44,22 @@ final class MacLink {
         /// Ollama loading the model, and reading the prompt.
         var loadSeconds: Double = 0
         var readSeconds: Double = 0
+        /// Ollama's own `total_duration`: everything it did on the Mac for the request (load, read,
+        /// generate), without the network. Nil until the final chunk.
+        var serverSeconds: Double?
+    }
+
+    /// One request to Ollama, handed back with its stream so a reply reads its own route and
+    /// timings, never another request's. `timings` is complete once the stream has yielded `.done`.
+    final class Request {
+        /// The route it went out on.
+        let route: Route
+        fileprivate(set) var timings: Timings
+
+        fileprivate init(route: Route, timings: Timings) {
+            self.route = route
+            self.timings = timings
+        }
     }
 
     /// "inkling-2-mini:latest" → "Inkling 2 Mini", "gemma4:31b-mlx" → "Gemma 4 31B".
@@ -78,18 +94,20 @@ final class MacLink {
     // The Mac Studio by its Bonjour and MagicDNS names, so a fresh install finds it with no setup.
     static let defaultLAN = "Stephens-Mac-Studio.local", defaultTailnet = "stephens-mac-studio.tail7b6e2.ts.net"
     static let defaultContext = 16384
-    /// How long Ollama keeps the model in memory after a request (`keep_alive`): for good. Its
-    /// default is five minutes, after which the next question waits for the whole model to load
-    /// again. A request's value overrides the server's, so anything less would undo
-    /// `scripts/mac-ollama-setup.sh`.
-    static let keepAlive = -1
+    /// How long Ollama keeps a model in memory after a request (`keep_alive`). Inkling, the usual
+    /// model, stays for good (-1): Ollama's own default is five minutes, after which a question
+    /// waits for the whole model to load again. The others are left out (nil), so the server's
+    /// `OLLAMA_KEEP_ALIVE` (30 minutes, from `scripts/mac-ollama-setup.sh`) applies: keeping all
+    /// three resident held ~60 GB of the Mac's memory for good. A request's value overrides the
+    /// server's, which is why the others send none.
+    nonisolated static func keepAlive(for model: String) -> Int? {
+        model.lowercased().hasPrefix("inkling") ? -1 : nil
+    }
 
     let tailnet = Tailnet()
     private(set) var route: Route = .unknown
     /// Ollama's models, from the last check (or the one before, until the Mac answers).
     private(set) var models: [String] = UserDefaults.standard.stringArray(forKey: "mac.knownModels") ?? []
-    /// The last reply's timings.
-    @ObservationIgnored private(set) var lastTimings = Timings()
 
     private var defaults: UserDefaults { .standard }
     var modelName: String { defaults.string(forKey: Self.modelKey) ?? "" }
@@ -248,13 +266,15 @@ final class MacLink {
     }
 
     /// Stops when the reading task is cancelled. A route that has gone stale (left home, Wi-Fi
-    /// dropped) gets one fresh check and retry before giving up.
-    func stream(_ messages: [ChatMessage], thinking: Thinking, model: String) async throws -> AsyncThrowingStream<Generation, Error> {
+    /// dropped) gets one fresh check and retry before giving up. The `Request` returned with the
+    /// stream has the route and, once `.done` arrives, the timings.
+    func stream(
+        _ messages: [ChatMessage], thinking: Thinking, model: String
+    ) async throws -> (stream: AsyncThrowingStream<Generation, Error>, request: Request) {
         var timings = Timings()
         let started = ContinuousClock.now
         if route.host == nil || routeIsStale { await resolve() }
         timings.findSeconds = (ContinuousClock.now - started).seconds
-        lastTimings = timings
         var messages = messages
         // Images go in each message's `images`, for a model that can see. One that can't is sent
         // the text alone, unless the question itself is about an image.
@@ -265,7 +285,8 @@ final class MacLink {
         let metrics = ConnectMetrics()
         let (bytes, _) = try await open(messages, thinking: thinking, model: model, metrics: metrics, retry: true)
         lastWarm[model] = .now  // a real request keeps it loaded as well as a warm-up does
-        return AsyncThrowingStream { continuation in
+        let request = Request(route: route, timings: timings)  // after `open`, which may have re-resolved
+        let stream = AsyncThrowingStream<Generation, Error> { continuation in
             let task = Task {
                 do {
                     for try await line in bytes.lines {
@@ -276,9 +297,10 @@ final class MacLink {
                         if chunk.done == true {
                             timings.loadSeconds = Double(chunk.load_duration ?? 0) / 1e9
                             timings.readSeconds = Double(chunk.prompt_eval_duration ?? 0) / 1e9
+                            timings.serverSeconds = chunk.total_duration.map { Double($0) / 1e9 }
                             // URLSession reports the connection's metrics as the task ends.
                             timings.connectSeconds = await metrics.connectSeconds(waitingUpTo: .milliseconds(300))
-                            self.lastTimings = timings
+                            request.timings = timings
                             var stats = GenerationStats()
                             stats.promptTokens = chunk.prompt_eval_count ?? 0
                             stats.promptSeconds = Double(chunk.prompt_eval_duration ?? 0) / 1e9
@@ -297,6 +319,7 @@ final class MacLink {
             }
             continuation.onTermination = { _ in task.cancel() }
         }
+        return (stream, request)
     }
 
     /// Gets the Mac ready for a question that's coming (a chat opened, typing started): finds the
@@ -318,7 +341,7 @@ final class MacLink {
             // The same num_ctx as a real request: a different one would make Ollama load it again.
             request.httpBody = try? JSONEncoder().encode(ChatRequest(
                 model: model, messages: [], stream: false, think: nil,
-                options: .init(num_ctx: contextLength), keep_alive: Self.keepAlive))
+                options: .init(num_ctx: contextLength), keep_alive: Self.keepAlive(for: model)))
             lastWarm[model] = .now
             if (try? await session.data(for: request)) == nil { lastWarm[model] = nil }
         }
@@ -367,7 +390,7 @@ final class MacLink {
             stream: true,
             think: think,
             options: .init(num_ctx: contextLength),
-            keep_alive: Self.keepAlive
+            keep_alive: Self.keepAlive(for: model)
         ))
         do {
             let (bytes, response) = try await session.bytes(for: request, delegate: metrics)
@@ -403,7 +426,7 @@ final class MacLink {
         let stream: Bool
         let think: Bool?  // left out when nil
         let options: Options
-        let keep_alive: Int
+        let keep_alive: Int?  // left out when nil: the server's OLLAMA_KEEP_ALIVE applies
     }
 
     private struct ShowResponse: Decodable { let capabilities: [String]? }
@@ -413,6 +436,7 @@ final class MacLink {
         let message: Message?
         let done: Bool?
         let error: String?
+        let total_duration: Int64?
         let load_duration: Int64?
         let prompt_eval_count: Int?
         let prompt_eval_duration: Int64?
