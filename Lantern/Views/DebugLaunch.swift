@@ -19,22 +19,11 @@ import UIKit
 ///   compare sheet on A (or B). Add `:metrics` (`compare:b:metrics`) to scroll to the table.
 ///   `compare:chat` opens the chat only, for the answer's ‹ 1/2 › pager.
 /// - `-ui composer:focus|composer:text`: the message box expanded, focused or holding a draft.
-/// - `-ui modelmenu|modelmenu:collapsed`: the model menu open, from the expanded or collapsed box.
+/// - `-ui modelmenu|modelmenu:collapsed`: the model picker open, from the expanded or collapsed box.
 /// - `-intent ask:<text>|new:<mode>|open:<chat title>`: runs that App Intent's `perform()`.
 /// - `-spotlightQuery <text>`: searches Lantern's own Spotlight items after indexing and prints them.
 enum DebugLaunch {
     static var arguments: [String] { ProcessInfo.processInfo.arguments }
-
-    /// Opens a menu button's menu as a tap would. UIKit has no public call for it, so this uses
-    /// the context menu interaction's private one: Debug builds only, for screenshots.
-    static func presentMenu(of button: UIButton) {
-        guard let interaction = button.contextMenuInteraction else { return }
-        let selector = NSSelectorFromString("_presentMenuAtLocation:")
-        guard interaction.responds(to: selector), let method = class_getInstanceMethod(type(of: interaction), selector) else { return }
-        typealias Present = @convention(c) (AnyObject, Selector, CGPoint) -> Void
-        let present = unsafeBitCast(method_getImplementation(method), to: Present.self)
-        present(interaction, selector, CGPoint(x: button.bounds.midX, y: button.bounds.midY))
-    }
 
     static var ui: String? {
         guard let i = arguments.firstIndex(of: "-ui"), arguments.indices.contains(i + 1) else { return nil }

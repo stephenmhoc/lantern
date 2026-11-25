@@ -10,7 +10,7 @@ import UniformTypeIdentifiers
 final class ComposerView: UIView, UITextViewDelegate {
     let textView = ComposerTextView()
     let modeButton = HitButton(configuration: .gray())
-    /// The collapsed row's model button: the symbol alone, with the same menu (`syncModeIcon`).
+    /// The collapsed row's model button: the symbol alone, opening the same picker (`syncModeIcon`).
     let modeIconButton = HitButton(configuration: .plain())
     let sendButton = HitButton(configuration: .plain())
     /// Files and photos; its menu is set by the chat, which knows what the mode can read.
@@ -116,7 +116,6 @@ final class ComposerView: UIView, UITextViewDelegate {
         placeholder.translatesAutoresizingMaskIntoConstraints = false
         textView.addSubview(placeholder)
 
-        modeButton.showsMenuAsPrimaryAction = true
         modeButton.isPointerInteractionEnabled = true
         modeButton.configuration?.cornerStyle = .capsule
         modeButton.configuration?.imagePadding = 4
@@ -190,7 +189,6 @@ final class ComposerView: UIView, UITextViewDelegate {
             chipStack.heightAnchor.constraint(equalTo: chipScroll.frameLayoutGuide.heightAnchor),
         ])
 
-        modeIconButton.showsMenuAsPrimaryAction = true
         modeIconButton.isPointerInteractionEnabled = true
         modeIconButton.isHidden = true
         modeIconButton.configuration?.contentInsets = .zero
@@ -346,7 +344,6 @@ final class ComposerView: UIView, UITextViewDelegate {
     /// Copies the mode button's menu, state and VoiceOver text onto the collapsed row's symbol
     /// button. The chat calls it after setting up `modeButton`.
     func syncModeIcon() {
-        modeIconButton.menu = modeButton.menu
         modeIconButton.isEnabled = modeButton.isEnabled
         modeIconButton.accessibilityLabel = modeButton.accessibilityLabel
         modeIconButton.accessibilityValue = modeButton.accessibilityValue

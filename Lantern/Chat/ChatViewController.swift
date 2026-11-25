@@ -117,6 +117,9 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         composer.onCancelEdit = { [unowned self] in cancelEditing() }
         composer.onMic = { [unowned self] in toggleDictation() }
         composer.textView.onPasteFiles = { [unowned self] providers in attach(providers) }
+        for button in [composer.modeButton, composer.modeIconButton] {
+            button.addAction(UIAction { [unowned self, unowned button] _ in showModelPicker(from: button) }, for: .primaryActionTriggered)
+        }
         composer.text = conversation.draft
         wasTyping = !conversation.draft.isEmpty
         view.addSubview(composer)
@@ -214,8 +217,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                 case "modelmenu":
                     composer.text = " "
                     try? await Task.sleep(for: .milliseconds(500))
-                    DebugLaunch.presentMenu(of: composer.modeButton)
-                case "modelmenu:collapsed": DebugLaunch.presentMenu(of: composer.modeIconButton)
+                    showModelPicker(from: composer.modeButton)
+                case "modelmenu:collapsed": showModelPicker(from: composer.modeIconButton)
                 default: break
                 }
             }
@@ -513,45 +516,79 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         composer.setMode(title: title, symbol: mode.symbol)
         composer.modeButton.accessibilityLabel = "Model"
         composer.modeButton.accessibilityValue = mode == .apple ? "\(title), on this device"
-            : "\(title), \(mode.isOnDevice ? "on this device" : "on your \(engine.mac.computerName)"), thinking \(conversation.thinking.rawValue)"
+            : "\(title), \(mode.isOnDevice ? "on this device" : "on your \(engine.mac.computerName)"), thinking \(conversation.thinking == .off ? "off" : "on")"
         composer.modeButton.isEnabled = live == nil
 
+        composer.syncModeIcon()
+    }
+
+    // MARK: - Model picker
+
+    /// The model button's picker (`ModelPicker`). On iPhone the keyboard goes down while it's up,
+    /// or it would sit over the sheet, and comes back after.
+    private func showModelPicker(from source: UIView) {
+        guard live == nil, presentedViewController == nil else { return }
+        let compact = traitCollection.horizontalSizeClass == .compact
+        let refocus = compact && composer.textView.isFirstResponder
+        if refocus { composer.textView.resignFirstResponder() }
+
+        weak var host: UIViewController?
+        let close: (@escaping () -> Void) -> Void = { then in
+            guard let host else { return then() }
+            host.dismiss(animated: true, completion: then)
+        }
+        let thinking: Binding<Bool>? = conversation.mode == .apple ? nil : Binding(
+            get: { [unowned self] in conversation.thinking != .off },
+            set: { [unowned self] on in
+                conversation.thinking = on ? .high : .off
+                refresh()
+            })
+        var getModels: (() -> Void)?
+        if let open = onOpenReadiness, Mode.allCases.contains(where: { $0.usesLlama && !isAvailable($0) }) {
+            getModels = { close(open) }
+        }
+        let picker = ModelPicker(
+            groups: { [unowned self] in pickerGroups() },
+            thinking: thinking,
+            select: { [unowned self] choice in
+                setMode(choice.mode, macModel: choice.macModel)
+                close {}
+            },
+            getModels: getModels,
+            close: { close {} })
+        let controller = PickerHost(rootView: picker.environment(engine))
+        controller.onClose = { [weak self] in if refocus { self?.composer.textView.becomeFirstResponder() } }
+        host = controller
+        controller.modalPresentationStyle = .popover
+        controller.preferredContentSize = CGSize(width: 360, height: 520)
+        if let popover = controller.popoverPresentationController {
+            popover.sourceView = source
+            popover.sourceRect = source.bounds
+            popover.permittedArrowDirections = [.down, .up]
+            let sheet = popover.adaptiveSheetPresentationController
+            sheet.detents = [.medium(), .large()]
+            sheet.prefersGrabberVisible = true
+            sheet.prefersScrollingExpandsWhenScrolledToEdge = true
+        }
+        present(controller, animated: true)
+    }
+
+    private func pickerGroups() -> [ModelPicker.Group] {
         let unreachable = engine.mac.route == .unreachable
         let (device, mac) = choices
-        let deviceItems = device.map { c in
-            UIAction(title: c.title, subtitle: availability(c.mode), image: UIImage(systemName: c.mode.symbol),
-                     attributes: isAvailable(c.mode) ? [] : .disabled, state: isCurrent(c) ? .on : .off) { [unowned self] _ in
-                setMode(c.mode)
-            }
+        let onDevice = device.map { c in
+            let available = isAvailable(c.mode)
+            return ModelPicker.Row(choice: c, title: c.title, symbol: c.mode.symbol,
+                                   note: available ? nil : availability(c.mode), enabled: available, current: isCurrent(c))
         }
-        let macItems = mac.map { c in
-            UIAction(title: c.title, image: UIImage(systemName: unreachable ? "exclamationmark.triangle" : c.mode.symbol),
-                     state: isCurrent(c) ? .on : .off) { [unowned self] _ in
-                setMode(.mac, macModel: c.macModel)
-            }
+        let computer = mac.map { c in
+            ModelPicker.Row(choice: c, title: c.title, symbol: unreachable ? "exclamationmark.triangle" : c.mode.symbol,
+                            note: nil, enabled: true, current: isCurrent(c))
         }
-        var sections: [UIMenuElement] = [
-            UIMenu(title: "On this device", options: .displayInline, children: deviceItems),
-            UIMenu(title: availability(.mac), options: .displayInline, children: macItems),
+        return [
+            .init(title: "On This \(UIDevice.current.model)", rows: onDevice),
+            .init(title: availability(.mac), rows: computer),
         ]
-        // Only for what can be downloaded: Apple Intelligence's model comes with the system.
-        if let open = onOpenReadiness, Mode.allCases.contains(where: { $0.usesLlama && !isAvailable($0) }) {
-            sections.append(UIAction(title: "Get Models…", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
-        }
-        let thinking = Thinking.allCases.map { t in
-            UIAction(title: t.rawValue.capitalized, state: t == conversation.thinking ? .on : .off) { [unowned self] _ in
-                conversation.thinking = t
-                refresh()
-            }
-        }
-        // Apple Intelligence's model doesn't think before answering: no choice to offer.
-        if mode != .apple {
-            sections.append(UIMenu(
-                title: "Thinking", subtitle: conversation.thinking.rawValue.capitalized,
-                image: UIImage(systemName: "lightbulb"), children: thinking))
-        }
-        composer.modeButton.menu = UIMenu(children: sections)
-        composer.syncModeIcon()
     }
 
     private func availability(_ mode: Mode) -> String {
@@ -1257,5 +1294,17 @@ private struct ChatControllerView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: ChatViewController, context: Context) {
         controller.refresh()
+    }
+}
+
+/// The model picker's controller: says when it's gone, whichever way it went (Done, a pick, or a
+/// swipe down).
+private final class PickerHost<Content: View>: UIHostingController<Content> {
+    var onClose: (() -> Void)?
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        onClose?()
+        onClose = nil
     }
 }

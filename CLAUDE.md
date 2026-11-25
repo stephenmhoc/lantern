@@ -60,7 +60,9 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   `_ollama._tcp`, tailnet peers and a typed address). The Models page just lists models: no
   "ready"/"offline" summary. The sidebar's bottom bar has Settings on the left (badged only when no
   model can answer or the build expires soon, `Readiness.needsAttention`) and New chat on the right.
-  The composer collapses to one row (model, field, mic or Stop) while the keyboard is down; a tap
+  The composer collapses to one row (model, field, mic or Stop) while the keyboard is down; its
+  model button opens `ModelPicker` (a sheet on iPhone, a popover on iPad: a Think First switch, since
+  `Thinking.low` and `.high` do the same, then every model), not a UIMenu; a tap
   on the transcript puts the keyboard away. Settings' "Speed and Tokens" (`ReplyDetails`) trims
   the line under each answer to only stop and cut-off notes.
 - `Lantern/System`: the ways in from outside the app. `LanternLink` is the `lantern://` scheme
