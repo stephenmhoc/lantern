@@ -431,6 +431,12 @@ enum Markdown {
 /// characters), a hairline under a table's header row, a bar beside each block quote and a hairline
 /// for each thematic break.
 nonisolated final class BlockLayoutManager: NSLayoutManager {
+    /// The table header's line and a thematic break: the separator, or with Increase Contrast
+    /// something that reads.
+    private static let hairlineColor = UIColor { $0.accessibilityContrast == .high ? .tertiaryLabel : .separator }
+    /// In dark mode a code block's or table's fill is close to the background, so a hairline edges it.
+    private static let blockEdge = UIColor { $0.userInterfaceStyle == .dark ? .separator : .clear }
+
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
         guard let storage = textStorage, let container = textContainers.first, storage.length > 0 else { return }
@@ -441,11 +447,16 @@ nonisolated final class BlockLayoutManager: NSLayoutManager {
         eachRun(of: .lanternBlock, in: characters, storage: storage) { used in
             let rect = CGRect(x: 0, y: used.minY - 8, width: width, height: used.height + 16)
             UIColor.secondarySystemFill.setFill()
-            UIBezierPath(roundedRect: rect.offsetBy(dx: origin.x, dy: origin.y), cornerRadius: 10).fill()
+            let path = UIBezierPath(roundedRect: rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0.25, dy: 0.25),
+                                    cornerRadius: 10)
+            path.fill()
+            Self.blockEdge.setStroke()
+            path.lineWidth = hairline
+            path.stroke()
         }
         eachRun(of: .lanternTableHeader, in: characters, storage: storage) { used in
             let inset = Markdown.blockInset
-            UIColor.separator.setFill()
+            Self.hairlineColor.setFill()
             UIBezierPath(rect: CGRect(x: origin.x + inset, y: origin.y + used.maxY + 4.5, width: width - 2 * inset, height: hairline)).fill()
         }
         eachRun(of: .lanternQuote, in: characters, storage: storage) { used in
@@ -454,7 +465,7 @@ nonisolated final class BlockLayoutManager: NSLayoutManager {
             UIBezierPath(roundedRect: bar, cornerRadius: 1.5).fill()
         }
         eachRun(of: .lanternRule, in: characters, storage: storage) { used in
-            UIColor.separator.setFill()
+            Self.hairlineColor.setFill()
             UIBezierPath(rect: CGRect(x: origin.x, y: origin.y + used.midY.rounded(), width: width, height: hairline)).fill()
         }
     }

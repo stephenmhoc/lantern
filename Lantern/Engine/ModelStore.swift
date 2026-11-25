@@ -1,5 +1,6 @@
 import Foundation
 import LlamaKit
+import Network
 import Observation
 import UIKit
 
@@ -25,6 +26,9 @@ final class ModelStore: NSObject {
     @ObservationIgnored private var resumeData: [String: Data] = [:]
     @ObservationIgnored private var backgroundCompletion: (() -> Void)?
     @ObservationIgnored private var backgroundEventsDone = false
+    /// Whether there's a network, so a missing drafter is only fetched when it can be.
+    @ObservationIgnored private let pathMonitor = NWPathMonitor()
+    @ObservationIgnored private var online = false
 
     @ObservationIgnored private lazy var session: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.sessionID)
@@ -43,6 +47,28 @@ final class ModelStore: NSObject {
                     guard let id = task.taskDescription, self.states[id] != .ready else { continue }
                     self.states[id] = .downloading(task.progress.fractionCompleted)
                 }
+            }
+        }
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.online = path.status == .satisfied
+                self.fetchMissingDrafters()
+            }
+        }
+        pathMonitor.start(queue: .main)
+    }
+
+    /// Starts downloading the drafter of each downloaded model that lacks one (a Gemma from before
+    /// drafters, or copied in by hand), if there's a network. Quiet: nothing shows it, and the
+    /// model runs without it until it's here. Free to call often.
+    func fetchMissingDrafters() {
+        guard online else { return }
+        for model in CatalogModel.all where states[model.id] == .ready {
+            guard let drafter = model.drafter else { continue }
+            switch states[drafter.id] {
+            case .ready, .downloading: continue
+            default: download(drafter)
             }
         }
     }
@@ -69,6 +95,7 @@ final class ModelStore: NSObject {
                 states[model.id] = .missing
             }
         }
+        fetchMissingDrafters()
     }
 
     // MARK: - Files nothing uses any more
@@ -108,19 +135,34 @@ final class ModelStore: NSObject {
         task.countOfBytesClientExpectsToReceive = model.bytes
         states[model.id] = .downloading(0)
         task.resume()
+        // A model's drafter comes with it.
+        if let drafter = model.drafter {
+            switch states[drafter.id] {
+            case .ready, .downloading: break
+            default: download(drafter)
+            }
+        }
     }
 
     func cancel(_ model: CatalogModel) {
+        let ids = [model.id] + (model.drafter.map { [$0.id] } ?? [])
         session.getAllTasks { tasks in
-            tasks.filter { $0.taskDescription == model.id }.forEach { $0.cancel() }
+            tasks.filter { ids.contains($0.taskDescription ?? "") }.forEach { $0.cancel() }
         }
-        resumeData[model.id] = nil
-        states[model.id] = .missing
+        for id in ids where id == model.id || states[id] != .ready {  // a finished drafter stays
+            resumeData[id] = nil
+            states[id] = .missing
+        }
     }
 
     func delete(_ model: CatalogModel) {
         try? FileManager.default.removeItem(at: url(for: model))
         states[model.id] = .missing
+        if let drafter = model.drafter {  // nothing else uses it
+            cancel(drafter)
+            try? FileManager.default.removeItem(at: url(for: drafter))
+            states[drafter.id] = .missing
+        }
         refresh()
     }
 

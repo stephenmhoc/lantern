@@ -54,8 +54,12 @@
 			</dict>
 		</dict>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_ollama._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Lantern talks to Ollama on your Mac over your home network.</string>
+	<string>Lantern finds your computers running Ollama on your home network and talks to them there.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Lantern listens when you tap the microphone, to type what you say.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

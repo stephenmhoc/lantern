@@ -32,7 +32,6 @@ struct RootView: View {
     @State private var resultsFor: SearchKey?
     @State private var renaming: Conversation?
     @State private var renameText = ""
-    @State private var deleted: DeletedChat?
     /// The chat this window last asked `ChatJump` to scroll, to clear only its own request.
     @State private var jumpRequested: PersistentIdentifier?
     @AppStorage(DefaultMode.key) private var lastMode = ""
@@ -63,18 +62,7 @@ struct RootView: View {
     private var hasSidebarToggle: Bool { sizeClass == .regular }
 
     var body: some View {
-        // The undo toast sits above both columns, so it shows with the sidebar hidden too.
-        ZStack(alignment: .bottom) {
-            splitView
-            if let deleted {
-                UndoToast(deleted: deleted) { undoDelete(deleted) }
-                    .zIndex(1)
-                    .task(id: deleted.id) {
-                        try? await Task.sleep(for: .seconds(6))
-                        if !Task.isCancelled { withAnimation { self.deleted = nil } }
-                    }
-            }
-        }
+        splitView
         .onChange(of: sheet) { _, shown in
             // The message box keeps focus behind a sheet, and its keyboard would cover the sheet.
             if shown != nil { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
@@ -160,7 +148,11 @@ struct RootView: View {
                 chatSections
             }
         }
-        .searchable(text: $query, isPresented: $searching, placement: .sidebar, prompt: "Search chats")
+        // Under the large title on iPhone: with `.sidebar` there, iOS 26 put the field at the bottom
+        // beside the bar of buttons. The sidebar's own placement on iPad.
+        .searchable(text: $query, isPresented: $searching,
+                    placement: hasSidebarToggle ? .sidebar : .navigationBarDrawer(displayMode: .always),
+                    prompt: "Search chats")
         .searchScopes($scope, activation: .onSearchPresentation) {
             ForEach(SearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
         }
@@ -205,13 +197,15 @@ struct RootView: View {
                     Label(store.downloaded.isEmpty ? "Welcome to Lantern" : "No chats yet", systemImage: "flame")
                 } description: {
                     Text(store.downloaded.isEmpty
-                         ? "Get the models while you have internet. After that, Lantern answers on this device with no connection."
+                         ? "Download a model to start chatting."
                          : "Start one, and it stays on this device.")
                 } actions: {
                     if store.downloaded.isEmpty {
-                        Button("Get models") { showSettings(readiness: true) }.buttonStyle(.borderedProminent)
+                        Button { showSettings(readiness: true) } label: { Text("Get models").modifier(ProminentLabel()) }
+                            .buttonStyle(.borderedProminent)
                     } else {
-                        Button("New chat", action: { newChat() }).buttonStyle(.borderedProminent)
+                        Button { newChat() } label: { Text("New chat").modifier(ProminentLabel()) }
+                            .buttonStyle(.borderedProminent)
                     }
                 }
             } else if isSearching, resultsFor == searchKey, results.isEmpty {
@@ -220,10 +214,10 @@ struct RootView: View {
         }
     }
 
-    /// Settings on the left (badged when not ready), New chat on the right, as round glass buttons.
+    /// Settings on the left (badged when it needs a look), New chat on the right, as round glass buttons.
     private var sidebarButtons: some View {
-        // Readiness is inside Settings; a warning on the gear says when it needs a look.
-        let ready = Readiness.isReady(store: store, engine: engine)
+        // Models are inside Settings; a mark on the gear only when there's no model at all or the build expires soon.
+        let ready = !Readiness.needsAttention(store: store)
         return HStack {
             Button { showSettings(readiness: !ready) } label: {
                 Label("Settings", systemImage: "gearshape")
@@ -236,12 +230,12 @@ struct RootView: View {
                 if !ready {
                     Image(systemName: "exclamationmark.circle.fill")
                         .font(.footnote)
-                        .foregroundStyle(.white, .orange)
+                        .foregroundStyle(.black, .orange)  // white on orange is about 2:1
                         .offset(x: 2, y: -2)
                         .accessibilityHidden(true)
                 }
             }
-            .accessibilityLabel(ready ? "Settings" : "Settings, not ready to work offline")
+            .accessibilityLabel(ready ? "Settings" : "Settings, needs attention")
             Spacer()
             // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
             Button { newChat() } label: {
@@ -535,10 +529,8 @@ struct RootView: View {
         withAnimation { c.pinned.toggle() }
     }
 
+    /// Immediate, with no undo. Swipe-delete still takes a tap on its button (no full swipe).
     private func delete(_ c: Conversation) {
-        // Before stopping: a comparison still running is put back as it was before it (A shown, on
-        // A's model), not with B's model and an empty B.
-        let snapshot = DeletedChat(c, comparing: engine.comparisonInProgress(in: c))
         if engine.running == c.persistentModelID { engine.stop() }
         engine.forgetState(for: c)  // its saved model state in Caches/kv
         if selection == c {
@@ -547,26 +539,20 @@ struct RootView: View {
             let next = list.firstIndex(of: c).flatMap { i in list.indices.contains(i + 1) ? list[i + 1] : i > 0 ? list[i - 1] : nil }
             selection = hasSidebarToggle ? next : nil
         }
-        withAnimation { deleted = snapshot }
-        context.delete(c)
+        withAnimation { context.delete(c) }
         try? context.save()
-    }
-
-    private func undoDelete(_ d: DeletedChat) {
-        let c = d.restore(into: context)
-        withAnimation { deleted = nil }
-        selection = c
     }
 }
 
-/// The sidebar's bottom buttons in the list's own bottom inset: a glass bar on iOS 26, the system
-/// bar material before.
-private struct BottomBar<Bar: View>: ViewModifier {
+/// Buttons in a scroll view's own bottom inset (the sidebar's, the comparison's): on iOS 26 a
+/// bar with no background of its own, over the scroll view's soft edge effect; the system bar
+/// material before.
+struct BottomBar<Bar: View>: ViewModifier {
     @ViewBuilder let bar: () -> Bar
 
     func body(content: Content) -> some View {
         if #available(iOS 26, *) {
-            content.safeAreaBar(edge: .bottom) { bar() }
+            content.scrollEdgeEffectStyle(.soft, for: .bottom).safeAreaBar(edge: .bottom) { bar() }
         } else {
             content.safeAreaInset(edge: .bottom, spacing: 0) { bar().background(.bar) }
         }
@@ -592,5 +578,15 @@ private struct RoundGlass: ViewModifier {
                 content.buttonStyle(.bordered).buttonBorderShape(.circle).controlSize(.large)
             }
         }
+    }
+}
+
+/// The label of a button filled with the amber accent: black, since white on the amber is about
+/// 2.3:1, and secondary when the button is disabled (black on the dimmed fill is about 1.5:1).
+struct ProminentLabel: ViewModifier {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content.foregroundStyle(isEnabled ? AnyShapeStyle(Color.black) : AnyShapeStyle(.secondary))
     }
 }

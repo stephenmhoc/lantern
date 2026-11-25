@@ -35,7 +35,7 @@ struct StatusStrip: View {
 
     private var suggestion: Suggestion? {
         let fast = engine.model(for: .fast).map { engine.store.states[$0.id] == .ready } ?? false
-        guard conversation.mode == .smart, fast else { return nil }
+        guard [.smart, .qwen].contains(conversation.mode), fast else { return nil }
         let runningHere = engine.running == conversation.persistentModelID
         if runningHere, let live = engine.live, live.text.isEmpty, Date().timeIntervalSince(live.started) > 20 {
             return Suggestion(text: "Taking a while.", symbol: "hourglass", action: "Use E2B") {

@@ -4,14 +4,17 @@ import AppIntents
 /// button does (`DefaultMode`). Compiled into the widget extension too, for the control.
 nonisolated enum ChatModeChoice: String, AppEnum {
     // Not `mac`/"Mac": Siri rejects App Intent options named after Apple trademarks (ITMS-90626).
-    case usual, fast, smart, computer
+    // Nor "Apple Intelligence": `builtIn` is that mode (`apple`), under a name of Lantern's own.
+    case usual, fast, smart, qwen, computer, builtIn
 
     static let typeDisplayRepresentation = TypeDisplayRepresentation(name: "Mode")
     static let caseDisplayRepresentations: [ChatModeChoice: DisplayRepresentation] = [
         .usual: DisplayRepresentation(title: "Usual", subtitle: "The mode you used last, if it's ready"),
         .fast: DisplayRepresentation(title: "Gemma 4 E2B", subtitle: "On this device", image: .init(systemName: "cpu")),
         .smart: DisplayRepresentation(title: "Gemma 4 E4B", subtitle: "On this device", image: .init(systemName: "cpu")),
-        .computer: DisplayRepresentation(title: "Computer", subtitle: "The model last used on your computer", image: .init(systemName: "cloud")),
+        .qwen: DisplayRepresentation(title: "Qwen 3.5 4B", subtitle: "On this device", image: .init(systemName: "cpu")),
+        .computer: DisplayRepresentation(title: "Computer", subtitle: "The model last used on your computer", image: .init(systemName: "desktopcomputer")),
+        .builtIn: DisplayRepresentation(title: "Built-in Model", subtitle: "Comes with the system, on this device", image: .init(systemName: "cpu")),
     ]
 
     /// The `Mode` raw value for a `LanternLink`; nil for the usual mode.
@@ -19,6 +22,7 @@ nonisolated enum ChatModeChoice: String, AppEnum {
         switch self {
         case .usual: nil
         case .computer: "mac"
+        case .builtIn: "apple"
         default: rawValue
         }
     }

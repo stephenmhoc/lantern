@@ -13,6 +13,8 @@ import UserNotifications
 final class Engine {
     let store = ModelStore.shared
     let mac = MacLink()
+    /// Apple Intelligence's on-device model (iOS 26+), which runs in a system process.
+    let apple = AppleLink()
 
     /// The chat that's answering. Every other chat's Send is disabled until it's done.
     private(set) var running: PersistentIdentifier?
@@ -23,7 +25,9 @@ final class Engine {
     private(set) var loadingModel: CatalogModel?
     /// Set while a model self-test runs, which also blocks chats.
     private(set) var testing: CatalogModel?
-    var isBusy: Bool { running != nil || testing != nil }
+    /// Set while Apple Intelligence's self-test runs (it has no `CatalogModel`).
+    private(set) var testingApple = false
+    var isBusy: Bool { running != nil || testing != nil || testingApple }
     /// The last finished reply's numbers (prompt, reused, generated tokens), for checks.
     @ObservationIgnored private(set) var lastStats: GenerationStats?
 
@@ -140,13 +144,6 @@ final class Engine {
         comparison = (live.id, back.mode, back.macModel)
     }
 
-    /// For a chat whose comparison is still running: its id, so a snapshot (delete, then Undo) can
-    /// keep A and leave out the unfinished B.
-    func comparisonInProgress(in conversation: Conversation) -> UUID? {
-        guard let comparing, comparing.conversation == conversation.persistentModelID else { return nil }
-        return comparing.id
-    }
-
     /// Records a vote on answer `index` of the last reply's `allVersions` (nil clears it).
     /// The voted answer gets `preferred = true`, its pair partner `false`; nil clears both.
     func vote(in conversation: Conversation, preferring index: Int?) {
@@ -205,7 +202,7 @@ final class Engine {
         if mode == .mac, conversation.macModel.isEmpty, !macModel.isEmpty { conversation.macModel = macModel }
         let live = LiveReply(id: reply.id, mode: mode)
         live.macModel = macModel
-        live.thinkingAsked = thinking != .off
+        live.thinkingAsked = thinking != .off && mode != .apple  // Apple's model doesn't think
         self.live = live
         running = conversation.persistentModelID
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
@@ -235,6 +232,29 @@ final class Engine {
                     if MacLink.alwaysThinks(macModel) { live.thinkingAsked = true }
                     statsKey = "mac:\(macModel)"
                     conversation.tokenLimit = mac.contextLength
+                } else if mode == .apple {
+                    live.modelTitle = Mode.apple.title
+                    live.phase = .waiting
+                    statsKey = "apple"
+                    conversation.tokenLimit = apple.contextSize
+                    guard apple.status.isAvailable else { throw AppleError.unavailable(apple.status) }
+                    await freeMemoryForApple()
+                    try Task.checkCancellation()
+                    // Its context is small: when the chat doesn't fit, the oldest turns go first, a
+                    // turn at a time (if that's allowed), as on device. Each shorter history is tried
+                    // only if the one before didn't fit.
+                    var attempts = [(start: conversation.historyStart, history: history)]
+                    if trim || UserDefaults.standard.bool(forKey: Self.autoTrimKey) {
+                        let end = conversation.messages.count - 1
+                        for start in conversation.messages[..<end].indices
+                            where start > conversation.historyStart && conversation.messages[start].isUser {
+                            attempts.append((start, [system] + conversation.messages[start..<end].compactMap { $0.chatMessage }))
+                        }
+                    }
+                    stream = apple.stream(attempts: attempts, key: Self.appleKey(conversation)) { start in
+                        conversation.historyStart = start
+                        live.trimmed = true
+                    }
                 } else {
                     guard let model = model(for: mode) else { throw EngineError.notDownloaded(mode) }
                     guard store.states[model.id] == .ready else { throw EngineError.notDownloaded(mode) }
@@ -263,7 +283,7 @@ final class Engine {
                         live.trimmed = true
                     }
                     try Task.checkCancellation()
-                    stream = llama.generate(history, sampling: model.sampling, thinking: thinking, checkpoint: checkpoint)
+                    stream = llama.generate(history, sampling: model.sampling(thinking: thinking), thinking: thinking, checkpoint: checkpoint)
                 }
                 for try await event in stream {
                     switch event {
@@ -295,7 +315,8 @@ final class Engine {
         _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?,
         request: MacLink.Request?
     ) {
-        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) on your Mac" : loadedModel?.name ?? live.mode.title]
+        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) on your Mac"
+                     : live.mode == .apple ? live.mode.title : loadedModel?.name ?? live.mode.title]
         if let stats, stats.generatedTokens > 0 { parts.append(String(format: "%.1f tok/s", stats.tokensPerSecond)) }
         if let first = live.firstTokenSeconds { parts.append(String(format: "%.1f s to first token", first)) }
         if live.mode == .mac, stats != nil {
@@ -421,6 +442,10 @@ final class Engine {
             if !mac {
                 m.reusedTokens = stats.reusedTokens
                 m.restored = stats.restored
+                if stats.draftedTokens > 0 {
+                    m.draftedTokens = stats.draftedTokens
+                    m.acceptedDraftTokens = stats.acceptedDraftTokens
+                }
             }
         }
         m.totalSeconds = (live.lastTokenAt ?? Date()).timeIntervalSince(live.started)
@@ -459,6 +484,7 @@ final class Engine {
         case LlamaError.contextFull: .contextFull
         case LlamaError.loadFailed, LlamaError.contextFailed: .loadFailed
         case let error as MacError: error.kind
+        case let error as AppleError: error.kind
         case is URLError: .macUnreachable
         default: .other
         }
@@ -518,7 +544,7 @@ final class Engine {
     /// How full a chat's context is: live while it's answering on this device, else as its last
     /// reply left it. Nil before the first reply.
     func contextUsage(for conversation: Conversation) -> (used: Int, limit: Int)? {
-        if running == conversation.persistentModelID, live?.mode.isOnDevice == true, let llama {
+        if running == conversation.persistentModelID, live?.mode.usesLlama == true, let llama {
             return (llama.tokensInContext, llama.contextLength)
         }
         return conversation.tokenLimit > 0 ? (conversation.tokensUsed, conversation.tokenLimit) : nil
@@ -527,6 +553,7 @@ final class Engine {
     /// The most a chat in this mode can hold, in tokens, before any reply has said so.
     func contextLimit(for mode: Mode) -> Int {
         if mode == .mac { return mac.contextLength }
+        if mode == .apple { return apple.contextSize }
         if let llama, loadedModel?.tier == mode { return llama.contextLength }
         return Int(model(for: mode)?.options.contextLength ?? ModelOptions().contextLength)
     }
@@ -534,6 +561,7 @@ final class Engine {
     /// Whether images attached in this mode are seen: on this device once the model's projector
     /// is downloaded, on the Mac if its model has vision (checked when sending).
     func canSeeImages(_ mode: Mode) -> Bool {
+        if mode == .apple { return apple.seesImages }
         guard mode.isOnDevice else { return true }
         return model(for: mode)?.projector.map { store.states[$0.id] == .ready } ?? false
     }
@@ -541,6 +569,7 @@ final class Engine {
     /// What this mode's model usually does on this device, from past replies. Nil until it has answered.
     func typicalSpeed(for mode: Mode, macModel: String? = nil) -> TypicalSpeed? {
         if mode == .mac { return TypicalSpeed.stored(for: "mac:\(macModel ?? mac.modelName)") }
+        if mode == .apple { return TypicalSpeed.stored(for: "apple") }
         return model(for: mode).flatMap { TypicalSpeed.stored(for: $0.id) }
     }
 
@@ -554,6 +583,13 @@ final class Engine {
         prepared = (mode, conversation)
         if mode == .mac {
             mac.warm(conversation.resolvedMacModel)  // Ollama loads the model while the question is typed
+            return
+        }
+        if mode == .apple {
+            // The system loads its model while the question is typed; the session holds the chat.
+            let history = [ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))]
+                + conversation.history(before: conversation.messages.count)
+            apple.prewarm(history, key: Self.appleKey(conversation))
             return
         }
         guard let model = model(for: mode), store.states[model.id] == .ready else { return }
@@ -612,6 +648,7 @@ final class Engine {
     /// Deletes a chat's saved model state. Call when the chat is deleted (before or after).
     func forgetState(for conversation: Conversation) {
         guard !conversation.stateID.isEmpty else { return }
+        apple.forget(conversation.stateID)
         let directory = Self.stateRoot.appending(path: conversation.stateID)
         Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: directory) }
     }
@@ -649,7 +686,7 @@ final class Engine {
         if let live {
             if continued != nil {
                 askToNotifyQuietly()
-            } else if live.mode.isOnDevice {
+            } else if live.mode.usesLlama {
                 live.stopNote = "Stopped when you left Lantern"
                 stop()
             } else {
@@ -661,7 +698,7 @@ final class Engine {
             }
         }
         guard llama != nil || pendingLoad != nil else { return }
-        let stopping = live?.mode.isOnDevice == true ? task : nil
+        let stopping = live?.mode.usesLlama == true ? task : nil
         var release = UIBackgroundTaskIdentifier.invalid
         release = UIApplication.shared.beginBackgroundTask(withName: "Save chat state") {
             UIApplication.shared.endBackgroundTask(release)
@@ -670,7 +707,7 @@ final class Engine {
         Task {
             await stopping?.value
             // Back in front already, or a self-test is running: keep the model.
-            if inBackground, testing == nil, live?.mode.isOnDevice != true {
+            if inBackground, testing == nil, live?.mode.usesLlama != true {
                 pendingLoad?.cancel.set()
                 if let old = llama {
                     llama = nil
@@ -705,13 +742,15 @@ final class Engine {
     /// Rough reply length for the system's progress display; raised as a reply runs past it.
     private static let expectedPieces: Int64 = 600
 
-    /// Asks iOS to let the reply that's starting keep going if the user leaves. On-device replies
+    /// Asks iOS to let the reply that's starting keep going if the user leaves. llama.cpp replies
     /// need the GPU in the background, which needs an entitlement and a device that supports it:
     /// without both, nothing is submitted and leaving stops the reply as before. Ollama replies
-    /// only need the network. With `.fail`, a request iOS can't start now is refused outright.
+    /// only need the network. Apple Intelligence's run in a system process, not on Lantern's GPU,
+    /// so they're treated like the Mac's: Lantern only has to stay running to receive the text.
+    /// With `.fail`, a request iOS can't start now is refused outright.
     private func beginContinuedProcessing(mode: Mode, chatTitle: String) {
         guard #available(iOS 26, *) else { return }
-        let needsGPU = mode.isOnDevice && !Self.onCPU
+        let needsGPU = mode.usesLlama && !Self.onCPU
         if needsGPU, !BGTaskScheduler.supportedResources.contains(.gpu) { return }
         let id = "\(Self.continuedPrefix).\(UUID().uuidString)"
         let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: id, using: .main) { [weak self] task in
@@ -787,6 +826,35 @@ final class Engine {
         UNUserNotificationCenter.current().add(request)
     }
 
+    // MARK: - Apple Intelligence
+
+    /// A chat's session key in `AppleLink`: its state id, like its saved llama.cpp states.
+    private static func appleKey(_ conversation: Conversation) -> String {
+        if conversation.stateID.isEmpty { conversation.stateID = UUID().uuidString }
+        return conversation.stateID
+    }
+
+    /// Apple's model runs in a system process, so its memory isn't Lantern's, but it's the same
+    /// RAM. On a 6 GB device a loaded Gemma (2.6 GB and its cache) beside it risks either being
+    /// killed, so the llama.cpp model is unloaded first (its state saved, as on leaving the app).
+    /// With 8 GB or more it stays loaded, so going back to it costs nothing.
+    private func freeMemoryForApple() async {
+        guard MemoryStats.deviceBytes < 7 * 1_073_741_824 else { return }
+        pendingLoad?.cancel.set()
+        guard let old = llama else { return }
+        llama = nil
+        loadedModel = nil
+        await old.flush()
+    }
+
+    /// Asks Apple Intelligence for a one-word answer, like `test(_:)` for a downloaded model.
+    func testApple() async throws -> GenerationStats {
+        guard !isBusy else { throw EngineError.busy }
+        testingApple = true
+        defer { testingApple = false }
+        return try await apple.test()
+    }
+
     // MARK: - Models
 
     /// Frees the model's memory, after saving the state of the chat it holds. It's loaded again
@@ -820,7 +888,16 @@ final class Engine {
                 if llama != nil || pendingLoad != nil { return try await load(model) }
             }
             let path = store.url(for: model).path
-            let options = model.options
+            var options = model.options
+            // Gemma drafts with its MTP model once that's downloaded; until then it runs without
+            // (and the drafter is fetched quietly if there's a network).
+            if let drafter = model.drafter {
+                if store.states[drafter.id] == .ready {
+                    options.draftModel = store.url(for: drafter).path
+                } else {
+                    store.fetchMissingDrafters()
+                }
+            }
             let cancel = CancelFlag()
             let report: @Sendable (Float) -> Void = { progress in
                 Task { @MainActor in
@@ -865,7 +942,7 @@ final class Engine {
         let llama = try await load(model)
         var result = GenerationStats()
         let question = [ChatMessage(role: .user, content: "Reply with one word: ready.")]
-        for try await event in llama.generate(question, sampling: model.sampling, maxTokens: 400) {
+        for try await event in llama.generate(question, sampling: model.sampling(thinking: .off), maxTokens: 400) {
             if case .done(let s) = event { result = s }
         }
         return result
@@ -1007,7 +1084,7 @@ nonisolated enum EngineError: LocalizedError {
     case notDownloaded(Mode), busy
     var errorDescription: String? {
         switch self {
-        case .notDownloaded(let mode): "\(mode.title) isn't on this device yet. Get it in Settings > Readiness."
+        case .notDownloaded(let mode): "\(mode.title) isn't on this device yet. Get it in Settings > Models."
         case .busy: "Lantern is answering. Try again when it's done."
         }
     }

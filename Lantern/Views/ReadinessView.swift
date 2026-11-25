@@ -4,16 +4,19 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UserNotifications
 
-/// "Will Lantern work without internet?" Models on this device (get, test, delete), the
-/// Mac on each route, and when this build stops launching.
+/// The Models page: a row per on-device model (details, image reading, Test and Delete behind a tap),
+/// the Mac in one line, then importing a file, old files and when this build stops launching.
 struct ReadinessView: View {
     /// Closes the sheet it's in (it's pushed inside Settings, where `dismiss` would only go back).
     var close: (() -> Void)?
     @Environment(Engine.self) private var engine
     @Environment(ModelStore.self) private var store
     @Environment(\.dismiss) private var dismiss
-    @State private var tests: [String: Result<GenerationStats, Error>] = [:]
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @State private var tests: ModelTestResults = [:]
     @State private var deleting: CatalogModel?
+    @State private var detail: CatalogModel?
+    @State private var appleDetail = false
     @State private var lan: Bool?
     @State private var tailnet: Bool?
     @State private var checkingMac = false
@@ -24,104 +27,95 @@ struct ReadinessView: View {
     @State private var reminders: UNAuthorizationStatus?
     @State private var deletingRetired = false
 
+
     var body: some View {
+        list
+            #if DEBUG
+            .modifier(DebugScroll(to: "end"))
+            #endif
+    }
+
+    private var list: some View {
         List {
             Section {
-                let ready = Readiness.isReady(store: store, engine: engine)
-                // Coloured icon, primary text: green or orange text is hard to read on white.
-                Label {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(Readiness.summary(store: store, engine: engine)).font(.headline)
-                        Text(ready
-                             ? "Lantern answers on this device with no connection at all."
-                             : "Get them while you have internet. After that, Lantern answers on this device with no connection at all.")
-                            .font(.subheadline).foregroundStyle(.secondary)
-                    }
-                } icon: {
-                    Image(systemName: ready ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
-                        .foregroundStyle(ready ? .green : .orange)
-                }
-            }
-
-            Section {
-                ForEach(CatalogModel.files) { row($0) }
+                ForEach(CatalogModel.all) { row($0) }
+                AppleModelRow(test: tests[AppleModelRow.testKey], open: { appleDetail = true },
+                              runTest: { Readiness.runAppleTest(engine: engine, into: $tests) })
             } header: {
-                Text("On this device")
+                Text("On This Device")
             } footer: {
-                Text("""
-                    Download while you have internet. Without it, copy the file from your Mac: in Finder, \
-                    select this device, then Files, and drag it onto Lantern, using the name shown.
-                    """)
+                Text("\(ByteCountFormatter.string(fromByteCount: ModelStore.freeBytes, countStyle: .file)) available on this device.")
             }
 
-            if !store.retired.isEmpty {
-                Section {
-                    ForEach(store.retired, id: \.name) { file in
-                        LabeledContent(file.name, value: size(file.bytes))
-                            .font(.callout.monospaced())
-                    }
-                    Button("Delete Unused Files", systemImage: "trash", role: .destructive) { deletingRetired = true }
-                } header: {
-                    Text("No longer used")
-                } footer: {
-                    Text("Inkling 2 Mini no longer runs on this device: it was too big and slow for it. Your Mac can still run it.")
-                }
+            Section("On Your Computers") {
+                macRow
             }
 
             Section {
                 if let importing {
-                    HStack {
+                    HStack(spacing: 12) {
                         ProgressView()
-                        Text("Copying \(importing)…").padding(.leading, 6)
+                        Text("Copying \(importing)…").foregroundStyle(.secondary)
                     }
                 } else {
-                    Button("Import a Model File…", systemImage: "square.and.arrow.down") { choosingFile = true }
+                    Button { choosingFile = true } label: {
+                        Label {
+                            Text("Import a Model File…")
+                        } icon: {
+                            Image(systemName: "square.and.arrow.down").foregroundStyle(.secondary)
+                        }
+                    }
+                    .tint(.primary)
                 }
-            } footer: {
-                Text("Already have one of the files above, from your Mac or the Files app? Import it, or drag it onto this list.")
-            }
-
-            Section {
-                macRow("Home network", ok: lan)
-                macRow("Tailnet", ok: tailnet)
-                Button(checkingMac ? "Checking…" : "Check the Mac", action: checkMac).disabled(checkingMac)
-            } header: {
-                Text("Mac")
-            } footer: {
-                Text("With the internet down, the home network still works if the router and Mac have power.")
-            }
-
-            Section("This app") {
-                LabeledContent("Free storage", value: ByteCountFormatter.string(fromByteCount: ModelStore.freeBytes, countStyle: .file))
+                if !store.retired.isEmpty {
+                    Button(role: .destructive) { deletingRetired = true } label: {
+                        LabeledContent("Delete Unused Files", value: size(store.retired.reduce(0) { $0 + $1.bytes }))
+                    }
+                }
                 if let expiry = Readiness.expiry {
                     LabeledContent {
                         Text(expiry.formatted(date: .abbreviated, time: .omitted))
                     } label: {
-                        HStack(spacing: 6) {
-                            if Readiness.expiresSoon {
-                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                            }
+                        if Readiness.expiresSoon {
+                            Label("Stops launching", systemImage: "exclamationmark.triangle.fill")
+                                .labelStyle(OrangeIconLabelStyle())
+                        } else {
                             Text("Stops launching")
                         }
                     }
                     reminderRow
-                } else {
-                    LabeledContent("Installed from Xcode", value: "No TestFlight expiry")
                 }
+            } footer: {
+                Text("Already have a model file, from your Mac or the Files app? Import it, or drag it onto this page.")
             }
+            .id("end")
         }
-        .navigationTitle("Readiness")
+        .navigationTitle("Models")
+        .navigationDestination(item: $detail) { ModelDetailView(model: $0, tests: $tests) }
+        .navigationDestination(isPresented: $appleDetail) { AppleModelDetailView(tests: $tests) }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Done") { if let close { close() } else { dismiss() } } }
         }
         .onAppear {
             store.refresh()
             store.refreshRetired()
+            #if DEBUG
+            // `-readinessDetail <model id>`: opens that model's page, for screenshots.
+            let args = ProcessInfo.processInfo.arguments
+            if detail == nil, let i = args.firstIndex(of: "-readinessDetail"), args.indices.contains(i + 1) {
+                if args[i + 1] == AppleModelRow.testKey { appleDetail = true }
+                detail = CatalogModel.all.first { $0.id == args[i + 1] }
+            }
+            #endif
         }
+        .confirmsModelDeletion($deleting)
         .confirmationDialog("Delete files no longer used?", isPresented: $deletingRetired, titleVisibility: .visible) {
             Button("Delete", role: .destructive) { store.deleteRetired() }
         } message: {
-            Text("Frees \(size(store.retired.reduce(0) { $0 + $1.bytes })).")
+            Text("""
+                Inkling 2 Mini no longer runs on this device: it was too big and slow for it. Your Mac can \
+                still run it. Frees \(size(store.retired.reduce(0) { $0 + $1.bytes })).
+                """)
         }
         .task { checkMac() }
         .task { reminders = await ExpiryReminders.status() }
@@ -157,96 +151,38 @@ struct ReadinessView: View {
         } message: {
             Text(importError ?? "")
         }
-        .confirmationDialog(
-            "Delete \(deleting?.name ?? "")?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
-            titleVisibility: .visible, presenting: deleting
-        ) { model in
-            Button("Delete", role: .destructive) {
-                if engine.loadedModel == model { engine.unload() }
-                store.delete(model)
-            }
-        } message: { model in
-            Text("Frees \(size(model.bytes)). Getting it back needs internet or your Mac.")
-        }
     }
 
-    @ViewBuilder
     private func row(_ model: CatalogModel) -> some View {
-        let state = store.states[model.id] ?? .missing
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Label(model.name, systemImage: model.isExtra ? "photo" : model.tier.symbol).font(.headline)
-                if !CatalogModel.fits(model) {
-                    Text("Needs \(model.minDeviceGB) GB").font(.caption).padding(.horizontal, 6)
-                        .background(.orange.opacity(0.2), in: .capsule)
-                }
-            }
-            Text(model.detail).font(.callout).foregroundStyle(.secondary)
-            Text("\(model.filename) · \(size(model.bytes))")
-                .font(.caption.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
-            switch state {
-            case .missing:
-                // Image reading is optional, so its button doesn't compete with the models'.
-                if model.isExtra {
-                    Button("Download") { store.download(model) }.buttonStyle(.bordered)
-                } else {
-                    Button("Download") { store.download(model) }.buttonStyle(.borderedProminent)
-                }
-            case .downloading(let p):
-                HStack {
-                    ProgressView(value: p).accessibilityLabel("Downloading")
-                    Text("\(Int(p * 100))%").font(.caption.monospacedDigit())
-                    Button("Cancel") { store.cancel(model) }
-                }
-            case .incomplete(let bytes):
-                Label("Incomplete: \(size(bytes)) of \(size(model.bytes)). If it's still copying, wait.",
-                      systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
-                Button("Delete", role: .destructive) { deleting = model }
-            case .failed(let message):
-                HStack {
-                    Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.red)
-                    Button("Retry") { store.download(model) }
-                }
-            case .ready:
-                HStack {
-                    testResult(model)
-                    Spacer()
-                    if !model.isExtra { Button("Test") { test(model) }.disabled(engine.isBusy) }
-                    Button("Delete", role: .destructive) { deleting = model }.disabled(engine.isBusy)
-                }
-            }
-        }
-        .padding(.vertical, 4)
+        ModelRow(model: model, test: tests[model.id], open: { detail = model },
+                 runTest: { Readiness.runTest(model, engine: engine, into: $tests) },
+                 delete: { deleting = $0 })
     }
 
-    @ViewBuilder
-    private func testResult(_ model: CatalogModel) -> some View {
-        if engine.testing == model {
-            Label("Testing…", systemImage: "hourglass")
-        } else {
-            switch tests[model.id] {
-            case .success(let s):
-                Label {
-                    Text(String(format: "Works · %.1f tok/s", s.tokensPerSecond))
-                } icon: {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+    // MARK: - Mac
+
+    /// The computer in one line; opens its page.
+    private var macRow: some View {
+        NavigationLink { ComputersView() } label: {
+            HStack(spacing: 12) {
+                Label { Text(MacLink.isConfigured ? MacLink.computerName : "Add a Computer") } icon: {
+                    Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
                 }
-            case .failure(let e): Label(e.localizedDescription, systemImage: "xmark.octagon.fill").foregroundStyle(.red)
-            case nil: Label("On this device", systemImage: "checkmark.circle").foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Text(macStatus).foregroundStyle(.secondary).multilineTextAlignment(.trailing)
             }
         }
+        .accessibilityElement(children: .combine)
     }
 
-    private func macRow(_ title: String, ok: Bool?) -> some View {
-        LabeledContent(title) {
-            // An HStack, not a Label: a Label here makes the row several lines tall.
-            switch ok {
-            case true?:
-                HStack(spacing: 6) { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green); Text("Answers") }
-            case false?:
-                HStack(spacing: 6) { Image(systemName: "xmark.circle"); Text("No answer") }.foregroundStyle(.secondary)
-            case nil: Text(checkingMac ? "Checking…" : "Not set up").foregroundStyle(.secondary)
-            }
+    private var macStatus: String {
+        if checkingMac { return "Checking…" }
+        switch (lan, tailnet) {
+        case (true?, true?): return "Home network and tailnet"
+        case (true?, _): return "Home network"
+        case (_, true?): return "Tailnet"
+        case (nil, nil): return "Not set up"
+        default: return "No answer"
         }
     }
 
@@ -255,9 +191,16 @@ struct ReadinessView: View {
     private var reminderRow: some View {
         switch reminders {
         case .notDetermined?:
-            Button("Remind Me Before It Expires", systemImage: "bell") {
+            Button {
                 Task { reminders = await ExpiryReminders.enable() }
+            } label: {
+                Label {
+                    Text("Remind Me Before It Expires")
+                } icon: {
+                    Image(systemName: "bell").foregroundStyle(.secondary)
+                }
             }
+            .tint(.primary)
         case .authorized?, .provisional?, .ephemeral?:
             LabeledContent("Reminders", value: "14 and 3 days before")
         case .denied?:
@@ -283,12 +226,6 @@ struct ReadinessView: View {
         if case .failure(let error) = outcome { importError = error.localizedDescription }
     }
 
-    private func test(_ model: CatalogModel) {
-        Task {
-            do { tests[model.id] = .success(try await engine.test(model)) } catch { tests[model.id] = .failure(error) }
-        }
-    }
-
     private func checkMac() {
         checkingMac = true
         Task {
@@ -305,6 +242,16 @@ struct ReadinessView: View {
     }
 
     private func size(_ bytes: Int64) -> String { ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file) }
+}
+
+/// Orange icon, primary text: orange text is hard to read on white.
+private struct OrangeIconLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 6) {
+            configuration.icon.foregroundStyle(.orange)
+            configuration.title
+        }
+    }
 }
 
 enum Readiness {
@@ -340,24 +287,11 @@ enum Readiness {
 
     static var expiresSoon: Bool { expiry.map { $0.timeIntervalSinceNow < 30 * 86_400 } ?? false }
 
-    /// Ready means every on-device model that fits this device (Gemma 4 E2B, and E4B with 8 GB) is
-    /// complete and the build isn't about to expire. Image reading and the Mac are a bonus.
-    static func isReady(store: ModelStore, engine: Engine) -> Bool {
-        missing(store: store, engine: engine).isEmpty && !expiresSoon
-    }
-
-    static func summary(store: ModelStore, engine: Engine) -> String {
-        if expiresSoon, let expiry { return "This build stops launching \(expiry.formatted(.relative(presentation: .named))). Install the latest from TestFlight." }
-        let missing = missing(store: store, engine: engine)
-        return missing.isEmpty ? "Ready to work offline." : "Not ready: get \(missing.joined(separator: " and "))."
-    }
-
-    private static func missing(store: ModelStore, engine: Engine) -> [String] {
-        [Mode.fast, .smart].compactMap { mode in
-            guard let model = CatalogModel.preferred(for: mode, downloaded: store.downloaded),
-                  mode == .fast || CatalogModel.fits(model) else { return nil }
-            return store.states[model.id] == .ready ? nil : model.name
-        }
+    /// Settings needs a look (the gear is badged) only when there's no model to answer with at all or
+    /// this build is about to stop launching. A model not downloaded yet is just a choice; Apple
+    /// Intelligence, when it's on, is a model to answer with.
+    static func needsAttention(store: ModelStore) -> Bool {
+        (store.downloaded.isEmpty && !AppleStatus.current.isAvailable) || expiresSoon
     }
 }
 

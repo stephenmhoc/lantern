@@ -159,7 +159,7 @@ final class UserCell: UICollectionViewCell {
         super.init(frame: frame)
         contentView.directionalLayoutMargins.leading = 0
         contentView.directionalLayoutMargins.trailing = 0  // the section's readable-width insets are the margins
-        bubble.backgroundColor = .tintColor.withAlphaComponent(0.15)
+        bubble.backgroundColor = .userBubble
         bubble.layer.cornerRadius = 18
         bubble.layer.cornerCurve = .continuous
         bubble.translatesAutoresizingMaskIntoConstraints = false
@@ -171,7 +171,7 @@ final class UserCell: UICollectionViewCell {
         // The date note the model was given, shown small above the bubble.
         dateLabel.font = .preferredFont(forTextStyle: .caption2)
         dateLabel.adjustsFontForContentSizeCategory = true
-        dateLabel.textColor = .tertiaryLabel
+        dateLabel.textColor = .secondaryLabel  // tertiary is under 3:1 in dark mode
         dateLabel.textAlignment = .right
         let content = UIStackView(arrangedSubviews: [files, textView])
         content.axis = .vertical
@@ -258,8 +258,18 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     /// Opens the comparison, on an answer that has one.
     private let compareButton = HitButton(configuration: .plain())
     private lazy var statusRow = UIStackView(arrangedSubviews: [glow, status])
-    private lazy var versionRow = UIStackView(arrangedSubviews: [previousButton, versionLabel, nextButton])
-    private lazy var footerRow = UIStackView(arrangedSubviews: [versionRow, footnote, compareButton, stopSpeakingButton, moreButton])
+    private lazy var versionRow = HitStackView(arrangedSubviews: [previousButton, versionLabel, nextButton])
+    private lazy var footerButtons = HitStackView(arrangedSubviews: [compareButton, stopSpeakingButton, moreButton])
+    /// Keeps the buttons at the trailing edge while the footnote is on its own line below.
+    private let footerSpacer = UIView()
+    /// One row, or at accessibility text sizes a column (pager, then footnote, then buttons), so the
+    /// footnote never gets squeezed down to a sliver beside 44 pt buttons.
+    private lazy var footerRow = UIStackView(arrangedSubviews: [versionRow, footnote, footerSpacer, footerButtons])
+    private lazy var body = UIStackView(arrangedSubviews: [
+        statusRow, progress, thoughtTail, thinkingButton, thinkingBox, answer, errorLabel, errorRow, footerRow,
+    ])
+    /// The footnote moves under the row when beside the pager and buttons it would take more than two lines.
+    private var footnoteBelow = false
 
     var onToggleThinking: (() -> Void)?
     /// -1 for the previous answer to this question, +1 for the next.
@@ -309,7 +319,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         thinkingButton.addAction(UIAction { [weak self] _ in self?.onToggleThinking?() }, for: .primaryActionTriggered)
 
         let thinkingBar = UIView()
-        thinkingBar.backgroundColor = .separator
+        thinkingBar.backgroundColor = .tertiaryLabel  // .separator all but vanishes in dark mode
         thinkingBar.layer.cornerRadius = 1
         thinkingBar.translatesAutoresizingMaskIntoConstraints = false
         thinkingText.translatesAutoresizingMaskIntoConstraints = false
@@ -329,7 +339,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         answer.delegate = self
 
         footnote.font = .preferredFont(forTextStyle: .caption2)
-        footnote.textColor = .tertiaryLabel
+        footnote.textColor = .secondaryLabel  // tertiary is under 3:1 in dark mode
         footnote.adjustsFontForContentSizeCategory = true
         footnote.numberOfLines = 0
 
@@ -344,6 +354,21 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
             button.accessibilityLabel = label
             button.setContentHuggingPriority(.required, for: .horizontal)
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        }
+        // Narrow frames so the pager and ⋯ sit compactly, each with a 44 × 44 pt touch area that
+        // reaches into the space beside it but never into a neighbour's: ‹ covers 0–44 (over the
+        // start of "1/2"), › starts after the label and reaches into the gap before the footnote,
+        // ⋯ and stop reach back into the 12 pt gap before them.
+        for button in [previousButton, nextButton] {
+            button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        previousButton.hitOutsets = UIEdgeInsets(top: 0, left: 0, bottom: 0, right: 20)
+        nextButton.hitOutsets = UIEdgeInsets(top: 0, left: 4, bottom: 0, right: 16)
+        for button in [stopSpeakingButton, moreButton] {
+            button.widthAnchor.constraint(equalToConstant: 32).isActive = true
+            button.hitOutsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 0)
         }
         moreButton.showsMenuAsPrimaryAction = true
         moreButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] done in
@@ -367,6 +392,11 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         compareButton.setContentHuggingPriority(.required, for: .horizontal)
         compareButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         compareButton.addAction(UIAction { [weak self] _ in self?.onCompare?() }, for: .primaryActionTriggered)
+        compareButton.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            compareButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            compareButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+        ])
         stopSpeakingButton.configuration?.baseForegroundColor = GlowView.amber
         stopSpeakingButton.addAction(UIAction { [weak self] _ in self?.onStopSpeaking?() }, for: .primaryActionTriggered)
         previousButton.addAction(UIAction { [weak self] _ in self?.onSwitchVersion?(-1) }, for: .primaryActionTriggered)
@@ -375,9 +405,17 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
             ofSize: UIFont.preferredFont(forTextStyle: .caption1).pointSize, weight: .regular)
         versionLabel.textColor = .secondaryLabel
         versionLabel.setContentHuggingPriority(.required, for: .horizontal)
-        versionRow.spacing = 2
-        footerRow.spacing = 10
-        footerRow.alignment = .center
+        versionLabel.setContentCompressionResistancePriority(.required, for: .horizontal)  // or the footnote squeezes "1/2" out
+        versionRow.spacing = 4
+        versionRow.alignment = .center
+        footerButtons.spacing = 12
+        footerButtons.alignment = .center
+        footerSpacer.isHidden = true
+        for row in [versionRow, footerButtons] {
+            row.setContentHuggingPriority(.required, for: .horizontal)
+            row.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+        layoutFooter()
 
         errorLabel.font = .preferredFont(forTextStyle: .callout)
         errorLabel.textColor = .systemRed
@@ -386,9 +424,8 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         errorRow.spacing = 8
         errorRow.alignment = .leading
 
-        let stack = UIStackView(arrangedSubviews: [
-            statusRow, progress, thoughtTail, thinkingButton, thinkingBox, answer, errorLabel, errorRow, footerRow,
-        ])
+        let stack = body
+        stack.setCustomSpacing(-6, after: footerRow)  // a footnote moved below sits close under the 44 pt row
         stack.axis = .vertical
         stack.spacing = 8
         stack.alignment = .fill
@@ -410,6 +447,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         // Dynamic Type: render the Markdown again at the new sizes.
         registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
             self.renderAnswer()
+            self.layoutFooter()
             self.versionLabel.font = .monospacedDigitSystemFont(
                 ofSize: UIFont.preferredFont(forTextStyle: .caption1, compatibleWith: self.traitCollection).pointSize,
                 weight: .regular)
@@ -417,6 +455,53 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// A row beside the footnote normally; a column at accessibility text sizes.
+    private func layoutFooter() {
+        let large = traitCollection.preferredContentSizeCategory.isAccessibilityCategory
+        footerRow.axis = large ? .vertical : .horizontal
+        footerRow.alignment = large ? .leading : .center
+        footerRow.spacing = large ? 4 : 10
+        placeFootnote(width: body.bounds.width)
+    }
+
+    /// Beside the pager and buttons if it fits there in two lines, else on its own line under them.
+    private func placeFootnote(width: CGFloat) {
+        guard footerRow.axis == .horizontal, width > 0, let text = footnote.text, !text.isEmpty else {
+            if footerRow.axis == .vertical || footnote.text?.isEmpty != false { moveFootnote(below: false) }
+            return
+        }
+        var room = width
+        for row in [versionRow, footerButtons] where !row.isHidden {
+            room -= row.systemLayoutSizeFitting(UIView.layoutFittingCompressedSize).width + footerRow.spacing
+        }
+        let font = footnote.font ?? .preferredFont(forTextStyle: .caption2)
+        let height = room <= 40 ? .infinity : (text as NSString).boundingRect(
+            with: CGSize(width: room, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin],
+            attributes: [.font: font], context: nil).height
+        moveFootnote(below: (height / font.lineHeight).rounded() > 2)
+    }
+
+    private func moveFootnote(below: Bool) {
+        guard below != footnoteBelow else { return }
+        footnoteBelow = below
+        footnote.removeFromSuperview()
+        if below, let i = body.arrangedSubviews.firstIndex(of: footerRow) {
+            body.insertArrangedSubview(footnote, at: i + 1)
+        } else {
+            footerRow.insertArrangedSubview(footnote, at: 1)
+        }
+        footerSpacer.isHidden = !footnoteBelow
+    }
+
+    override func systemLayoutSizeFitting(
+        _ targetSize: CGSize, withHorizontalFittingPriority horizontal: UILayoutPriority,
+        verticalFittingPriority vertical: UILayoutPriority
+    ) -> CGSize {
+        placeFootnote(width: targetSize.width - contentView.layoutMargins.left - contentView.layoutMargins.right)
+        return super.systemLayoutSizeFitting(targetSize, withHorizontalFittingPriority: horizontal,
+                                             verticalFittingPriority: vertical)
+    }
 
     override func prepareForReuse() {
         super.prepareForReuse()
@@ -498,11 +583,15 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         previousButton.isEnabled = current > 0
         nextButton.isEnabled = current < versions.count - 1
         versionLabel.accessibilityLabel = "Answer \(current + 1) of \(versions.count)"
+        previousButton.accessibilityValue = "\(current + 1) of \(versions.count)"
+        nextButton.accessibilityValue = previousButton.accessibilityValue
 
         compareButton.isHidden = message.comparison == nil || live != nil
         stopSpeakingButton.isHidden = !content.isSpeaking
         moreButton.isHidden = live != nil
         footerRow.isHidden = live != nil
+        footnote.isHidden = live != nil  // also when it's below the row
+        placeFootnote(width: body.bounds.width)
     }
 
     /// The last line or two of the thought stream, for under the status while it thinks.
@@ -534,10 +623,40 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
 /// A button whose touch and pointer target is at least 44 points square, however small it looks.
 final class HitButton: UIButton {
     var minimumHitSize: CGFloat = 44
+    /// How far the touch area reaches past each edge, instead of growing evenly to `minimumHitSize`.
+    var hitOutsets: UIEdgeInsets?
 
     override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        if let o = hitOutsets {
+            return bounds.inset(by: UIEdgeInsets(top: -o.top, left: -o.left, bottom: -o.bottom, right: -o.right)).contains(point)
+        }
         let dx = max(0, (minimumHitSize - bounds.width) / 2)
         let dy = max(0, (minimumHitSize - bounds.height) / 2)
         return bounds.insetBy(dx: -dx, dy: -dy).contains(point)
+    }
+}
+
+/// A stack whose buttons' touch areas may reach past its own edges.
+final class HitStackView: UIStackView {
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        super.point(inside: point, with: event) || arrangedSubviews.contains {
+            !$0.isHidden && $0.isUserInteractionEnabled && $0.point(inside: convert(point, to: $0), with: event)
+        }
+    }
+}
+
+extension UIColor {
+    /// The question's bubble: a warm tint of the amber, fixed rather than the tint colour at 15%,
+    /// which was a muddy brown on black in dark mode and went grey while a sheet dimmed the tint.
+    static let userBubble = UIColor { traits in
+        let high = traits.accessibilityContrast == .high
+        return traits.userInterfaceStyle == .dark
+            ? UIColor(rgb: high ? 0x4D3821 : 0x3B2A17)
+            : UIColor(rgb: high ? 0xF9DDBA : 0xFDEFDF)
+    }
+
+    convenience init(rgb: UInt32) {
+        self.init(red: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                  blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
     }
 }

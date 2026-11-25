@@ -277,6 +277,9 @@ nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
     var generatedTokens: Int?
     var generateSeconds: Double?
     var tokensPerSecond: Double?
+    /// On device with an MTP drafter (Gemma): tokens it guessed, and how many the model kept.
+    var draftedTokens: Int?
+    var acceptedDraftTokens: Int?
     /// From the request to the last token, everything included (load too).
     var totalSeconds: Double?
 

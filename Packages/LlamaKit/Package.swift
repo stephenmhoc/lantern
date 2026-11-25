@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "LlamaKit", targets: ["LlamaKit"]),
     ],
     targets: [
-        // Fetched by scripts/fetch-llama.sh, pinned to a build with the Inkling loop fix (PR #32704).
+        // Fetched by scripts/fetch-llama.sh (the pinned release's xcframework).
         .binaryTarget(name: "llama", path: "../../Vendor/build-apple/llama.xcframework"),
         .target(name: "LlamaKit", dependencies: ["llama"]),
         // Mac-only smoke test: loads a GGUF through the same wrapper the app uses.

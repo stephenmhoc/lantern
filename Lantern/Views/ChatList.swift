@@ -43,106 +43,21 @@ struct ChatSection: Identifiable {
 }
 
 /// The mode a new chat starts in: the last one used if it works right now, else the quickest that
-/// does (the Mac if it answers, then Gemma 4 E2B, then E4B).
+/// does (the Mac if it answers, then Gemma 4 E2B, then E4B, then Qwen 3.5 4B, then Apple
+/// Intelligence: last, since its small context fills after a few turns; first only for someone who
+/// has downloaded nothing, where it means a new chat works at once).
 enum DefaultMode {
     static let key = "chat.lastMode"
 
     static func pick(last: String, engine: Engine) -> Mode {
         if let last = Mode(rawValue: last), isAvailable(last, engine: engine) { return last }
-        return [Mode.mac, .fast, .smart].first { isAvailable($0, engine: engine) } ?? .fast
+        return [Mode.mac, .fast, .smart, .qwen, .apple].first { isAvailable($0, engine: engine) } ?? .fast
     }
 
     static func isAvailable(_ mode: Mode, engine: Engine) -> Bool {
         if mode == .mac { return engine.mac.route.host != nil }
+        if mode == .apple { return engine.apple.status.isAvailable }
         return engine.model(for: mode).map { engine.store.states[$0.id] == .ready } ?? false
-    }
-}
-
-/// A deleted chat, kept for a few seconds so Undo can put it back.
-struct DeletedChat: Identifiable {
-    let id = UUID()
-    let title: String
-    let created: Date
-    let updated: Date
-    let mode: Mode
-    let macModel: String
-    let thinking: Thinking
-    let pinned: Bool
-    let systemPrompt: String
-    let historyStart: Int
-    let messages: [StoredMessage]
-
-    /// `comparing`: the id of the comparison running in `c` (`Engine.comparisonInProgress`). The
-    /// unfinished B is left out and the chat is put back as it was before it: A shown, on A's model.
-    init(_ c: Conversation, comparing: UUID? = nil) {
-        title = c.title
-        created = c.created
-        updated = c.lastActive
-        thinking = c.thinking
-        pinned = c.pinned
-        systemPrompt = c.systemPrompt
-        historyStart = c.historyStart
-        var messages = c.messages
-        var mode = c.mode, macModel = c.macModel
-        if let comparing, let last = messages.indices.last, !messages[last].isUser, !messages[last].finished,
-           let a = Self.withoutB(messages[last], comparing: comparing) {
-            messages[last] = a
-            if let m = a.metrics, let aMode = Mode(rawValue: m.modeRaw) {
-                mode = aMode
-                if aMode == .mac, let model = m.macModel, !model.isEmpty { macModel = model }
-            }
-        }
-        self.mode = mode
-        self.macModel = macModel
-        // A reply cut off by the delete is kept as stopped, not left looking unfinished.
-        self.messages = messages.map { m in
-            var m = m
-            if !m.finished {
-                m.finished = true
-                if m.footnote == nil { m.footnote = "Stopped" }
-            }
-            return m
-        }
-    }
-
-    /// The reply with the running B (the shown, newest answer) removed and A shown, no longer
-    /// paired. Nil if A isn't among its versions.
-    private static func withoutB(_ reply: StoredMessage, comparing: UUID) -> StoredMessage? {
-        var (list, current) = reply.allVersions
-        list.remove(at: current)
-        guard let ai = list.lastIndex(where: { $0.metrics?.compareID == comparing }) ?? list.indices.last else { return nil }
-        let a = list.remove(at: ai)
-        var m = reply
-        m.content = a.content
-        m.thinking = a.thinking
-        m.footnote = a.footnote
-        m.error = a.error
-        m.errorKind = nil
-        m.cutOff = nil
-        m.thoughtSeconds = a.thoughtSeconds
-        m.metrics = a.metrics
-        m.metrics?.compareID = nil
-        m.metrics?.preferred = nil
-        m.finished = true
-        m.versions = list.isEmpty ? nil : list
-        m.versionIndex = ai >= list.count ? nil : ai
-        return m
-    }
-
-    func restore(into context: ModelContext) -> Conversation {
-        let c = Conversation(mode: mode)
-        c.title = title
-        c.created = created
-        c.lastActive = updated
-        c.macModel = macModel
-        c.thinking = thinking
-        c.pinned = pinned
-        if !systemPrompt.isEmpty { c.systemPrompt = systemPrompt }  // frozen per chat
-        c.historyStart = historyStart
-        c.messages = messages
-        context.insert(c)
-        try? context.save()
-        return c
     }
 }
 
@@ -176,7 +91,7 @@ struct ChatRow: View {
                 Text(conversation.modelTitle)
             }
             .font(.caption)
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.secondary)  // tertiary is under 3:1 in dark mode
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
@@ -203,26 +118,6 @@ struct ChatRow: View {
         let week = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)) ?? now
         if date >= week { return date.formatted(.dateTime.weekday(.wide)) }
         return date.formatted(date: .numeric, time: .omitted)
-    }
-}
-
-/// "Deleted “…”  Undo", at the bottom of the window for a few seconds after a delete.
-struct UndoToast: View {
-    let deleted: DeletedChat
-    let undo: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Text("Deleted “\(deleted.title)”").lineLimit(1)
-            Button("Undo", action: undo).bold()
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.regularMaterial, in: .capsule)
-        .shadow(radius: 6, y: 2)
-        .padding()
-        .padding(.bottom, 64)  // clear of the message box and the sidebar's bottom bar
-        .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 }
 

@@ -14,7 +14,7 @@ extension Engine {
         guard let container = try? ModelContainer(
             for: Conversation.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true)) else { return }
         let context = container.mainContext
-        let mode: Mode = arguments.contains("-smart") ? .smart : .fast
+        let mode: Mode = arguments.contains("-qwen") ? .qwen : arguments.contains("-smart") ? .smart : .fast
         let chat = Conversation(mode: mode)
         // Begun three days ago: the first question gets a date note, the second doesn't.
         chat.created = Date(timeIntervalSinceNow: -3 * 86_400)

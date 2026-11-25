@@ -1,6 +1,6 @@
 #!/bin/sh
-# Fetches the pinned llama.cpp xcframework into Vendor/. b12633 is after PR #32704, the Inkling
-# loop fix; older builds load Inkling's mainline GGUFs but produce gibberish.
+# Fetches the pinned llama.cpp xcframework into Vendor/. Run lantern-smoke on both Gemmas and on
+# Qwen 3.5 (--think, --stop, --state) before moving the pin.
 set -eu
 TAG=b12633
 SHA=d0b199082096fc63c875ef55c4675de09b3d42fa25a0b8d2dba736938c9c9bc6

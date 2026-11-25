@@ -3,12 +3,15 @@ import UniformTypeIdentifiers
 
 /// The bar under the chat: status strip, attached files, a full-width text view that grows to six
 /// lines, and under it the controls: mode menu and attach menu on the left, dictation and Send/Stop
-/// on the right.
+/// on the right. While the keyboard is down and there's nothing to send or edit it collapses to one
+/// row: the model's symbol, the field, dictation, and Stop while this chat is answering.
 /// On iOS 26 and later it's a floating Liquid Glass panel at the readable width; before that, a
 /// full-width blurred bar.
 final class ComposerView: UIView, UITextViewDelegate {
     let textView = ComposerTextView()
     let modeButton = HitButton(configuration: .gray())
+    /// The collapsed row's model button: the symbol alone, with the same menu (`syncModeIcon`).
+    let modeIconButton = HitButton(configuration: .plain())
     let sendButton = HitButton(configuration: .plain())
     /// Files and photos; its menu is set by the chat, which knows what the mode can read.
     let attachButton = HitButton(configuration: .plain())
@@ -19,6 +22,15 @@ final class ComposerView: UIView, UITextViewDelegate {
     private let chipScroll = UIScrollView()
     private let chipStack = UIStackView()
     private var heightConstraint: NSLayoutConstraint!
+    private var fieldRow: UIStackView!
+    private var controls: UIStackView!
+    private var stackTop: NSLayoutConstraint!
+    private var stackBottom: NSLayoutConstraint!
+    private var insets: (top: CGFloat, bottom: CGFloat) = (8, 8)
+    /// The one-row layout, while the keyboard is down and there's nothing to send.
+    private(set) var isCollapsed = false
+    /// The keyboard's current animation, so collapsing and expanding move with it.
+    private var keyboardAnimation: (duration: TimeInterval, curve: UIView.AnimationCurve, at: Date)?
     private var modeTitle = ""
     private let usesGlass: Bool
     private lazy var tap = UIImpactFeedbackGenerator(style: .light, view: self)
@@ -44,12 +56,13 @@ final class ComposerView: UIView, UITextViewDelegate {
     var onMic: (() -> Void)?
     /// After a chip's remove button.
     var onAttachmentsChange: (() -> Void)?
-    var isRunning = false { didSet { updateButton() } }
+    var isRunning = false { didSet { updateButton(); updateCollapsed() } }
     /// Files to send with the next message, shown as chips above the field.
     var attachments: [Attachment] = [] {
         didSet {
             renderChips()
             updateButton()
+            updateCollapsed()
             announceAdded(since: oldValue)
         }
     }
@@ -57,7 +70,10 @@ final class ComposerView: UIView, UITextViewDelegate {
     var canSend = true { didSet { updateButton() } }
     /// Shows "Editing message" above the field while a sent message is being edited.
     var isEditingMessage = false {
-        didSet { editBanner.isHidden = !isEditingMessage }
+        didSet {
+            editBanner.isHidden = !isEditingMessage
+            updateCollapsed()
+        }
     }
 
     var text: String {
@@ -174,23 +190,37 @@ final class ComposerView: UIView, UITextViewDelegate {
             chipStack.heightAnchor.constraint(equalTo: chipScroll.frameLayoutGuide.heightAnchor),
         ])
 
-        // The field gets the whole width; the controls sit in a row beneath it.
+        modeIconButton.showsMenuAsPrimaryAction = true
+        modeIconButton.isPointerInteractionEnabled = true
+        modeIconButton.isHidden = true
+        modeIconButton.configuration?.contentInsets = .zero
+        modeIconButton.configuration?.baseForegroundColor = .secondaryLabel
+        modeIconButton.configuration?.preferredSymbolConfigurationForImage = .init(textStyle: .body)
+        modeIconButton.setContentHuggingPriority(.required, for: .horizontal)
+        modeIconButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        // Expanded, the field gets the whole width and the controls sit in a row beneath it;
+        // collapsed, the field shares one row with the model's symbol, dictation and Stop.
+        fieldRow = UIStackView(arrangedSubviews: [modeIconButton, textView])
+        fieldRow.spacing = 8
+        fieldRow.alignment = .center
         let spacer = UIView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let controls = UIStackView(arrangedSubviews: [modeButton, attachButton, spacer, micButton, sendButton])
+        controls = UIStackView(arrangedSubviews: [modeButton, attachButton, spacer, micButton, sendButton])
         controls.spacing = 8
         controls.alignment = .center
         controls.setCustomSpacing(2, after: micButton)
         // At accessibility text sizes the mode button is a bare symbol and the others are small
         // for their text: touch and hold shows each one large, with its name.
         controls.addInteraction(UILargeContentViewerInteraction())
-        for button in [modeButton, attachButton, micButton, sendButton] {
+        fieldRow.addInteraction(UILargeContentViewerInteraction())
+        for button in [modeButton, modeIconButton, attachButton, micButton, sendButton] {
             button.showsLargeContentViewer = true
             button.scalesLargeContentImage = true
         }
         attachButton.largeContentTitle = "Attach"
-        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, textView, controls])
-        stack.setCustomSpacing(2, after: textView)
+        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, fieldRow, controls])
+        stack.setCustomSpacing(2, after: fieldRow)
         stack.setCustomSpacing(0, after: statusView)
         stack.axis = .vertical
         stack.spacing = 6
@@ -211,13 +241,15 @@ final class ComposerView: UIView, UITextViewDelegate {
             glass.contentView.addSubview(stack)
             addSubview(glass)
             glass.translatesAutoresizingMaskIntoConstraints = false
+            insets = (10, 8)
+            stackTop = stack.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: insets.top)
+            stackBottom = stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -insets.bottom)
             NSLayoutConstraint.activate([
                 glass.topAnchor.constraint(equalTo: topAnchor, constant: 4),
                 glass.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
                 glass.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor, constant: -pad),
                 glass.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor, constant: pad),
-                stack.topAnchor.constraint(equalTo: glass.contentView.topAnchor, constant: 10),
-                stack.bottomAnchor.constraint(equalTo: glass.contentView.bottomAnchor, constant: -8),
+                stackTop, stackBottom,
                 stack.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor),
                 stack.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor),
             ])
@@ -231,8 +263,11 @@ final class ComposerView: UIView, UITextViewDelegate {
                 blur.leadingAnchor.constraint(equalTo: leadingAnchor),
                 blur.trailingAnchor.constraint(equalTo: trailingAnchor),
                 blur.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 100),  // under the home indicator too
-                stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
-                stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            ])
+            stackTop = stack.topAnchor.constraint(equalTo: topAnchor, constant: insets.top)
+            stackBottom = stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -insets.bottom)
+            NSLayoutConstraint.activate([
+                stackTop, stackBottom,
                 stack.leadingAnchor.constraint(equalTo: columnGuide.leadingAnchor),
                 stack.trailingAnchor.constraint(equalTo: columnGuide.trailingAnchor),
             ])
@@ -242,13 +277,21 @@ final class ComposerView: UIView, UITextViewDelegate {
         NSLayoutConstraint.activate([
             heightConstraint,
             modeButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 32),
+            modeIconButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            modeIconButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
             placeholder.leadingAnchor.constraint(equalTo: textView.leadingAnchor, constant: usesGlass ? 0 : 15),
-            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: textView.trailingAnchor, constant: usesGlass ? 0 : -10),
+            // The visible width, not the trailing anchor: a text view's anchors are its content's
+            // edges, so in the collapsed row a long placeholder ran on under the mic.
+            placeholder.widthAnchor.constraint(lessThanOrEqualTo: textView.frameLayoutGuide.widthAnchor, constant: usesGlass ? 0 : -25),
             placeholder.topAnchor.constraint(equalTo: textView.topAnchor, constant: 9),
         ])
         placeholder.numberOfLines = 1
         updateButton()
         updateForTextSize()
+        updateCollapsed(animated: false)
+        for name in [UIResponder.keyboardWillShowNotification, UIResponder.keyboardWillHideNotification] {
+            NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillMove(_:)), name: name, object: nil)
+        }
         // Dynamic Type changes the line height, and so the six-line limit, the send glyph and
         // whether the mode button has room for its title.
         registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (self: Self, _) in
@@ -264,6 +307,9 @@ final class ComposerView: UIView, UITextViewDelegate {
     func setMode(title: String, symbol: String) {
         modeTitle = title
         modeButton.configuration?.image = UIImage(systemName: symbol)
+        modeIconButton.configuration?.image = UIImage(systemName: symbol)
+        modeIconButton.largeContentTitle = title
+        modeIconButton.largeContentImage = UIImage(systemName: symbol)
         modeButton.largeContentTitle = title
         modeButton.largeContentImage = UIImage(systemName: symbol)
         updateModeTitle()
@@ -286,12 +332,73 @@ final class ComposerView: UIView, UITextViewDelegate {
     }
 
     func textViewDidChange(_ textView: UITextView) { textDidChange(notify: true) }
+    func textViewDidBeginEditing(_ textView: UITextView) { updateCollapsed() }
+    func textViewDidEndEditing(_ textView: UITextView) { updateCollapsed() }
 
     private func textDidChange(notify: Bool) {
         placeholder.isHidden = !textView.text.isEmpty
         updateHeight()
         updateButton()
+        updateCollapsed()
         if notify { onTextChange?(textView.text) }
+    }
+
+    /// Copies the mode button's menu, state and VoiceOver text onto the collapsed row's symbol
+    /// button. The chat calls it after setting up `modeButton`.
+    func syncModeIcon() {
+        modeIconButton.menu = modeButton.menu
+        modeIconButton.isEnabled = modeButton.isEnabled
+        modeIconButton.accessibilityLabel = modeButton.accessibilityLabel
+        modeIconButton.accessibilityValue = modeButton.accessibilityValue
+    }
+
+    @objc private func keyboardWillMove(_ note: Notification) {
+        let info = note.userInfo ?? [:]
+        let duration = (info[UIResponder.keyboardAnimationDurationUserInfoKey] as? NSNumber)?.doubleValue ?? 0.25
+        let curve = (info[UIResponder.keyboardAnimationCurveUserInfoKey] as? NSNumber)
+            .flatMap { UIView.AnimationCurve(rawValue: $0.intValue) } ?? .easeInOut
+        keyboardAnimation = (duration, curve, Date())
+        updateCollapsed()
+    }
+
+    /// Collapsed while the field isn't focused and holds nothing: no text, no files, no edit.
+    private var wantsCollapsed: Bool {
+        !textView.isFirstResponder && textView.text.isEmpty && attachments.isEmpty && !isEditingMessage
+    }
+
+    /// Switches between the one-row and the full layout, moving with the keyboard when it's the
+    /// keyboard that caused it (its notification and the field's focus change arrive together).
+    private func updateCollapsed(animated: Bool = true) {
+        let collapse = wantsCollapsed
+        // Collapsed there's never anything to send, so its button is only ever Stop.
+        let sendHidden = collapse && !isRunning
+        if sendButton.isHidden != sendHidden, collapse == isCollapsed {
+            sendButton.isHidden = sendHidden
+        }
+        guard collapse != isCollapsed || !animated else { return }
+        isCollapsed = collapse
+        let apply = { [self] in
+            modeIconButton.isHidden = !collapse
+            controls.isHidden = collapse
+            // Dictation and Send/Stop move to whichever row is showing.
+            let row: UIStackView = collapse ? fieldRow : controls
+            row.addArrangedSubview(micButton)
+            row.addArrangedSubview(sendButton)
+            row.setCustomSpacing(2, after: micButton)
+            sendButton.isHidden = sendHidden
+            stackTop.constant = collapse ? 3 : insets.top
+            stackBottom.constant = -(collapse ? 3 : insets.bottom)
+        }
+        guard animated, window != nil, !UIAccessibility.isReduceMotionEnabled else {
+            apply()
+            return
+        }
+        let keyboard = keyboardAnimation.flatMap { Date().timeIntervalSince($0.at) < 0.3 ? $0 : nil }
+        let animator = UIViewPropertyAnimator(duration: keyboard?.duration ?? 0.25, curve: keyboard?.curve ?? .easeInOut) {
+            apply()
+            self.superview?.layoutIfNeeded()
+        }
+        animator.startAnimation()
     }
 
     private func updateHeight() {

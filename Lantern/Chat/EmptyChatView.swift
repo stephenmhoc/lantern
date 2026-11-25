@@ -8,6 +8,7 @@ struct EmptyChat: View {
     /// starters aren't shown, since tapping them would do nothing.
     var onStarter: ((String) -> Void)?
     @Environment(MacLink.self) private var mac
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         // Fits what it can: the keyboard or a short window (iPad split view) leaves little height.
@@ -26,11 +27,11 @@ struct EmptyChat: View {
         VStack(spacing: 24) {
             if header {
                 VStack(spacing: 10) {
-                    Image(systemName: conversation.mode == .mac ? "cloud.fill" : "flame.fill")
+                    Image(systemName: conversation.mode == .mac ? "desktopcomputer" : "flame.fill")
                         .font(.system(size: 30, weight: .medium))
                         .foregroundStyle(.tint)
                         .frame(width: 64, height: 64)
-                        .background(.tint.opacity(0.12), in: .circle)
+                        .background(.tint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: .circle)
                         .accessibilityHidden(true)
                     Text("Ask anything").font(.title2.bold())
                     Text(message)

@@ -15,7 +15,7 @@ nonisolated enum ModelImport {
         var errorDescription: String? {
             switch self {
             case .notGGUF(let name): "“\(name)” isn't a GGUF model file."
-            case .unknown(let name): "“\(name)” isn't one of the models Lantern runs. Use one of the files listed in Readiness."
+            case .unknown(let name): "“\(name)” isn't one of the models Lantern runs. Use one of the files listed in Models."
             case .wrongSize(let name, let model, let size):
                 "“\(name)” is \(Self.format(size)), but \(model.name) is \(Self.format(model.bytes)). It may not have finished copying."
             case .noSpace(let needed): "Needs \(Self.format(needed)) free."

@@ -4,7 +4,8 @@ import UIKit
 /// while the model works and brightens as text arrives. With Reduce Motion it holds still and only
 /// its brightness changes.
 final class GlowView: UIView {
-    static let amber = UIColor(red: 1.0, green: 0.66, blue: 0.22, alpha: 1)
+    /// The asset catalog's AccentColor: dynamic, with its own Increase Contrast shades.
+    static let amber = UIColor(named: "AccentColor") ?? UIColor(red: 0.949, green: 0.588, blue: 0.161, alpha: 1)
 
     private let container = CALayer()  // scaled by intensity
     private let halo = CAGradientLayer()  // breathes inside it
@@ -21,12 +22,13 @@ final class GlowView: UIView {
         isUserInteractionEnabled = false
         isAccessibilityElement = false
         halo.type = .radial
-        halo.colors = [Self.amber.withAlphaComponent(0.9).cgColor, Self.amber.withAlphaComponent(0.35).cgColor,
-                       Self.amber.withAlphaComponent(0).cgColor]
         halo.locations = [0, 0.45, 1]
         halo.startPoint = CGPoint(x: 0.5, y: 0.5)
         halo.endPoint = CGPoint(x: 1, y: 1)
-        core.backgroundColor = Self.amber.cgColor
+        applyColors()
+        registerForTraitChanges([UITraitUserInterfaceStyle.self, UITraitAccessibilityContrast.self]) { (self: Self, _) in
+            self.applyColors()
+        }
         container.addSublayer(halo)
         layer.addSublayer(container)
         layer.addSublayer(core)
@@ -37,6 +39,19 @@ final class GlowView: UIView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Layers take CGColors, which don't follow the appearance: resolve them for the current traits.
+    /// In dark mode the halo is a little stronger, or it fades into the black.
+    private func applyColors() {
+        let amber = Self.amber.resolvedColor(with: traitCollection)
+        let dark = traitCollection.userInterfaceStyle == .dark
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        halo.colors = [amber.withAlphaComponent(dark ? 1 : 0.9).cgColor, amber.withAlphaComponent(dark ? 0.45 : 0.35).cgColor,
+                       amber.withAlphaComponent(0).cgColor]
+        core.backgroundColor = amber.cgColor
+        CATransaction.commit()
+    }
 
     override var intrinsicContentSize: CGSize { CGSize(width: 22, height: 22) }
 

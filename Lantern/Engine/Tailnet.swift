@@ -42,6 +42,12 @@ final class Tailnet {
     }
     /// Other devices on the tailnet, by MagicDNS name, for picking the Mac.
     private(set) var peers: [String] = []
+    /// The peers the tailnet says are online now: the ones worth probing for Ollama.
+    private(set) var onlinePeers: Set<String> = []
+    /// Who the node is signed in as (the tailnet's login name), once connected.
+    private(set) var account: String?
+    /// The tailnet's MagicDNS suffix ("tail7b6e2.ts.net"), for completing a typed short name.
+    private(set) var magicDNSSuffix: String?
     /// Requests through the node, once it's connected.
     private(set) var session: URLSession?
 
@@ -120,6 +126,8 @@ final class Tailnet {
         client = nil
         session = nil
         peers = []
+        onlinePeers = []
+        account = nil
     }
 
     fileprivate func handle(_ notify: Ipn.Notify) {
@@ -131,10 +139,13 @@ final class Tailnet {
 
     func refreshPeers() async {
         guard let status = try? await client?.backendStatus() else { return }
-        peers = (status.Peer ?? [:]).values
-            .map { $0.DNSName.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
-            .filter { !$0.isEmpty }
-            .sorted()
+        let all = (status.Peer ?? [:]).values
+        func name(_ peer: IpnState.PeerStatus) -> String { peer.DNSName.trimmingCharacters(in: CharacterSet(charactersIn: ".")) }
+        peers = all.map(name).filter { !$0.isEmpty }.sorted()
+        onlinePeers = Set(all.filter(\.Online).map(name).filter { !$0.isEmpty })
+        account = status.User?.values.first(where: { !$0.isTaggedDevice })?.LoginName ?? status.CurrentTailnet?.Name
+        let suffix = status.CurrentTailnet?.MagicDNSSuffix ?? ""
+        magicDNSSuffix = suffix.isEmpty ? nil : suffix
     }
     #else
     private func start() async {}

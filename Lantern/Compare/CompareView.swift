@@ -145,7 +145,7 @@ struct CompareView: View {
         }
         #endif
         }
-        .safeAreaInset(edge: .bottom) {
+        .modifier(BottomBar {
             if pair.canAct, answer.index != nil {
                 HStack(spacing: 10) {
                     preferButton(answer, letter: letter)
@@ -154,9 +154,8 @@ struct CompareView: View {
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 10)
-                .background(.bar)
             }
-        }
+        })
     }
 
     // MARK: - Pieces
@@ -233,7 +232,7 @@ struct CompareView: View {
                   systemImage: answer.isPreferred ? "hand.thumbsup.fill" : "hand.thumbsup")
         }
         .buttonStyle(.bordered)
-        .tint(answer.isPreferred ? .primary : .secondary)
+        .tint(.primary)  // .secondary read as disabled
         .controlSize(.regular)
         .accessibilityLabel("Prefer \(letter)")
         .accessibilityValue(answer.isPreferred ? "Selected" : "")
@@ -247,8 +246,7 @@ struct CompareView: View {
             dismiss()
         } label: {
             Label("Continue With \(letter)", systemImage: "arrow.turn.down.right")
-                // Dark on the amber fill: white on it is about 2.3:1.
-                .foregroundStyle(.black)
+                .modifier(ProminentLabel())
         }
         .buttonStyle(.borderedProminent)
         .controlSize(.regular)

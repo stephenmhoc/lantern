@@ -49,7 +49,9 @@ struct ChatInspector: View {
                 if conversation.mode == .mac {
                     LabeledContent("Connected by", value: mac.route.label)
                 }
-                LabeledContent("Thinking", value: conversation.thinking.rawValue.capitalized)
+                if conversation.mode != .apple {  // Apple Intelligence's model doesn't think
+                    LabeledContent("Thinking", value: conversation.thinking.rawValue.capitalized)
+                }
             }
 
             Section {
@@ -73,7 +75,7 @@ struct ChatInspector: View {
             }
 
             Section("This device") {
-                if conversation.mode.isOnDevice, let free = MemoryStats.availableBytes {
+                if conversation.mode.usesLlama, let free = MemoryStats.availableBytes {
                     LabeledContent("Memory free", value: MemoryStats.gb(free))
                 }
                 LabeledContent("Battery", value: Power.isCharging ? "\(Power.batteryText), charging" : Power.batteryText)
@@ -96,7 +98,10 @@ struct ChatInspector: View {
         case .mac:
             let name = conversation.resolvedMacModel
             return name.isEmpty ? "Ollama's first model" : "\(MacLink.displayName(name)) (\(name))"
-        case .fast, .smart:
+        case .apple:
+            let status = engine.apple.status
+            return status.isAvailable ? Mode.apple.title : "\(Mode.apple.title) (\(status.short.lowercased()))"
+        case .fast, .smart, .qwen:
             guard let model = engine.model(for: conversation.mode) else { return "None" }
             return engine.store.states[model.id] == .ready ? model.name : "\(model.name) (not on this device)"
         }

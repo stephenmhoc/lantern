@@ -17,10 +17,24 @@ import UIKit
 /// - `-ui compare` (or `compare:b`): adds a chat whose last reply is a comparison (Gemma 4 E2B on
 ///   this device against Inkling 2 Mini on the Mac, with sample metrics), opens it and shows the
 ///   compare sheet on A (or B). Add `:metrics` (`compare:b:metrics`) to scroll to the table.
+///   `compare:chat` opens the chat only, for the answer's ‹ 1/2 › pager.
+/// - `-ui composer:focus|composer:text`: the message box expanded, focused or holding a draft.
+/// - `-ui modelmenu|modelmenu:collapsed`: the model menu open, from the expanded or collapsed box.
 /// - `-intent ask:<text>|new:<mode>|open:<chat title>`: runs that App Intent's `perform()`.
 /// - `-spotlightQuery <text>`: searches Lantern's own Spotlight items after indexing and prints them.
 enum DebugLaunch {
     static var arguments: [String] { ProcessInfo.processInfo.arguments }
+
+    /// Opens a menu button's menu as a tap would. UIKit has no public call for it, so this uses
+    /// the context menu interaction's private one: Debug builds only, for screenshots.
+    static func presentMenu(of button: UIButton) {
+        guard let interaction = button.contextMenuInteraction else { return }
+        let selector = NSSelectorFromString("_presentMenuAtLocation:")
+        guard interaction.responds(to: selector), let method = class_getInstanceMethod(type(of: interaction), selector) else { return }
+        typealias Present = @convention(c) (AnyObject, Selector, CGPoint) -> Void
+        let present = unsafeBitCast(method_getImplementation(method), to: Present.self)
+        present(interaction, selector, CGPoint(x: button.bounds.midX, y: button.bounds.midY))
+    }
 
     static var ui: String? {
         guard let i = arguments.firstIndex(of: "-ui"), arguments.indices.contains(i + 1) else { return nil }
@@ -44,8 +58,11 @@ enum DebugLaunch {
             ("Packing list for a weekend hike", -1.2 * day, .fast, false),
             ("Rewrite this email more politely", -3 * day, .mac, false),
             ("What is a Fourier transform?", -20 * day, .smart, false),
+            ("Plan a vegetable bed rotation", -2 * day, .qwen, false),
+            ("Ideas for a rainy afternoon", -5 * day, .apple, false),
         ]
         for (title, age, mode, pinned) in samples {
+            let model = mode == .mac ? "Inkling 2 Mini on your Mac" : mode.title
             let c = Conversation(mode: mode)
             c.title = title
             c.lastActive = Date(timeIntervalSinceNow: age)
@@ -54,7 +71,7 @@ enum DebugLaunch {
             c.messages = [
                 StoredMessage(isUser: true, content: title + "?"),
                 StoredMessage(isUser: false, content: "Here's a short answer about \(title.lowercased()).",
-                              footnote: "Gemma 4 E2B · 14.2 tok/s · 0.8 s to first token"),
+                              footnote: "\(model) · 14.2 tok/s · 0.8 s to first token"),
             ]
             context.insert(c)
         }

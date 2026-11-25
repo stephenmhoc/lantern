@@ -175,10 +175,30 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
         #if DEBUG
         // -ui compare (or compare:b, with :metrics to scroll to the table): the seeded comparison, once the chat has settled.
-        if let ui = DebugLaunch.ui, ui.hasPrefix("compare"), let reply = conversation.messages.last, reply.comparison != nil {
+        // -ui compare:chat: the seeded comparison's chat, without opening the sheet.
+        if let ui = DebugLaunch.ui, ui.hasPrefix("compare"), ui != "compare:chat",
+           let reply = conversation.messages.last, reply.comparison != nil {
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(1))
                 self?.showComparison(reply.id, startOnB: ui.hasPrefix("compare:b"))
+            }
+        }
+        // -ui composer:focus|composer:text|modelmenu|modelmenu:collapsed: the message box expanded
+        // (focused, or holding a draft without the keyboard) or the model menu open.
+        if let ui = DebugLaunch.ui, ui.hasPrefix("composer") || ui.hasPrefix("modelmenu") {
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(1))
+                guard let self else { return }
+                switch ui {
+                case "composer:focus": composer.textView.becomeFirstResponder()
+                case "composer:text": composer.text = "What should I plant next to tomatoes?"
+                case "modelmenu":
+                    composer.text = " "
+                    try? await Task.sleep(for: .milliseconds(500))
+                    DebugLaunch.presentMenu(of: composer.modeButton)
+                case "modelmenu:collapsed": DebugLaunch.presentMenu(of: composer.modeIconButton)
+                default: break
+                }
             }
         }
         #endif
@@ -330,7 +350,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     }
 
     private func modelName(for mode: Mode) -> String? {
-        mode == .mac ? conversation.modelTitle : engine.model(for: mode)?.name
+        mode == .mac ? conversation.modelTitle : mode == .apple ? mode.title : engine.model(for: mode)?.name
     }
 
     private func reconfigureVisibleAnswers() {
@@ -441,10 +461,12 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     private func isAvailable(_ mode: Mode) -> Bool {
         guard mode.isOnDevice else { return true }  // the Mac may come back; it's badged, not disabled
+        if mode == .apple { return engine.apple.status.isAvailable }
         return engine.model(for: mode).map { engine.store.states[$0.id] == .ready } ?? false
     }
 
-    /// One entry per model: the Gemmas on this device, then each of Ollama's models on the Mac.
+    /// One entry per model: the Gemmas, Qwen and Apple Intelligence on this device, then each of
+    /// Ollama's models on the Mac.
     private var choices: (device: [ModelChoice], mac: [ModelChoice]) {
         let device = Mode.allCases.filter(\.isOnDevice).map { ModelChoice(mode: $0, macModel: nil) }
         var names = engine.mac.models
@@ -465,7 +487,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         let title = conversation.modelTitle
         composer.setMode(title: title, symbol: mode.symbol)
         composer.modeButton.accessibilityLabel = "Model"
-        composer.modeButton.accessibilityValue = "\(title), \(mode.isOnDevice ? "on this device" : "on your Mac"), thinking \(conversation.thinking.rawValue)"
+        composer.modeButton.accessibilityValue = mode == .apple ? "\(title), on this device"
+            : "\(title), \(mode.isOnDevice ? "on this device" : "on your \(engine.mac.computerName)"), thinking \(conversation.thinking.rawValue)"
         composer.modeButton.isEnabled = live == nil
 
         let unreachable = engine.mac.route == .unreachable
@@ -486,7 +509,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             UIMenu(title: "On this device", options: .displayInline, children: deviceItems),
             UIMenu(title: availability(.mac), options: .displayInline, children: macItems),
         ]
-        if let open = onOpenReadiness, Mode.allCases.contains(where: { !isAvailable($0) }) {
+        // Only for what can be downloaded: Apple Intelligence's model comes with the system.
+        if let open = onOpenReadiness, Mode.allCases.contains(where: { $0.usesLlama && !isAvailable($0) }) {
             sections.append(UIAction(title: "Get Models…", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
         }
         let thinking = Thinking.allCases.map { t in
@@ -495,19 +519,28 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                 refresh()
             }
         }
-        sections.append(UIMenu(
-            title: "Thinking", subtitle: conversation.thinking.rawValue.capitalized,
-            image: UIImage(systemName: "lightbulb"), children: thinking))
+        // Apple Intelligence's model doesn't think before answering: no choice to offer.
+        if mode != .apple {
+            sections.append(UIMenu(
+                title: "Thinking", subtitle: conversation.thinking.rawValue.capitalized,
+                image: UIImage(systemName: "lightbulb"), children: thinking))
+        }
         composer.modeButton.menu = UIMenu(children: sections)
+        composer.syncModeIcon()
     }
 
     private func availability(_ mode: Mode) -> String {
         if mode == .mac {
+            let name = engine.mac.computerName
             return switch engine.mac.route {
-            case .unknown, .checking: "On your Mac"
-            case .unreachable: "On your Mac · can't reach it now"
-            default: "On your Mac · \(engine.mac.route.label)"
+            case .unknown, .checking: "On Your \(name)"
+            case .unreachable: "On Your \(name) · Not reachable"
+            default: "On Your \(name) · \(engine.mac.route.label)"
             }
+        }
+        if mode == .apple {
+            let status = engine.apple.status
+            return status.isAvailable ? "Built into this device" : status.short
         }
         guard let model = engine.model(for: mode) else { return "" }
         return engine.store.states[model.id] == .ready ? "On this device" : "Not on this device"
@@ -531,6 +564,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         guard !engine.isBusy else { return false }
         let mode = conversation.mode
         if mode == .mac { return engine.mac.route.host == nil }
+        if mode == .apple { return false }  // `prepare` already warmed it when the chat opened
         return engine.loadedModel == nil || engine.loadedModel != engine.model(for: mode)
     }
 
@@ -581,14 +615,14 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             let current = conversation.mode
             let (device, mac) = choices
             let others = (device + mac).filter { !isCurrent($0) }.map { c in
-                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On your Mac",
+                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On Your \(engine.mac.computerName)",
                          image: UIImage(systemName: c.mode.symbol),
                          attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in retry(c.mode, macModel: c.macModel) }
             }
             // A second answer from another model, kept beside this one (see CompareView).
             let own = answeredBy(m)
             let rivals = (device + mac).filter { !isSame($0, own) }.map { c in
-                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On your Mac",
+                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On Your \(engine.mac.computerName)",
                          image: UIImage(systemName: c.mode.symbol),
                          attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in compare(with: c) }
             }
@@ -650,7 +684,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         switch kind {
         case .notDownloaded:
             if let open = onOpenReadiness {
-                actions.append(UIAction(title: "Open Readiness", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
+                actions.append(UIAction(title: "Open Models", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
             }
         case .macUnreachable, .macNoModel, .macFailed:
             actions.append(UIAction(title: "Check the Mac", image: UIImage(systemName: "desktopcomputer")) {
@@ -746,11 +780,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         if collectionView.contentOffset == before, collectionView.cellForItem(at: path) != nil,
            !collectionView.isDragging { DispatchQueue.main.async { [weak self] in self?.focusJumpTarget() } }
         // The match is in another answer to that question, which isn't switched to (that would
-        // change the history sent next): say where it is.
+        // change the history sent next): tell VoiceOver where it is. Nothing pops up on screen.
         if let version = target.version, let m = message(target.message) {
             let (list, current) = m.allVersions
             if version != current, list.indices.contains(version) {
-                showToast("Match is in answer \(version + 1) of \(list.count)")
+                UIAccessibility.post(notification: .announcement, argument: "Match is in answer \(version + 1) of \(list.count)")
             }
         }
     }
@@ -765,33 +799,6 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
               let cell = collectionView.cellForItem(at: path) else { return }
         jumpFocus = nil
         UIAccessibility.post(notification: .layoutChanged, argument: cell)
-    }
-
-    /// A short note over the transcript that fades on its own; VoiceOver reads it too.
-    private func showToast(_ text: String) {
-        let label = PaddedLabel()
-        label.text = text
-        label.font = .preferredFont(forTextStyle: .footnote)
-        label.adjustsFontForContentSizeCategory = true
-        label.textColor = .label
-        label.numberOfLines = 0
-        label.textAlignment = .center
-        label.backgroundColor = .secondarySystemBackground
-        label.layer.cornerRadius = 12
-        label.layer.cornerCurve = .continuous
-        label.clipsToBounds = true
-        label.isAccessibilityElement = false  // announced below instead
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.alpha = 0
-        view.addSubview(label)
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            label.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            label.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -32),
-        ])
-        UIView.animate(withDuration: 0.2) { label.alpha = 1 }
-        UIView.animate(withDuration: 0.4, delay: 2.5, options: []) { label.alpha = 0 } completion: { _ in label.removeFromSuperview() }
-        UIAccessibility.post(notification: .announcement, argument: text)
     }
 
     /// On iPad the tapped chat may already be on screen: take a target set while it's showing.
@@ -876,7 +883,8 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
         let mode = conversation.mode
         let seesImages = engine.canSeeImages(mode)
         var photoNote: String?
-        if !seesImages { photoNote = "Needs Image reading for \(mode.title)" }
+        let projector = engine.model(for: mode)?.projector
+        if !seesImages { photoNote = projector == nil ? "\(mode.title) can't see images" : "Needs Image reading for \(mode.title)" }
         var items: [UIMenuElement] = [
             UIAction(title: "Choose File…", subtitle: "Text or PDF", image: UIImage(systemName: "doc")) { [unowned self] _ in
                 chooseFile()
@@ -884,7 +892,7 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
             UIAction(title: "Choose Photo…", subtitle: photoNote, image: UIImage(systemName: "photo"),
                      attributes: seesImages ? [] : .disabled) { [unowned self] _ in choosePhoto() },
         ]
-        if mode.isOnDevice, !seesImages, let open = onOpenReadiness {
+        if mode.isOnDevice, !seesImages, projector != nil, let open = onOpenReadiness {
             items.append(UIAction(title: "Get Image Reading…", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
         }
         composer.attachButton.menu = UIMenu(children: items)
@@ -973,7 +981,9 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
         let mode = conversation.mode
         let seen = engine.canSeeImages(mode) ? new : new.filter { !$0.isImage }
         if seen.count < new.count {
-            showProblem("\(mode.title) needs Image reading, in Settings > Readiness, to see photos.")
+            showProblem(engine.model(for: mode)?.projector == nil
+                        ? "\(mode.title) can't see photos. Gemma 4 E2B and E4B can, with Image reading."
+                        : "\(mode.title) needs Image reading, in Settings > Models, to see photos.")
         }
         guard !seen.isEmpty else { return }
         let limit = engine.contextLimit(for: mode)
@@ -1185,6 +1195,7 @@ private struct BusyBanner: View {
 
     private var text: String? {
         if let model = engine.testing { return "Testing \(model.name). Chats can send when it's done." }
+        if engine.testingApple { return "Testing \(Mode.apple.title). Chats can send when it's done." }
         guard let running = engine.running, running != conversation.persistentModelID else { return nil }
         if let other: Conversation = context.registeredModel(for: running) {
             return "“\(other.title)” is answering. This chat can send when it's done."
@@ -1214,17 +1225,5 @@ private struct ChatControllerView: UIViewControllerRepresentable {
 
     func updateUIViewController(_ controller: ChatViewController, context: Context) {
         controller.refresh()
-    }
-}
-
-/// A label with room around its text, for `showToast`.
-private final class PaddedLabel: UILabel {
-    private let insets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
-
-    override func drawText(in rect: CGRect) { super.drawText(in: rect.inset(by: insets)) }
-
-    override func textRect(forBounds bounds: CGRect, limitedToNumberOfLines n: Int) -> CGRect {
-        let rect = super.textRect(forBounds: bounds.inset(by: insets), limitedToNumberOfLines: n)
-        return rect.inset(by: UIEdgeInsets(top: -insets.top, left: -insets.left, bottom: -insets.bottom, right: -insets.right))
     }
 }

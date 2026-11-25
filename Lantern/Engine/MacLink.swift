@@ -21,7 +21,7 @@ final class MacLink {
             case .checking: "Checking…"
             case .lan: "Home network"
             case .tailnet(_, let app): app ? "Tailnet (Tailscale app)" : "Tailnet"
-            case .unreachable: "Can't reach the Mac"
+            case .unreachable: "Not reachable"
             }
         }
 
@@ -83,7 +83,7 @@ final class MacLink {
         return words.joined(separator: " ")
     }
 
-    // Settings, edited with @AppStorage in SettingsView.
+    // Settings, edited with @AppStorage in ComputersView (Settings › On Your Computers).
     /// `modelKey`: the model a new Mac chat uses, the one last picked.
     nonisolated static let lanKey = "mac.lan", tailnetKey = "mac.tailnet", modelKey = "mac.model"
     /// The models Ollama listed last time, so the picker has them before the Mac is checked.
@@ -108,6 +108,8 @@ final class MacLink {
     private(set) var route: Route = .unknown
     /// Ollama's models, from the last check (or the one before, until the Mac answers).
     private(set) var models: [String] = UserDefaults.standard.stringArray(forKey: "mac.knownModels") ?? []
+    /// Each model's size on the Mac's disk, from the last check that answered.
+    private(set) var modelSizes: [String: Int64] = [:]
 
     private var defaults: UserDefaults { .standard }
     var modelName: String { defaults.string(forKey: Self.modelKey) ?? "" }
@@ -127,6 +129,10 @@ final class MacLink {
     @ObservationIgnored private var resolving: Task<Route, Never>?
     @ObservationIgnored private var lastWarm: [String: Date] = [:]
     @ObservationIgnored private var warming: Set<String> = []
+    /// What `/api/show` says each model can do ("vision", "thinking"…), once asked.
+    @ObservationIgnored fileprivate var capabilityCache: [String: Set<String>] = [:]
+    /// Bumped when the computer's addresses change, so a check begun before doesn't land after.
+    @ObservationIgnored fileprivate var configuration = 0
 
     init() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -134,6 +140,9 @@ final class MacLink {
             Task { @MainActor in self?.networkChanged(summary) }
         }
         pathMonitor.start(queue: DispatchQueue(label: "Lantern.MacLink.path"))
+        #if DEBUG
+        ComputersDebug.presentIfAsked(self)  // `-ui computers|addcomputer`
+        #endif
     }
 
     private func networkChanged(_ path: (status: NWPath.Status, interfaces: [NWInterface.InterfaceType])) {
@@ -173,13 +182,15 @@ final class MacLink {
     private func performResolve() async -> Route {
         if route.host == nil { route = .checking }
         routeIsStale = false
+        let generation = configuration
         let lan = Self.normalized(defaults.string(forKey: Self.lanKey) ?? Self.defaultLAN)
         let tail = Self.normalized(defaults.string(forKey: Self.tailnetKey) ?? Self.defaultTailnet)
         let tailnet = tailnet
         var tailViaApp = false
-        enum Probe { case lan([String]?), tail([String]?, viaApp: Bool), graceOver }
-        let (l, t): ([String]?, [String]?) = await withTaskGroup(of: Probe.self) { group in
-            group.addTask { .lan(await Self.tags(lan)) }
+        typealias Listing = [OllamaModel]
+        enum Probe { case lan(Listing?), tail(Listing?, viaApp: Bool), graceOver }
+        let (l, t): (Listing?, Listing?) = await withTaskGroup(of: Probe.self) { group in
+            group.addTask { .lan(await Self.listing(lan)) }
             group.addTask {
                 // Lantern's own tailnet node starts at launch: give it a moment rather than probing
                 // without it. Only this probe waits, so the home network (which works with the
@@ -190,12 +201,12 @@ final class MacLink {
                 // Lantern's node and the Tailscale app's VPN up, the first to answer wins: the VPN
                 // stays connected while Lantern is in the background, the node starts over.
                 guard let node = await tailnet.session else {
-                    return .tail(await Self.tags(tail, timeout: 6), viaApp: true)
+                    return .tail(await Self.listing(tail, timeout: 6), viaApp: true)
                 }
-                return await withTaskGroup(of: ([String]?, Bool).self) { race in
-                    race.addTask { (await Self.tags(tail, session: node, timeout: 6), false) }
-                    race.addTask { (await Self.tags(tail, timeout: 6), true) }
-                    var last: ([String]?, Bool) = (nil, false)
+                return await withTaskGroup(of: (Listing?, Bool).self) { race in
+                    race.addTask { (await Self.listing(tail, session: node, timeout: 6), false) }
+                    race.addTask { (await Self.listing(tail, timeout: 6), true) }
+                    var last: (Listing?, Bool) = (nil, false)
                     for await result in race {
                         last = result
                         if result.0 != nil { race.cancelAll(); break }
@@ -204,7 +215,7 @@ final class MacLink {
                 }
             }
             // Outer nil: not back yet. Inner nil: no answer.
-            var l: [String]??, t: [String]??
+            var l: Listing??, t: Listing??
             var viaApp = false
             var graceStarted = false
             while let probe = await group.next() {
@@ -228,15 +239,21 @@ final class MacLink {
             tailViaApp = viaApp
             return (l ?? nil, t ?? nil)
         }
+        // The addresses changed while this check was out: the check that follows has the say.
+        guard generation == configuration else { return route }
+        var listing: Listing = []
         if let lan, let l {
             route = .lan(lan)
-            models = l
+            listing = l
         } else if let tail, let t {
             route = .tailnet(tail, viaApp: tailViaApp)
-            models = t
+            listing = t
         } else {
             route = .unreachable
-            models = []
+        }
+        models = listing.map(\.name)
+        if !listing.isEmpty {
+            modelSizes = Dictionary(listing.map { ($0.name, $0.size ?? 0) }, uniquingKeysWith: { a, _ in a })
         }
         if !models.isEmpty { defaults.set(models, forKey: Self.knownModelsKey) }
         if !models.isEmpty, !models.contains(modelName) {
@@ -256,13 +273,18 @@ final class MacLink {
 
     /// The model names Ollama has, or nil if the host doesn't answer.
     static func tags(_ host: String?, session: URLSession = .shared, timeout: TimeInterval = 2.5) async -> [String]? {
+        await listing(host, session: session, timeout: timeout)?.map(\.name)
+    }
+
+    /// The models Ollama has, with their sizes (`/api/tags`), or nil if the host doesn't answer.
+    static func listing(_ host: String?, session: URLSession = .shared, timeout: TimeInterval = 2.5) async -> [OllamaModel]? {
         guard let host, let url = URL(string: "http://\(host)/api/tags") else { return nil }
         var request = URLRequest(url: url, timeoutInterval: timeout)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let list = try? JSONDecoder().decode(TagList.self, from: data) else { return nil }
-        return list.models.map(\.name)
+        return list.models
     }
 
     /// Stops when the reading task is cancelled. A route that has gone stale (left home, Wi-Fi
@@ -348,7 +370,7 @@ final class MacLink {
     }
 
     /// Where requests go on the current route: through Lantern's tailnet node when that's the route.
-    private var session: URLSession {
+    fileprivate var session: URLSession {
         if case .tailnet(_, viaApp: false) = route { return tailnet.session ?? .shared }
         return .shared
     }
@@ -413,12 +435,15 @@ final class MacLink {
         }
     }
 
-    private struct TagList: Decodable {
-        struct Model: Decodable { let name: String }
-        let models: [Model]
+    /// One of Ollama's models, from `/api/tags`.
+    nonisolated struct OllamaModel: Decodable, Hashable, Sendable {
+        let name: String
+        let size: Int64?
     }
 
-    private struct ChatRequest: Encodable {
+    private struct TagList: Decodable { let models: [OllamaModel] }
+
+    fileprivate struct ChatRequest: Encodable {
         struct Message: Encodable { let role: String; let content: String; let images: [String]? }
         struct Options: Encodable { let num_ctx: Int }
         let model: String
@@ -429,9 +454,9 @@ final class MacLink {
         let keep_alive: Int?  // left out when nil: the server's OLLAMA_KEEP_ALIVE applies
     }
 
-    private struct ShowResponse: Decodable { let capabilities: [String]? }
+    fileprivate struct ShowResponse: Decodable { let capabilities: [String]? }
 
-    private struct ChatChunk: Decodable {
+    fileprivate struct ChatChunk: Decodable {
         struct Message: Decodable { let content: String?; let thinking: String? }
         let message: Message?
         let done: Bool?
@@ -442,6 +467,224 @@ final class MacLink {
         let prompt_eval_duration: Int64?
         let eval_count: Int?
         let eval_duration: Int64?
+    }
+}
+
+// MARK: - The computer
+
+/// The computer Ollama runs on, as Settings' "On Your Computers" shows it. One computer for now:
+/// its two addresses (`lanKey`, `tailnetKey`), the model new chats use (`modelKey`) and its name
+/// (`computerNameKey`).
+extension MacLink {
+    /// The name the computer was added with ("Mac Studio"); without one it comes from the host.
+    nonisolated static let computerNameKey = "mac.name"
+
+    static var lanHost: String { UserDefaults.standard.string(forKey: lanKey) ?? defaultLAN }
+    static var tailnetHost: String { UserDefaults.standard.string(forKey: tailnetKey) ?? defaultTailnet }
+    /// Whether there is a computer at all: "Remove Computer" leaves both addresses empty.
+    static var isConfigured: Bool { normalized(lanHost) != nil || normalized(tailnetHost) != nil }
+
+    /// "Mac Studio": the stored name, else one from the home-network or tailnet host.
+    static var computerName: String {
+        computerName(stored: UserDefaults.standard.string(forKey: computerNameKey), lan: lanHost, tailnet: tailnetHost)
+    }
+    var computerName: String { Self.computerName }
+
+    nonisolated static func computerName(stored: String?, lan: String, tailnet: String) -> String {
+        if let stored = stored?.trimmingCharacters(in: .whitespaces), !stored.isEmpty { return stored }
+        return derivedName(fromHost: lan) ?? derivedName(fromHost: tailnet) ?? "Computer"
+    }
+
+    /// "Stephens-Mac-Studio.local" → "Mac Studio", "stephens-mac-studio.tail7b6e2.ts.net:11434" →
+    /// "Mac Studio", "devbox" → "Devbox". Nil for an IP address or nothing.
+    nonisolated static func derivedName(fromHost host: String) -> String? {
+        let label = shortName(host)
+        guard !label.isEmpty, !label.allSatisfy({ $0.isNumber || $0 == "." || $0 == ":" }) else { return nil }
+        return prettyName(label)
+    }
+
+    /// "Stephen’s Mac Studio" or "Stephens-Mac-Studio" → "Mac Studio": the owner's name in front
+    /// goes, from the product on stays. Anything else is just capitalized.
+    nonisolated static func prettyName(_ raw: String) -> String {
+        var words = raw.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == " " }).map(String.init)
+        let products = ["mac", "macbook", "imac", "macmini", "macpro"]
+        if let i = words.firstIndex(where: { products.contains($0.lowercased()) }), i > 0 {
+            words.removeFirst(i)
+        } else if let i = words.firstIndex(where: { $0.hasSuffix("’s") || $0.hasSuffix("'s") }), i < words.count - 1 {
+            words.removeFirst(i + 1)
+        }
+        let spelled = ["mac": "Mac", "macbook": "MacBook", "imac": "iMac", "macmini": "Mac mini", "macpro": "Mac Pro", "mini": "mini"]
+        return words.map { spelled[$0.lowercased()] ?? $0.prefix(1).uppercased() + $0.dropFirst() }.joined(separator: " ")
+    }
+
+    /// A host's first label, without scheme or port: "stephens-mac-studio.tail7b6e2.ts.net:11434"
+    /// → "stephens-mac-studio". An IP address stays whole.
+    nonisolated static func shortName(_ host: String) -> String {
+        var h = host.trimmingCharacters(in: .whitespaces)
+        if let r = h.range(of: "://") { h = String(h[r.upperBound...]) }
+        if h.hasPrefix("[") { return h }  // IPv6
+        if h.filter({ $0 == ":" }).count == 1, let colon = h.firstIndex(of: ":") { h = String(h[..<colon]) }
+        if h.allSatisfy({ $0.isNumber || $0 == "." }) { return h }
+        return h.split(separator: ".").first.map(String.init) ?? h
+    }
+
+    /// The same computer's names, compared: "Stephen’s Mac Studio" (its Bonjour name),
+    /// "Stephens-Mac-Studio.local" and "stephens-mac-studio.tail….ts.net" all give "stephens-mac-studio".
+    nonisolated static func slug(_ name: String) -> String {
+        let base = name.contains(" ") ? name : shortName(name)
+        return base.lowercased()
+            .replacingOccurrences(of: "’", with: "").replacingOccurrences(of: "'", with: "")
+            .split(whereSeparator: { $0 == " " || $0 == "_" || $0 == "-" }).joined(separator: "-")
+    }
+
+    /// Whether a host is on the tailnet (a MagicDNS name or a 100.64/10 address).
+    nonisolated static func isTailnetHost(_ host: String) -> Bool {
+        var h = host.trimmingCharacters(in: .whitespaces).lowercased()
+        if let r = h.range(of: "://") { h = String(h[r.upperBound...]) }
+        if h.filter({ $0 == ":" }).count == 1, let colon = h.firstIndex(of: ":") { h = String(h[..<colon]) }
+        if h.hasSuffix(".ts.net") { return true }
+        let parts = h.split(separator: ".").compactMap { Int($0) }
+        return parts.count == 4 && parts[0] == 100 && (64...127).contains(parts[1])
+    }
+
+    /// Saves the computer's addresses and name; the route is checked again before it's next used.
+    func configure(name: String?, lan: String, tailnet: String) {
+        defaults.set(lan.trimmingCharacters(in: .whitespaces), forKey: Self.lanKey)
+        defaults.set(tailnet.trimmingCharacters(in: .whitespaces), forKey: Self.tailnetKey)
+        if let name, !name.trimmingCharacters(in: .whitespaces).isEmpty {
+            defaults.set(name.trimmingCharacters(in: .whitespaces), forKey: Self.computerNameKey)
+        } else {
+            defaults.removeObject(forKey: Self.computerNameKey)
+        }
+        configuration += 1
+        resolving = nil
+        route = .unknown
+        routeIsStale = true
+        lastWarm = [:]
+        vision = [:]
+        capabilityCache = [:]
+        cannotThink = []
+    }
+
+    /// Forgets the computer: no addresses, no name, no models. Chats already on it keep their model.
+    func removeComputer() {
+        configure(name: nil, lan: "", tailnet: "")
+        models = []
+        modelSizes = [:]
+        defaults.removeObject(forKey: "mac.knownModels")
+    }
+
+    /// Ollama's version on the current route ("0.40.18").
+    func ollamaVersion() async -> String? {
+        guard let host = route.host else { return nil }
+        return await Self.version(host, session: session)
+    }
+
+    /// Ollama's version at a host, or nil if nothing answers there.
+    static func version(_ host: String?, session: URLSession = .shared, timeout: TimeInterval = 2.5) async -> String? {
+        guard let host, let url = URL(string: "http://\(host)/api/version") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let v = try? JSONDecoder().decode(VersionResponse.self, from: data) else { return nil }
+        return v.version
+    }
+
+    /// The models Ollama has in memory now (`/api/ps`), or nil without an answer.
+    func loadedModels() async -> Set<String>? {
+        guard let host = route.host, let url = URL(string: "http://\(host)/api/ps") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 4)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let list = try? JSONDecoder().decode(PSResponse.self, from: data) else { return nil }
+        return Set(list.models.map(\.name))
+    }
+
+    /// What a model can do, from `/api/show` ("thinking", "vision"…), asked once per model.
+    func capabilities(of model: String) async -> Set<String>? {
+        if let known = capabilityCache[model] { return known }
+        guard let host = route.host, let url = URL(string: "http://\(host)/api/show") else { return nil }
+        var request = URLRequest(url: url, timeoutInterval: 5)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(["model": model])
+        guard let (data, response) = try? await session.data(for: request),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let info = try? JSONDecoder().decode(ShowResponse.self, from: data) else { return nil }
+        let set = Set(info.capabilities ?? [])
+        capabilityCache[model] = set
+        vision[model] = set.contains("vision")
+        return set
+    }
+
+    /// The result of "Test Connection".
+    struct ConnectionTest {
+        var route: Route
+        var timings = Timings()
+        /// Wall time of the whole test.
+        var totalSeconds: Double = 0
+        var failure: String?
+    }
+
+    /// Finds the computer again (both routes, as a send would) and loads `model` (as `warm` does),
+    /// timing each: found, connected, loaded.
+    func testConnection(model: String) async -> ConnectionTest {
+        let started = ContinuousClock.now
+        routeIsStale = true
+        let found = await resolve()
+        var result = ConnectionTest(route: found)
+        result.timings.findSeconds = (ContinuousClock.now - started).seconds
+        guard let host = found.host, let url = URL(string: "http://\(host)/api/chat") else {
+            result.failure = "Ollama didn't answer on the home network or the tailnet."
+            result.totalSeconds = (ContinuousClock.now - started).seconds
+            return result
+        }
+        guard !model.isEmpty else {
+            result.failure = MacError.noModel.errorDescription
+            result.totalSeconds = (ContinuousClock.now - started).seconds
+            return result
+        }
+        var request = URLRequest(url: url, timeoutInterval: 120)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONEncoder().encode(ChatRequest(
+            model: model, messages: [], stream: false, think: nil,
+            options: .init(num_ctx: contextLength), keep_alive: Self.keepAlive(for: model)))
+        // A fresh connection, so "connected" is measured rather than reused from finding it. Lantern's
+        // own tailnet node has one session, used as it is.
+        let fresh = session === URLSession.shared
+        let testSession = fresh ? URLSession(configuration: .ephemeral) : session
+        defer { if fresh { testSession.finishTasksAndInvalidate() } }
+        let metrics = ConnectMetrics()
+        let sent = ContinuousClock.now
+        do {
+            let (data, response) = try await testSession.data(for: request, delegate: metrics)
+            let elapsed = (ContinuousClock.now - sent).seconds
+            let connect = await metrics.connectSeconds(waitingUpTo: .milliseconds(300))
+            result.timings.connectSeconds = connect
+            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if code != 200 {
+                let message = (try? JSONDecoder().decode(ChatChunk.self, from: data))?.error
+                result.failure = MacError.http(code, model: model, message: message).errorDescription
+            } else {
+                // An empty chat only loads: what isn't the connection is Ollama loading the model.
+                let chunk = try? JSONDecoder().decode(ChatChunk.self, from: data)
+                result.timings.loadSeconds = chunk?.load_duration.map { Double($0) / 1e9 } ?? max(0, elapsed - (connect ?? 0))
+                lastWarm[model] = .now
+            }
+        } catch {
+            result.failure = error.localizedDescription
+        }
+        result.totalSeconds = (ContinuousClock.now - started).seconds
+        return result
+    }
+
+    private struct VersionResponse: Decodable { let version: String }
+    private struct PSResponse: Decodable {
+        struct Model: Decodable { let name: String }
+        let models: [Model]
     }
 }
 

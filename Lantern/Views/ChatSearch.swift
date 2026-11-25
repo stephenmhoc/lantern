@@ -235,6 +235,14 @@ nonisolated enum ChatSearch {
 
     /// `text` with each occurrence of `query` in bold, on a faint tint of the accent colour. The
     /// text stays the primary colour: the amber itself as text is about 2.3:1 on white.
+    /// The accent at a strength that shows on black as well as white, stronger with Increase Contrast.
+    static let matchTint = Color(UIColor { traits in
+        let high = traits.accessibilityContrast == .high
+        let alpha: CGFloat = traits.userInterfaceStyle == .dark ? (high ? 0.45 : 0.32) : (high ? 0.32 : 0.22)
+        let accent = UIColor(named: "AccentColor")?.resolvedColor(with: traits) ?? .systemOrange
+        return accent.withAlphaComponent(alpha)
+    })
+
     static func highlighted(_ text: String, query: String) -> AttributedString {
         var out = AttributedString()
         var rest = text[...]
@@ -243,7 +251,7 @@ nonisolated enum ChatSearch {
             var match = AttributedString(String(rest[r]))
             match.inlinePresentationIntent = .stronglyEmphasized
             match.foregroundColor = Color.primary
-            match.backgroundColor = Color.accentColor.opacity(0.22)
+            match.backgroundColor = Self.matchTint
             out += match
             rest = rest[r.upperBound...]
         }
@@ -385,7 +393,7 @@ struct SearchResultRow: View {
             if result.more > 0 {
                 Text(result.more == 1 ? "1 more match" : "\(result.more) more matches")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(.vertical, 2)

@@ -15,6 +15,11 @@ struct LanternWidgetBundle: WidgetBundle {
     }
 }
 
+extension Color {
+    /// The app's AccentColor (#F29629). A constant, not a second asset catalog in this target.
+    static let lanternAmber = Color(red: 0xF2 / 255, green: 0x96 / 255, blue: 0x29 / 255)
+}
+
 // MARK: - Timeline
 
 struct BuildEntry: TimelineEntry {
@@ -70,7 +75,9 @@ private struct ModeLink: Identifiable {
     static let all = [
         ModeLink(mode: "fast", title: "E2B", symbol: "cpu"),
         ModeLink(mode: "smart", title: "E4B", symbol: "cpu"),
-        ModeLink(mode: "mac", title: "Mac", symbol: "cloud"),
+        ModeLink(mode: "qwen", title: "Qwen", symbol: "cpu"),
+        ModeLink(mode: "mac", title: "Mac", symbol: "desktopcomputer"),
+        ModeLink(mode: "apple", title: "Apple", symbol: "apple.intelligence"),
     ]
 }
 
@@ -98,7 +105,8 @@ struct AskWidgetView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Image(systemName: "flame.fill")
                         .font(.title2)
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(Color.lanternAmber)
+                        .widgetAccentable()  // tinted with the rest of the accent in tinted and clear modes
                     Text("Ask Lantern")
                         .font(.headline)
                     if family == .systemMedium {
@@ -167,7 +175,12 @@ struct AccessoryView: View {
             switch family {
             case .accessoryRectangular:
                 VStack(alignment: .leading) {
-                    Label("Ask Lantern", systemImage: "flame.fill").font(.headline)
+                    Label {
+                        Text("Ask Lantern")
+                    } icon: {
+                        Image(systemName: "flame.fill").widgetAccentable()
+                    }
+                    .font(.headline)
                     if let expiry = entry.expiry {
                         Text("Build expires \(expiry.formatted(date: .abbreviated, time: .omitted))")
                             .font(.caption)
@@ -181,7 +194,7 @@ struct AccessoryView: View {
             default:
                 ZStack {
                     AccessoryWidgetBackground()
-                    Image(systemName: "flame.fill").font(.title2)
+                    Image(systemName: "flame.fill").font(.title2).widgetAccentable()
                 }
                 .accessibilityLabel("Ask Lantern")
             }

@@ -56,7 +56,7 @@ extension FocusedValues {
 
 /// The iPad menu bar and its keyboard shortcuts.
 ///
-/// Mode (⌘1–3) and Stop (⌘.) also exist as `UIKeyCommand`s on `ChatViewController`, so they work
+/// Mode (⌘1–4) and Stop (⌘.) also exist as `UIKeyCommand`s on `ChatViewController`, so they work
 /// while the message box has focus. Both paths are idempotent (set a mode, cancel the one task),
 /// so whichever UIKit routes the key to, it does the same thing once.
 struct LanternCommands: Commands {
@@ -78,7 +78,7 @@ struct LanternCommands: Commands {
             Button("Settings…") { actions?.showSettings() }
                 .keyboardShortcut(",")
                 .disabled(actions == nil)
-            Button("Readiness") { actions?.showReadiness() }
+            Button("Models") { actions?.showReadiness() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(actions == nil)
         }

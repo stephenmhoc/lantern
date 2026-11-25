@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import os
 import llama
@@ -21,14 +22,27 @@ public struct ChatMessage: Sendable, Hashable, Codable {
     public var withoutImages: ChatMessage { ChatMessage(role: role, content: content) }
 }
 
-public struct Sampling: Sendable {
+public struct Sampling: Sendable, Hashable {
     public var temperature: Float
     public var topK: Int32  // 0 = off
     public var topP: Float  // 1 = off
-    public init(temperature: Float, topK: Int32 = 0, topP: Float = 1) {
+    public var minP: Float  // 0 = off
+    /// Subtracted from the logit of every token already in the reply (llama.cpp's penalties
+    /// sampler, presence only, over the reply so far). 0 = off.
+    public var presencePenalty: Float
+    public init(temperature: Float, topK: Int32 = 0, topP: Float = 1, minP: Float = 0, presencePenalty: Float = 0) {
         self.temperature = temperature
         self.topK = topK
         self.topP = topP
+        self.minP = minP
+        self.presencePenalty = presencePenalty
+    }
+
+    /// Qwen 3.5's recommended settings (its model card), with and without thinking.
+    public static func qwen35(thinking: Bool) -> Sampling {
+        thinking
+            ? Sampling(temperature: 1.0, topK: 20, topP: 0.95, presencePenalty: 1.5)
+            : Sampling(temperature: 0.7, topK: 20, topP: 0.8, presencePenalty: 1.5)
     }
 }
 
@@ -44,30 +58,38 @@ public enum StopReason: String, Sendable, Codable {
     case stopped
 }
 
-/// How a model is loaded. The defaults suit a model that is bigger than memory (Inkling).
+/// How a model is loaded.
 public struct ModelOptions: Sendable, Hashable {
     public var contextLength: UInt32
     /// llama.cpp's `lazy_mode`: reads the rows of per-layer token-embedding tables from storage as
     /// they're used instead of prefetching the whole table. Only architectures that mark such a
-    /// tensor are affected (Gemma 4's 1.2 GB table); it does nothing for Inkling's MoE experts,
-    /// which are paged by mmap alone.
+    /// tensor are affected (Gemma 4's 1.2 GB table).
     public var lazyEmbeddings: Bool
     /// F16 instead of Q8_0 for the KV cache: twice the memory, faster attention on models whose
-    /// cache is small (Gemma). Not worth it on Inkling, whose cache is ten times larger.
+    /// cache is small (Gemma).
     public var f16Cache: Bool
-    /// Keeps a mixture-of-experts model's expert weights (`ffn_*_exps`) on the CPU, read straight
-    /// from the memory-mapped file, and puts only the rest (attention, shared layers, a few hundred
-    /// MB) on the GPU. Needed when the whole model is more than iOS lets the GPU use: Metal then
-    /// fails the first command buffer (llama.cpp's error -3). Slower than all-GPU, but it runs.
-    public var expertsOnCPU: Bool
+    /// An MTP draft model made for this one (Gemma 4's `mtp-gemma-4-*-it.gguf`, about 60 MB): each
+    /// step it guesses the next `draftTokens` tokens, the model checks them in one batch and keeps
+    /// the ones it would have picked itself, so the reply is the same, sooner. Used only on a model
+    /// that can rewind (rejected guesses are removed from the cache); ignored if it can't be loaded
+    /// or doesn't fit the model.
+    public var draftModel: String?
+    /// The most tokens drafted per step.
+    public var draftTokens: Int
+    /// Tokens per batch when reading a prompt (`n_batch` and `n_ubatch`). Bigger reads long prompts
+    /// faster but takes more compute memory.
+    public var batchSize: Int
 
     public init(
-        contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false, expertsOnCPU: Bool = false
+        contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false,
+        draftModel: String? = nil, draftTokens: Int = 3, batchSize: Int = 1024
     ) {
         self.contextLength = contextLength
         self.lazyEmbeddings = lazyEmbeddings
         self.f16Cache = f16Cache
-        self.expertsOnCPU = expertsOnCPU
+        self.draftModel = draftModel
+        self.draftTokens = draftTokens
+        self.batchSize = batchSize
     }
 }
 
@@ -80,6 +102,9 @@ public struct GenerationStats: Sendable {
     public var generatedTokens = 0
     public var promptSeconds = 0.0
     public var generateSeconds = 0.0
+    /// Tokens the MTP draft model guessed, and how many of them the model kept.
+    public var draftedTokens = 0
+    public var acceptedDraftTokens = 0
     public init() {}
     public var tokensPerSecond: Double { generateSeconds > 0 ? Double(generatedTokens) / generateSeconds : 0 }
 }
@@ -141,12 +166,15 @@ public final class LlamaModel: @unchecked Sendable {
     private var prefixSnapshot: (tokens: [llama_token], data: [UInt8])?
     private let used = OSAllocatedUnfairLock(initialState: 0)
     private let threads: Int32
+    private let batchSize: Int
     /// The vision projector (`mtmd_context`), once `loadVision` has loaded one.
     private var vision: OpaquePointer?
     private let visionLoaded = OSAllocatedUnfairLock(initialState: false)
+    /// The MTP draft model and its context, which reads this model's KV cache (`ctx_other`).
+    private var drafter: Drafter?
 
     public let contextLength: Int
-    /// False for hybrid and recurrent models (Inkling): their state can't be rolled back, so the
+    /// False for hybrid and recurrent models (Qwen 3.5): their state can't be rolled back, so the
     /// cache is only ever appended to, restored from a checkpoint, or cleared.
     public let canRewind: Bool
     /// Identifies the file and the context settings a saved state belongs to.
@@ -159,12 +187,13 @@ public final class LlamaModel: @unchecked Sendable {
     public var templateName: String { template.format.rawValue }
     /// Whether images in messages are shown to the model. Without a projector they're left out.
     public var hasVision: Bool { visionLoaded.withLock { $0 } }
+    /// Whether replies are drafted by an MTP model (`ModelOptions.draftModel` loaded and fits).
+    public var hasDrafter: Bool { drafter != nil }
     /// About how many tokens an image takes (the projector is capped at this), for counting a
     /// prompt before its images are encoded.
     public static let imageTokens = 280
 
     private static let backend: Void = llama_backend_init()
-    private static let batchSize = 512
     /// The performance cores, up to six. Each op is split evenly across the threads and waits for
     /// the slowest, so a thread on an efficiency core holds the rest back.
     private static let threadCount: Int32 = {
@@ -208,22 +237,7 @@ public final class LlamaModel: @unchecked Sendable {
             return llama_model_load_from_file(path, mp)
         }
         #else
-        let loaded: OpaquePointer?
-        if options.expertsOnCPU {
-            // The pattern must outlive the load; the list ends with a null entry.
-            let pattern = strdup("\\.ffn_(up|down|gate|gate_up)_exps")
-            defer { free(pattern) }
-            let overrides = [
-                llama_model_tensor_buft_override(pattern: pattern, buft: ggml_backend_cpu_buffer_type()),
-                llama_model_tensor_buft_override(pattern: nil, buft: nil),
-            ]
-            loaded = overrides.withUnsafeBufferPointer { buf in
-                mp.tensor_buft_overrides = buf.baseAddress
-                return llama_model_load_from_file(path, mp)
-            }
-        } else {
-            loaded = llama_model_load_from_file(path, mp)
-        }
+        let loaded = llama_model_load_from_file(path, mp)
         #endif
         guard let model = loaded else {
             throw isCancelled?() == true ? LlamaError.cancelled : LlamaError.loadFailed(path)
@@ -236,15 +250,19 @@ public final class LlamaModel: @unchecked Sendable {
         var cp = llama_context_default_params()
         let canRewind = !llama_model_is_hybrid(model) && !llama_model_is_recurrent(model)
         cp.n_ctx = options.contextLength
-        cp.n_batch = UInt32(Self.batchSize)
-        cp.n_ubatch = UInt32(Self.batchSize)
+        cp.n_batch = UInt32(options.batchSize)
+        cp.n_ubatch = UInt32(options.batchSize)
+        // Logits are asked for one position when reading a prompt and for each verified token while
+        // answering, never a whole batch: without this limit the context reserves a batch-sized
+        // logits buffer (batch × vocabulary floats, 0.5 GB per 512 tokens on Gemma's 262k vocabulary).
+        cp.n_outputs_max = UInt32(max(1, options.draftModel == nil ? 1 : options.draftTokens + 1))
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO
         if !options.f16Cache {
             cp.type_k = GGML_TYPE_Q8_0  // half the memory of f16 for a small quality cost
             cp.type_v = GGML_TYPE_Q8_0
         }
         // A model that can't rewind has no use for sliding-window layers remembering more than
-        // their window: on Inkling that is 550 MB less cache and a slightly faster prefill.
+        // their window: less cache and a slightly faster prefill.
         cp.swa_full = canRewind
         let threads = Self.threadCount
         cp.n_threads = threads
@@ -252,11 +270,6 @@ public final class LlamaModel: @unchecked Sendable {
         #if targetEnvironment(simulator)
         cp.offload_kqv = false
         cp.op_offload = false
-        #else
-        // With the experts left in CPU memory, offloading a prompt's expert matmuls to the GPU
-        // means copying the expert weights there for every batch, which needs gigabytes of GPU
-        // scratch on a device that kept them off the GPU for lack of room. Run them where they are.
-        if options.expertsOnCPU { cp.op_offload = false }
         #endif
         guard let ctx = llama_init_from_model(model, cp) else {
             llama_model_free(model)
@@ -269,6 +282,11 @@ public final class LlamaModel: @unchecked Sendable {
         self.template = template
         self.canRewind = canRewind
         self.threads = threads
+        self.batchSize = options.batchSize
+        if canRewind, let draftPath = options.draftModel {
+            drafter = Drafter(path: draftPath, params: mp, target: model, targetContext: ctx, targetParams: cp,
+                              maxTokens: options.draftTokens)
+        }
         let file = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         self.stateKey = [
             "v1", URL(fileURLWithPath: path).lastPathComponent, "\(file?.fileSize ?? 0)",
@@ -279,6 +297,7 @@ public final class LlamaModel: @unchecked Sendable {
 
     deinit {
         if let vision { mtmd_free(vision) }
+        drafter = nil  // it reads this context's cache, so it goes first
         llama_free(ctx)
         llama_model_free(model)
     }
@@ -383,9 +402,9 @@ public final class LlamaModel: @unchecked Sendable {
         unsaved = nil
         var appended = false
         if let rest {
-            // Append only. Hybrid models (Inkling's short-conv layers) can't roll their state back,
+            // Append only. Hybrid models (Qwen 3.5's Gated DeltaNet layers) can't roll their state back,
             // so never rewinding is what makes multi-turn chat cheap on them.
-            let tokens = try tokenize(template.renderContinuation(rest))
+            let tokens = try tokenize(template.renderContinuation(rest, thinking: thinking))
             if cached.count + tokens.count <= limit {
                 stats.reusedTokens = cached.count
                 stats.promptTokens = cached.count + tokens.count
@@ -419,7 +438,7 @@ public final class LlamaModel: @unchecked Sendable {
         defer { llama_sampler_free(smpl) }
 
         start = Date()
-        var parser = template.makeParser()
+        var parser = template.makeParser(thinking: thinking)
         var utf8 = UTF8Assembler()
         var answer = ""
         var endedCleanly = false
@@ -433,13 +452,13 @@ public final class LlamaModel: @unchecked Sendable {
             case nil: break
             }
         }
-        while stats.generatedTokens < maxTokens, cached.count < contextLength, !isStopped() {
-            let token = llama_sampler_sample(smpl, ctx, -1)
+        /// Shows a token the model picked and counts it, or ends the reply at an end-of-generation
+        /// token (which stays out of the cache: the next turn's continuation starts with it).
+        func commit(_ token: llama_token) -> Bool {
             if llama_vocab_is_eog(vocab, token) {
-                // The turn-end token stays out of the cache; the next turn's continuation starts with it.
                 endedCleanly = String(decoding: piece(token, special: true), as: UTF8.self) == template.turnEnd
                 ended = true
-                break
+                return false
             }
             stats.generatedTokens += 1
             let attr = llama_vocab_get_attr(vocab, token).rawValue
@@ -450,7 +469,44 @@ public final class LlamaModel: @unchecked Sendable {
             } else if let text = utf8.append(piece(token, special: false)) {
                 send(text, marker: false)
             }
-            try feed([token], batch: batch, isStopped: { false }, emit: { _ in })
+            return true
+        }
+        // Each step processes the token just picked, plus any drafted after it, in one batch. The
+        // model then picks from each position's logits in turn: while it picks what was drafted,
+        // that token is already processed and the next position's pick is free. The first pick that
+        // differs is the next step's token, and the drafts after it are removed from the cache.
+        // With greedy decoding that's the reply one token at a time would give; with sampling,
+        // every token is still sampled from the model's own distribution.
+        var next = llama_sampler_sample(smpl, ctx, -1)
+        var state = drafter?.targetState(ctx, -1) ?? []
+        generation: while stats.generatedTokens < maxTokens, cached.count < contextLength, !isStopped() {
+            guard commit(next) else { break }
+            let room = min(contextLength - cached.count - 1, maxTokens - stats.generatedTokens)
+            let drafts = drafter?.draft(after: next, at: cached.count, state: state, limit: room) ?? []
+            stats.draftedTokens += drafts.count
+            try verify([next] + drafts, batch: batch)
+            cached.append(next)
+            var i = 0
+            while true {
+                let picked = llama_sampler_sample(smpl, ctx, Int32(i))
+                if i < drafts.count, picked == drafts[i] {
+                    stats.acceptedDraftTokens += 1
+                    guard stats.generatedTokens < maxTokens, !isStopped(), commit(picked) else { break generation }
+                    cached.append(picked)
+                    i += 1
+                    continue
+                }
+                next = picked
+                if let drafter { state = drafter.targetState(ctx, Int32(i)) }
+                break
+            }
+            if i < drafts.count { _ = llama_memory_seq_rm(llama_get_memory(ctx), 0, llama_pos(cached.count), -1) }
+            used.withLock { $0 = cached.count }
+        }
+        if drafter != nil {
+            // An accepted draft the reply stopped at (end of turn, length, a stop) is still in the cache.
+            _ = llama_memory_seq_rm(llama_get_memory(ctx), 0, llama_pos(cached.count), -1)
+            used.withLock { $0 = cached.count }
         }
         if let rest = utf8.flush() { send(rest, marker: false) }
         stats.generateSeconds = Date().timeIntervalSince(start)
@@ -619,7 +675,7 @@ public final class LlamaModel: @unchecked Sendable {
             if span.isImage {
                 var past: llama_pos = 0
                 let rc = mtmd_helper_eval_chunk_single(
-                    vision, ctx, span.chunk, llama_pos(cached.count), 0, Int32(Self.batchSize), false, &past)
+                    vision, ctx, span.chunk, llama_pos(cached.count), 0, Int32(batchSize), false, &past)
                 guard rc == 0 else { throw LlamaError.processFailed(rc) }
                 cached += prompt.tokens[span.range]
                 guard Int(past) == cached.count else { throw LlamaError.processFailed(-2) }
@@ -838,7 +894,7 @@ public final class LlamaModel: @unchecked Sendable {
         while index < tokens.count {
             if isStopped() { return }
             llama_batch_ext_clear(batch)
-            let end = min(index + Self.batchSize, tokens.count)
+            let end = min(index + batchSize, tokens.count)
             for i in index..<end {
                 let idx = llama_batch_ext_add_token(batch, 0, tokens[i])
                 guard idx >= 0 else { throw LlamaError.processFailed(idx) }
@@ -851,8 +907,23 @@ public final class LlamaModel: @unchecked Sendable {
             cached += tokens[index..<end]
             used.withLock { $0 = cached.count }
             index = end
-            if tokens.count > Self.batchSize { emit(.reading(Double(index) / Double(tokens.count))) }
+            if tokens.count > batchSize { emit(.reading(Double(index) / Double(tokens.count))) }
         }
+    }
+
+    /// Processes a generation step's tokens at the end of the cache with logits for each, without
+    /// adding them to `cached`: the caller adds the ones the model keeps.
+    private func verify(_ tokens: [llama_token], batch: OpaquePointer) throws {
+        llama_batch_ext_clear(batch)
+        for (i, token) in tokens.enumerated() {
+            let idx = llama_batch_ext_add_token(batch, 0, token)
+            guard idx >= 0 else { throw LlamaError.processFailed(idx) }
+            var pos = llama_pos(cached.count + i)
+            _ = llama_batch_ext_set_pos(batch, idx, &pos)
+            _ = llama_batch_ext_set_output_logits(batch, idx, true)
+        }
+        let rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)
+        guard rc == 0 else { throw rc == 1 ? LlamaError.contextFull : LlamaError.processFailed(rc) }
     }
 
     /// Special tokens in the text are parsed as special, as llama-server does: the templates rely on it.
@@ -886,7 +957,14 @@ public final class LlamaModel: @unchecked Sendable {
             return chain
         }
         if s.topK > 0 { llama_sampler_chain_add(chain, llama_sampler_init_top_k(s.topK)) }
+        if s.presencePenalty != 0 {
+            // After top-k, so it looks at a few candidates instead of the whole vocabulary. The
+            // chain is new for each reply, so it sees the reply's tokens only.
+            llama_sampler_chain_add(chain, llama_sampler_init_penalties(
+                llama_vocab_n_tokens(vocab), Int32(contextLength), 1, 0, s.presencePenalty))
+        }
         if s.topP < 1 { llama_sampler_chain_add(chain, llama_sampler_init_top_p(s.topP, 1)) }
+        if s.minP > 0 { llama_sampler_chain_add(chain, llama_sampler_init_min_p(s.minP, 1)) }
         llama_sampler_chain_add(chain, llama_sampler_init_temp(s.temperature))
         llama_sampler_chain_add(chain, llama_sampler_init_dist(UInt32.random(in: 0...UInt32.max)))
         return chain
@@ -927,5 +1005,131 @@ private final class ProgressBox {
     init(_ progress: (@Sendable (Float) -> Void)?, _ isCancelled: (@Sendable () -> Bool)?) {
         self.progress = progress
         self.isCancelled = isCancelled
+    }
+}
+
+/// An MTP draft model (Gemma 4's assistant) and its context. It has no cache of its own: its
+/// attention reads the target's (llama.cpp shares the KV cells through `ctx_other`), so it only ever
+/// sees what the target has processed, and drafting leaves the target's cache untouched. Each draft
+/// step takes the token before and a hidden state (the target's for the first step, its own after),
+/// all at the position of the first drafted token, as llama.cpp's `draft-mtp` does for Gemma 4.
+/// Used only on the target's queue.
+private final class Drafter {
+    private let model: OpaquePointer
+    private let ctx: OpaquePointer
+    private let batch: OpaquePointer
+    private let width: Int
+    private let vocabSize: Int
+    let maxTokens: Int
+    /// A draft stops at a token the drafter is less sure of than this (llama.cpp's `p_min`).
+    private static let minProbability: Float = 0.5
+
+    init?(
+        path: String, params: llama_model_params, target: OpaquePointer, targetContext: OpaquePointer,
+        targetParams: llama_context_params, maxTokens: Int
+    ) {
+        guard maxTokens > 0 else { return nil }
+        var mp = params
+        mp.progress_callback = nil
+        mp.progress_callback_user_data = nil
+        mp.lazy_mode = LLAMA_LAZY_MODE_OFF
+        #if targetEnvironment(simulator)
+        // CPU only, as for the target; its device list only lived for the target's load.
+        var devices: [ggml_backend_dev_t?] = [ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU), nil]
+        let loaded = devices.withUnsafeMutableBufferPointer { buf in
+            mp.devices = buf.baseAddress
+            return llama_model_load_from_file(path, mp)
+        }
+        #else
+        mp.devices = nil
+        let loaded = llama_model_load_from_file(path, mp)
+        #endif
+        guard let model = loaded else { return nil }
+        let width = Int(llama_model_n_embd_out(model))
+        guard llama_model_n_layer_nextn(model) > 0, width == Int(llama_model_n_embd_out(target)),
+              llama_vocab_n_tokens(llama_model_get_vocab(model)) == llama_vocab_n_tokens(llama_model_get_vocab(target))
+        else {
+            llama_model_free(model)
+            return nil
+        }
+        var cp = llama_context_default_params()
+        cp.ctx_type = LLAMA_CONTEXT_TYPE_MTP
+        cp.ctx_other = targetContext
+        cp.n_ctx = llama_n_ctx(targetContext)
+        cp.n_batch = 8
+        cp.n_ubatch = 8
+        cp.n_seq_max = 1
+        cp.n_threads = targetParams.n_threads
+        cp.n_threads_batch = targetParams.n_threads_batch
+        cp.flash_attn_type = targetParams.flash_attn_type
+        cp.type_k = targetParams.type_k  // the cells it reads are the target's
+        cp.type_v = targetParams.type_v
+        cp.swa_full = targetParams.swa_full
+        cp.offload_kqv = targetParams.offload_kqv
+        cp.op_offload = targetParams.op_offload
+        guard let ctx = llama_init_from_model(model, cp) else {
+            llama_model_free(model)
+            return nil
+        }
+        self.model = model
+        self.ctx = ctx
+        self.batch = llama_batch_ext_init(ctx)!
+        self.width = width
+        self.vocabSize = Int(llama_vocab_n_tokens(llama_model_get_vocab(model)))
+        self.maxTokens = maxTokens
+        // The target hands over its last hidden state for each position it outputs logits for.
+        llama_set_embeddings_nextn(targetContext, true, true)
+        llama_set_embeddings_nextn(ctx, true, true)
+    }
+
+    deinit {
+        llama_batch_ext_free(batch)
+        llama_free(ctx)
+        llama_model_free(model)
+    }
+
+    /// The target's hidden state at output `index` of its last batch: what the first draft step
+    /// pairs with the token picked from that position's logits.
+    func targetState(_ target: OpaquePointer, _ index: Int32) -> [Float] {
+        guard let row = llama_get_embeddings_nextn_ith(target, index) else { return [] }
+        return Array(UnsafeBufferPointer(start: row, count: width))
+    }
+
+    /// Up to `limit` (and `maxTokens`) tokens likely to follow `token`, which the target will
+    /// process at `position`. Greedy: the drafter's most likely token at each step.
+    func draft(after token: llama_token, at position: Int, state first: [Float], limit: Int) -> [llama_token] {
+        guard first.count == width else { return [] }
+        var out: [llama_token] = []
+        var token = token
+        var state = first
+        var logits = [Float](repeating: 0, count: vocabSize)
+        while out.count < min(limit, maxTokens) {
+            llama_batch_ext_clear(batch)
+            let idx = llama_batch_ext_add_token(batch, 0, token)
+            guard idx >= 0 else { break }
+            var pos = llama_pos(position)
+            _ = llama_batch_ext_set_pos(batch, idx, &pos)
+            _ = llama_batch_ext_set_output_logits(batch, idx, true)
+            let rc = state.withUnsafeBufferPointer { h -> Int32 in
+                guard llama_batch_ext_set_embd_state(batch, idx, llama_embd(data: h.baseAddress, n_rows: 1, n_embd: width)) else { return -1 }
+                return llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)
+            }
+            guard rc == 0, let raw = llama_get_logits_ith(ctx, idx), let h = llama_get_embeddings_nextn_ith(ctx, idx) else { break }
+            // The most likely token and its probability (softmax of the logits).
+            var best: Float = 0
+            var bestIndex: vDSP_Length = 0
+            vDSP_maxvi(raw, 1, &best, &bestIndex, vDSP_Length(vocabSize))
+            var shift = -best
+            vDSP_vsadd(raw, 1, &shift, &logits, 1, vDSP_Length(vocabSize))
+            var n = Int32(vocabSize)
+            vvexpf(&logits, logits, &n)
+            var sum: Float = 0
+            vDSP_sve(logits, 1, &sum, vDSP_Length(vocabSize))
+            guard 1 / sum >= Self.minProbability else { break }
+            token = llama_token(bestIndex)
+            out.append(token)
+            state = Array(UnsafeBufferPointer(start: h, count: width))
+        }
+        return out
     }
 }

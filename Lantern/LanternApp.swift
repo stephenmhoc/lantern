@@ -86,7 +86,10 @@ private struct EngineTest: ViewModifier {
             for old in (try? context.fetch(FetchDescriptor<Conversation>())) ?? [] {
                 print("ENGINETEST existing chat: \(old.messages.count) messages, \(old.history(before: old.messages.count).count) in history")
             }
-            let mode: Mode = ProcessInfo.processInfo.arguments.contains("-smart") ? .smart : .fast
+            let arguments = ProcessInfo.processInfo.arguments
+            // `-apple`: Apple Intelligence, whose follow-ups reuse its session and which saves no state.
+            let mode: Mode = arguments.contains("-apple") ? .apple : arguments.contains("-qwen") ? .qwen
+                : arguments.contains("-smart") ? .smart : .fast
             let chat = Conversation(mode: mode)
             context.insert(chat)
             @MainActor func idle() async {
@@ -107,6 +110,27 @@ private struct EngineTest: ViewModifier {
             try? await Task.sleep(for: .seconds(3))
             engine.stop()
             await idle()
+            if mode == .apple, engine.canSeeImages(.apple) {
+                // iOS 27's model sees images: a red square should come back as red.
+                let red = UIGraphicsImageRenderer(size: CGSize(width: 256, height: 256)).jpegData(withCompressionQuality: 0.9) { c in
+                    UIColor.systemRed.setFill()
+                    c.fill(CGRect(x: 0, y: 0, width: 256, height: 256))
+                }
+                engine.send("What color is this image? One word.", attachments: [Attachment(name: "red.jpg", image: red)], in: chat)
+                await idle()
+            }
+            if mode == .apple {
+                // Its context is small: a long earlier turn makes the next question fail as full,
+                // and dropping the oldest turns then answers it.
+                let long = String(repeating: "The lantern glowed softly in the quiet room. ", count: 900)
+                chat.messages += [StoredMessage(isUser: true, content: long), StoredMessage(isUser: false, content: "Noted.")]
+                engine.send("What is two plus two?", in: chat)
+                await idle()
+                print("ENGINETEST too long: \(chat.messages.last?.errorKind?.rawValue ?? "no error kind")")
+                engine.continueTrimmed(in: chat)
+                await idle()
+                print("ENGINETEST trimmed: historyStart \(chat.historyStart), metrics trimmed \(chat.messages.last?.metrics?.trimmed ?? false)")
+            }
             try? await Task.sleep(for: .seconds(1))  // the state is saved after the reply
             let saved = (try? FileManager.default.contentsOfDirectory(atPath: Engine.stateDirectory(for: chat).path)) ?? []
             let speed = engine.typicalSpeed(for: mode)
@@ -121,7 +145,8 @@ private struct EngineTest: ViewModifier {
 
 #if DEBUG
 /// `-comparetest`: in an in-memory chat (no chats touched), asks a short question with E2B,
-/// compares with E4B if it's downloaded or else the Mac's default model, then prints both
+/// compares with E4B (or Qwen 3.5 4B with `-qwen`, Apple Intelligence with `-apple`) if it's downloaded or else the
+/// Mac's default model, then prints both
 /// answers' `ReplyMetrics` and checks the pair, the vote and going back to A (its saved state must
 /// be restored, not read again). Prints COMPARETEST lines (simctl launch --console).
 @MainActor
@@ -133,7 +158,9 @@ enum CompareTest {
         ran = true
         guard let container = try? ModelContainer(
             for: Conversation.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true)) else { return }
-        let chat = Conversation(mode: .fast)
+        // `-appleA`: A is Apple Intelligence and B Gemma 4 E2B, the other way round.
+        let aMode: Mode = ProcessInfo.processInfo.arguments.contains("-appleA") ? .apple : .fast
+        let chat = Conversation(mode: aMode)
         container.mainContext.insert(chat)
         func idle() async {
             repeat { try? await Task.sleep(for: .milliseconds(200)) } while engine.isBusy
@@ -152,14 +179,21 @@ enum CompareTest {
             return print("COMPARETEST done")
         }
         let other: ModelChoice
-        if let e4b = engine.model(for: .smart), engine.store.states[e4b.id] == .ready {
-            other = ModelChoice(mode: .smart, macModel: nil)
+        // `-qwen`: B is Qwen 3.5 4B, a model that can't rewind, so going back to A restores across kinds.
+        // `-apple`: B is Apple Intelligence, which has no file and keeps no saved state.
+        let arguments = ProcessInfo.processInfo.arguments
+        let deviceB: Mode = aMode == .apple ? .fast : arguments.contains("-apple") ? .apple
+            : arguments.contains("-qwen") ? .qwen : .smart
+        if deviceB == .apple, engine.apple.status.isAvailable {
+            other = ModelChoice(mode: .apple, macModel: nil)
+        } else if let b = engine.model(for: deviceB), engine.store.states[b.id] == .ready {
+            other = ModelChoice(mode: deviceB, macModel: nil)
         } else {
             await engine.mac.resolve()
             other = ModelChoice(mode: .mac, macModel: engine.mac.modelName.isEmpty ? nil : engine.mac.modelName)
         }
         print("COMPARETEST comparing \(a.metrics?.modelTitle ?? "?") with \(other.title)")
-        check("a model differing from A's is required", { engine.compare(in: chat, with: ModelChoice(mode: .fast, macModel: nil)); return !engine.isBusy }())
+        check("a model differing from A's is required", { engine.compare(in: chat, with: ModelChoice(mode: aMode, macModel: nil)); return !engine.isBusy }())
         engine.compare(in: chat, with: other)
         check("comparing is set while B runs", engine.comparing?.next == other && engine.isBusy)
         check("the chat is on B's model while it runs", chat.mode == other.mode)
@@ -192,7 +226,7 @@ enum CompareTest {
 
         engine.continueWith(in: chat, version: pair.a)
         check("A is shown", chat.messages.last?.allVersions.current == pair.a && chat.messages.last?.content == a.content)
-        check("the chat is on A's model", chat.mode == .fast)
+        check("the chat is on A's model", chat.mode == aMode)
         // Let `prepare` finish loading, then drop the model so the follow-up has to come from A's
         // saved state, not memory.
         repeat { try? await Task.sleep(for: .milliseconds(500)) } while engine.loadingModel != nil
@@ -204,7 +238,11 @@ enum CompareTest {
         let follow = chat.messages.last
         print("COMPARETEST follow-up: \(follow?.content.prefix(60).debugDescription ?? "") | error: \(follow?.error ?? "none")",
               "| reused \(follow?.metrics?.reusedTokens ?? -1) of \(follow?.metrics?.promptTokens ?? -1), restored \(follow?.metrics?.restored ?? false)")
-        check("A's saved state was restored for the follow-up", follow?.metrics?.restored == true)
+        if aMode.usesLlama {
+            check("A's saved state was restored for the follow-up", follow?.metrics?.restored == true)
+        } else {
+            check("the follow-up is answered by A's model", follow?.metrics?.modeRaw == aMode.rawValue && follow?.error == nil)
+        }
 
         // A B that produces nothing (a Mac model that doesn't exist) leaves A shown and no pair.
         if let shown = chat.messages.last, shown.error == nil, !shown.content.isEmpty {
@@ -214,7 +252,7 @@ enum CompareTest {
             print("COMPARETEST failed B: \(after?.allVersions.list.last?.error ?? "no error")")
             check("a failed B shows A again", after?.content == shown.content && after?.error == nil)
             check("a failed B leaves no pair", after?.comparison == nil)
-            check("a failed B puts the chat back on A's model", chat.mode == .fast)
+            check("a failed B puts the chat back on A's model", chat.mode == aMode)
         }
         engine.forgetState(for: chat)
         print("COMPARETEST done")

@@ -74,7 +74,9 @@ targets:
             UTTypeConformsTo: [public.plain-text]
             UTTypeTagSpecification:
               public.filename-extension: [md, markdown]
-        NSLocalNetworkUsageDescription: Lantern talks to Ollama on your Mac over your home network.
+        NSLocalNetworkUsageDescription: Lantern finds your computers running Ollama on your home network and talks to them there.
+        # Add a Computer browses for Ollama, which scripts/mac-ollama-setup.sh advertises over Bonjour.
+        NSBonjourServices: [_ollama._tcp]
         # Dictation in the message box, recognized on this device only.
         NSMicrophoneUsageDescription: Lantern listens when you tap the microphone, to type what you say.
         NSSpeechRecognitionUsageDescription: Lantern turns what you say into text on this device. Nothing is sent anywhere.

@@ -182,6 +182,8 @@ struct CompareMetricsView: View {
             speed.a.bar = x / max(x, y)
             speed.b.bar = y / max(x, y)
         }
+        if let line = Self.drafted(a) { speed.a.lines.append(line) }
+        if let line = Self.drafted(b) { speed.b.lines.append(line) }
         rows.append(speed)
 
         rows.append(Row(label: "Generated tokens", a: Self.count(a?.generatedTokens), b: Self.count(b?.generatedTokens)))
@@ -245,6 +247,12 @@ struct CompareMetricsView: View {
         if m.cutOff != nil { notes.append("cut off") }
         if m.stopped == true { notes.append("stopped") }
         return notes
+    }
+
+    /// "62% drafted": the share of the answer's tokens Gemma's drafter guessed right.
+    static func drafted(_ m: ReplyMetrics?) -> String? {
+        guard let m, let accepted = m.acceptedDraftTokens, let total = m.generatedTokens, accepted > 0, total > 0 else { return nil }
+        return "\(Int((Double(accepted) / Double(total) * 100).rounded()))% drafted"
     }
 
     private func tokens(_ n: Int?) -> String? { n.map { "\($0.formatted()) tok" } }
