@@ -49,6 +49,7 @@ struct LanternApp: App {
                 }
                 .modifier(EngineTest(engine: engine))
                 .task { await CompareTest.run(engine) }
+                .task { await SearchTest.run(engine) }
                 .task { await DebugLaunch.system() }  // -openURL, -intent
                 #endif
         }
@@ -256,6 +257,58 @@ enum CompareTest {
         }
         engine.forgetState(for: chat)
         print("COMPARETEST done")
+    }
+}
+#endif
+
+#if DEBUG
+/// `-searchtest [-model <ollama model>]`: in an in-memory chat on the computer (no chats touched)
+/// with Search the Web on (the key from `SIMCTL_CHILD_TAVILY_API_KEY`), asks something only a search can answer, then a follow-up, so the
+/// first reply's stored searches go back in the history. Prints SEARCHTEST lines.
+@MainActor
+enum SearchTest {
+    private static var ran = false
+
+    static func run(_ engine: Engine) async {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.contains("-searchtest"), !ran else { return }
+        ran = true
+        setvbuf(stdout, nil, _IOLBF, 0)  // each line as it's printed, even into a pipe
+        guard let container = try? ModelContainer(
+            for: Conversation.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true)) else { return }
+        let defaults = UserDefaults.standard
+        let was = defaults.bool(forKey: Engine.webSearchKey)
+        defaults.set(true, forKey: Engine.webSearchKey)
+        defer { defaults.set(was, forKey: Engine.webSearchKey) }
+        let chat = Conversation(mode: .mac)
+        if let i = arguments.firstIndex(of: "-model"), arguments.indices.contains(i + 1) { chat.macModel = arguments[i + 1] }
+        container.mainContext.insert(chat)
+        func idle() async {
+            repeat { try? await Task.sleep(for: .milliseconds(200)) } while engine.isBusy
+        }
+        func report(_ label: String) {
+            guard let m = chat.messages.last else { return }
+            for s in m.searches ?? [] {
+                print("SEARCHTEST \(label) searched “\(s.query)”: \(s.results.count) results, error: \(s.error ?? "none")")
+                for r in s.results { print("SEARCHTEST   \(r.title) | \(r.url) | \(r.content.count) chars") }
+            }
+            print("SEARCHTEST \(label) answer: \(m.content.prefix(300).debugDescription)")
+            print("SEARCHTEST \(label) footnote: \(m.footnote ?? "") | error: \(m.error ?? "none")")
+        }
+        print("SEARCHTEST model: \(chat.resolvedMacModel), key: \(WebSearcher.apiKey == nil ? "missing" : "present")")
+        engine.send("What are the top news headlines today?", in: chat)
+        await idle()
+        report("first")
+        engine.send("Which of those is the most important? One sentence.", in: chat)
+        await idle()
+        report("follow-up")
+        let sent = chat.history(before: chat.messages.count - 1)
+        print("SEARCHTEST history carries \(sent.compactMap(\.searches).flatMap { $0 }.count) searches")
+        engine.send("What is 2 + 2?", in: chat)
+        await idle()
+        report("no search needed")
+        engine.forgetState(for: chat)
+        print("SEARCHTEST done")
     }
 }
 #endif

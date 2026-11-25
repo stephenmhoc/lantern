@@ -150,6 +150,11 @@ nonisolated struct ChatExport: Transferable {
                 lines += ["**Lantern**" + (m.footnote.map { " _(\($0))_" } ?? ""), ""]
                 if !m.content.isEmpty { lines += [m.content, ""] }
                 if let error = m.error { lines += ["> \(error)", ""] }
+                // The pages a search found, as links under the answer that used them.
+                let sources = (m.searches ?? []).flatMap(\.results)
+                if !sources.isEmpty {
+                    lines += ["Sources:"] + sources.map { "- [\($0.title)](\($0.url))" } + [""]
+                }
             }
         }
         markdown = lines.joined(separator: "\n")

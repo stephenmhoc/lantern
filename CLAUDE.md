@@ -92,7 +92,7 @@ cd Packages/LlamaKit && swift build -c release && .build/release/lantern-smoke .
                             # restored cache answers byte for byte like the live one.
                             # Gemma runs with --lazy --f16 --draft in the app; Qwen with --qwen-sampling.
                             # --render compares a template with the GGUF's Jinja; --bench times prompt
-                            # reading and generation.
+                            # reading and generation; --search answers web search calls with Tavily.
 ```
 
 In a Debug build, `simctl launch --console <device> com.merimerimeri.Lantern -selftest` tests each
@@ -106,7 +106,7 @@ The official xcframework has no simulator slice. For the simulator, build llama.
 `build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
 simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't map its buffers.
 Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
-`-seedChats`, `-ui readiness|settings|inspector|search:<text>|delete|newchat|sidebar|swipe|swipepin|next|window`,
+`-seedChats`, `-ui readiness|settings|inspector|search:<text>|search|delete|newchat|sidebar|swipe|swipepin|next|window`,
 `-testflight` (show the expiry and reminders), `-importModel <path>`, `-markdownSample full|partial`
 (every answer shows a Markdown sample, `partial` cut off mid code fence), and `-selftest`.
 For the system integration: `-openURL <lantern://…>` (the app opens the link through the system
@@ -186,6 +186,26 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   read the chat; `MacLink.Timings`). Keep `num_ctx` the same on every request: a different one
   makes Ollama reload the model. Inkling thinks even with `think: false` (Ollama just hides it,
   so nothing showed for seconds); `MacLink.alwaysThinks` models are always asked for thinking.
+- **Web search** (not Apple Intelligence yet). Settings' "Search the Web" (`Engine.webSearchKey`,
+  off by default) plus the user's own Tavily API key (Keychain, `WebSearcher`; Ollama's own web
+  search needs paid credits). This device runs every search (`WebSearcher.search`), at most
+  `MacLink.searchRounds` / `LlamaModel.searchLimit` (3) per reply; a failed search never fails the
+  reply: the model is told why and answers anyway. Each search (`WebSearch`, in LlamaKit: query,
+  trimmed results, or the error) is kept on the reply (`StoredMessage.searches`,
+  `ChatMessage.searches`) and sent back with the history as the call and `WebSearch.modelText`,
+  rendered from those fields only. The cell shows "Searched for “…”" with the sources in its menu.
+  - Computer: Ollama models with the `tools` capability are offered `web_search` per request
+    (`MacLink.stream(search:)`); a call goes back as a `tool` turn. Five results of 1,500 characters.
+  - Gemma and Qwen: the tool is declared in the system turn (`ChatMessage.tools` on the system
+    message, set by `Engine.systemMessage`), so switching search changes the prompt and the next
+    reply reads the chat again. `LlamaModel.run` collects a call between `toolCallStart` and
+    `toolCallEnd` (never shown), runs the search and appends `renderToolResult` to the cache: Gemma
+    continues its turn, Qwen gets a `<tool_response>` user turn and a new reply. Append-only, so
+    Qwen's cache and saved states work as for any turn. Three results of 700 characters (8K context).
+    Check with `lantern-smoke <file> --search [--think]` (TAVILY_API_KEY) and `--render`, whose tool
+    cases must match the GGUF's Jinja.
+  - Debug builds take the key from `TAVILY_API_KEY` in the environment (`SIMCTL_CHILD_TAVILY_API_KEY=…
+    simctl launch … -searchtest [-model <name>]` for the computer); `-ui search` shows a reply that searched.
 - **One on-device model loaded at a time.** `Engine.load` frees the old one first. It stays
   loaded while Lantern is in front and is unloaded on a memory warning or on leaving the app,
   after its state is saved; `Engine.prepare` (called when a chat opens) loads it again.

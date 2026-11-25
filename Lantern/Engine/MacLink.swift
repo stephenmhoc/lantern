@@ -290,8 +290,13 @@ final class MacLink {
     /// Stops when the reading task is cancelled. A route that has gone stale (left home, Wi-Fi
     /// dropped) gets one fresh check and retry before giving up. The `Request` returned with the
     /// stream has the route and, once `.done` arrives, the timings.
+    ///
+    /// With `search`, a model Ollama says can use tools is offered `web_search`. When it calls it,
+    /// this device runs the search (`WebSearcher`), the call and its results go back as a tool turn and
+    /// the model carries on: up to `searchRounds` times, after which it's asked without the tool so
+    /// it answers. Each search is reported as `.searching` and `.searched`, for the reply to keep.
     func stream(
-        _ messages: [ChatMessage], thinking: Thinking, model: String
+        _ messages: [ChatMessage], thinking: Thinking, model: String, search: Bool = false
     ) async throws -> (stream: AsyncThrowingStream<Generation, Error>, request: Request) {
         var timings = Timings()
         let started = ContinuousClock.now
@@ -304,36 +309,80 @@ final class MacLink {
             if messages.last?.hasImages == true { throw MacError.noVision(model) }
             messages = messages.map(\.withoutImages)
         }
+        let tools = search && model.isEmpty == false ? await canUseTools(model) : false
+        let turns = messages.flatMap(Self.turns)
         let metrics = ConnectMetrics()
-        let (bytes, _) = try await open(messages, thinking: thinking, model: model, metrics: metrics, retry: true)
+        let (first, _) = try await open(turns, tools: tools, thinking: thinking, model: model, metrics: metrics, retry: true)
         lastWarm[model] = .now  // a real request keeps it loaded as well as a warm-up does
         let request = Request(route: route, timings: timings)  // after `open`, which may have re-resolved
         let stream = AsyncThrowingStream<Generation, Error> { continuation in
             let task = Task {
                 do {
-                    for try await line in bytes.lines {
-                        guard let chunk = try? JSONDecoder().decode(ChatChunk.self, from: Data(line.utf8)) else { continue }
-                        if let error = chunk.error { throw MacError.ollama(error) }
-                        if let t = chunk.message?.thinking, !t.isEmpty { continuation.yield(.thinking(t)) }
-                        if let t = chunk.message?.content, !t.isEmpty { continuation.yield(.text(t)) }
-                        if chunk.done == true {
+                    var bytes = first
+                    var turns = turns
+                    var rounds = 0
+                    var total = GenerationStats()
+                    while true {
+                        var calls: [String] = []
+                        var said = ""
+                        var finished: ChatChunk?
+                        for try await line in bytes.lines {
+                            guard let chunk = try? JSONDecoder().decode(ChatChunk.self, from: Data(line.utf8)) else { continue }
+                            if let error = chunk.error { throw MacError.ollama(error) }
+                            if let t = chunk.message?.thinking, !t.isEmpty { continuation.yield(.thinking(t)) }
+                            if let t = chunk.message?.content, !t.isEmpty {
+                                said += t
+                                continuation.yield(.text(t))
+                            }
+                            for call in chunk.message?.tool_calls ?? [] where call.function.name == WebSearch.toolName {
+                                if let q = call.function.arguments?.query?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
+                                    calls.append(q)
+                                }
+                            }
+                            if chunk.done == true { finished = chunk }
+                        }
+                        // Ended without `done`: the connection closed (Stop, or the Mac went away).
+                        guard let chunk = finished else { break }
+                        if rounds == 0 {
                             timings.loadSeconds = Double(chunk.load_duration ?? 0) / 1e9
-                            timings.readSeconds = Double(chunk.prompt_eval_duration ?? 0) / 1e9
-                            timings.serverSeconds = chunk.total_duration.map { Double($0) / 1e9 }
                             // URLSession reports the connection's metrics as the task ends.
                             timings.connectSeconds = await metrics.connectSeconds(waitingUpTo: .milliseconds(300))
-                            request.timings = timings
-                            var stats = GenerationStats()
-                            stats.promptTokens = chunk.prompt_eval_count ?? 0
-                            stats.promptSeconds = Double(chunk.prompt_eval_duration ?? 0) / 1e9
-                            stats.generatedTokens = chunk.eval_count ?? 0
-                            stats.generateSeconds = Double(chunk.eval_duration ?? 0) / 1e9
-                            continuation.yield(.done(stats))
                         }
+                        // Reading and writing add up over the rounds; the prompt of the last one is
+                        // the whole chat as the model last saw it.
+                        timings.readSeconds += Double(chunk.prompt_eval_duration ?? 0) / 1e9
+                        timings.serverSeconds = (timings.serverSeconds ?? 0) + Double(chunk.total_duration ?? 0) / 1e9
+                        total.promptTokens = chunk.prompt_eval_count ?? 0
+                        total.promptSeconds += Double(chunk.prompt_eval_duration ?? 0) / 1e9
+                        total.generatedTokens += chunk.eval_count ?? 0
+                        total.generateSeconds += Double(chunk.eval_duration ?? 0) / 1e9
+                        guard tools, !calls.isEmpty else {
+                            request.timings = timings
+                            continuation.yield(.done(total))
+                            break
+                        }
+                        rounds += 1
+                        // The model's turn as it was (anything it said, then its calls), then each
+                        // result, as `turns(_:)` renders a stored reply.
+                        var searches: [WebSearch] = []
+                        for query in calls {
+                            try Task.checkCancellation()
+                            continuation.yield(.searching(query))
+                            let result = await WebSearcher.search(query)
+                            searches.append(result)
+                            continuation.yield(.searched(result))
+                        }
+                        turns += Self.searchTurns(searches, said: said)
+                        try Task.checkCancellation()
+                        (bytes, _) = try await self.open(
+                            turns, tools: rounds < Self.searchRounds, thinking: thinking, model: model,
+                            metrics: ConnectMetrics(), retry: true)
                     }
                     continuation.finish()
                 } catch let error as URLError where error.code == .cancelled {
                     continuation.finish()  // Stop, not a failure
+                } catch is CancellationError {
+                    continuation.finish()
                 } catch {
                     if error is URLError { route = .unknown }
                     continuation.finish(throwing: error)
@@ -342,6 +391,26 @@ final class MacLink {
             continuation.onTermination = { _ in task.cancel() }
         }
         return (stream, request)
+    }
+
+    /// Searches a reply may run before it has to answer.
+    nonisolated static let searchRounds = 3
+
+    /// A chat message as Ollama's turns: a reply that searched first has each search as a call and
+    /// its result, then the answer. Rendered from the stored searches alone, so it's the same each time.
+    nonisolated fileprivate static func turns(_ m: ChatMessage) -> [ChatRequest.Message] {
+        let images = m.images?.map { $0.base64EncodedString() }
+        guard m.role == .assistant, let searches = m.searches, !searches.isEmpty else {
+            return [.init(role: m.role.rawValue, content: m.content, images: images)]
+        }
+        return searchTurns(searches, said: "") + [.init(role: "assistant", content: m.content)]
+    }
+
+    nonisolated fileprivate static func searchTurns(_ searches: [WebSearch], said: String) -> [ChatRequest.Message] {
+        guard !searches.isEmpty else { return [] }
+        let calls = searches.map { ChatRequest.Call(function: .init(name: WebSearch.toolName, arguments: ["query": $0.query])) }
+        return [.init(role: "assistant", content: said, tool_calls: calls)]
+            + searches.map { .init(role: "tool", content: $0.modelText, tool_name: WebSearch.toolName) }
     }
 
     /// Gets the Mac ready for a question that's coming (a chat opened, typing started): finds the
@@ -392,7 +461,7 @@ final class MacLink {
     }
 
     private func open(
-        _ messages: [ChatMessage], thinking: Thinking, model: String, metrics: ConnectMetrics, retry: Bool
+        _ turns: [ChatRequest.Message], tools: Bool, thinking: Thinking, model: String, metrics: ConnectMetrics, retry: Bool
     ) async throws -> (URLSession.AsyncBytes, URLResponse) {
         guard let host = route.host, let url = URL(string: "http://\(host)/api/chat") else { throw MacError.unreachable }
         guard !model.isEmpty else { throw MacError.noModel }
@@ -406,13 +475,12 @@ final class MacLink {
         let think: Bool? = cannotThink.contains(model) ? nil : thinking != .off || Self.alwaysThinks(model)
         request.httpBody = try JSONEncoder().encode(ChatRequest(
             model: model,
-            messages: messages.map {
-                .init(role: $0.role.rawValue, content: $0.content, images: $0.images?.map { $0.base64EncodedString() })
-            },
+            messages: turns,
             stream: true,
             think: think,
             options: .init(num_ctx: contextLength),
-            keep_alive: Self.keepAlive(for: model)
+            keep_alive: Self.keepAlive(for: model),
+            tools: tools ? [ChatRequest.Tool.webSearch] : nil
         ))
         do {
             let (bytes, response) = try await session.bytes(for: request, delegate: metrics)
@@ -424,15 +492,20 @@ final class MacLink {
                 let message = (try? JSONDecoder().decode(ChatChunk.self, from: body))?.error
                 if code == 400, think != nil, message?.localizedCaseInsensitiveContains("think") == true {
                     cannotThink.insert(model)  // not a thinking model: ask again without it, once
-                    return try await open(messages, thinking: thinking, model: model, metrics: metrics, retry: retry)
+                    return try await open(turns, tools: tools, thinking: thinking, model: model, metrics: metrics, retry: retry)
                 }
                 throw MacError.http(code, model: model, message: message)
             }
             return (bytes, response)
         } catch let error as URLError where error.code != .cancelled && retry {
             await resolve()
-            return try await open(messages, thinking: thinking, model: model, metrics: metrics, retry: false)
+            return try await open(turns, tools: tools, thinking: thinking, model: model, metrics: metrics, retry: false)
         }
+    }
+
+    /// Whether Ollama says the model can call tools (`/api/show`'s "tools").
+    func canUseTools(_ model: String) async -> Bool {
+        await capabilities(of: model)?.contains("tools") == true
     }
 
     /// One of Ollama's models, from `/api/tags`.
@@ -444,20 +517,63 @@ final class MacLink {
     private struct TagList: Decodable { let models: [OllamaModel] }
 
     fileprivate struct ChatRequest: Encodable {
-        struct Message: Encodable { let role: String; let content: String; let images: [String]? }
+        struct Message: Encodable {
+            let role: String
+            let content: String
+            var images: [String]? = nil
+            var tool_calls: [Call]? = nil
+            var tool_name: String? = nil
+        }
+        struct Call: Encodable {
+            struct Function: Encodable { let name: String; let arguments: [String: String] }
+            let function: Function
+        }
         struct Options: Encodable { let num_ctx: Int }
+        struct Tool: Encodable {
+            struct Function: Encodable {
+                struct Parameters: Encodable {
+                    struct Property: Encodable { let type: String; let description: String }
+                    let type = "object"
+                    let properties: [String: Property]
+                    let required: [String]
+                }
+                let name: String
+                let description: String
+                let parameters: Parameters
+            }
+            let type = "function"
+            let function: Function
+
+            static let webSearch = Tool(function: .init(
+                name: WebSearch.toolName, description: WebSearch.toolDescription,
+                parameters: .init(properties: ["query": .init(type: "string", description: WebSearch.queryDescription)],
+                                  required: ["query"])))
+        }
         let model: String
         let messages: [Message]
         let stream: Bool
         let think: Bool?  // left out when nil
         let options: Options
         let keep_alive: Int?  // left out when nil: the server's OLLAMA_KEEP_ALIVE applies
+        var tools: [Tool]? = nil
     }
 
     fileprivate struct ShowResponse: Decodable { let capabilities: [String]? }
 
     fileprivate struct ChatChunk: Decodable {
-        struct Message: Decodable { let content: String?; let thinking: String? }
+        struct Message: Decodable {
+            struct Call: Decodable {
+                struct Function: Decodable {
+                    struct Arguments: Decodable { let query: String? }
+                    let name: String
+                    let arguments: Arguments?
+                }
+                let function: Function
+            }
+            let content: String?
+            let thinking: String?
+            let tool_calls: [Call]?
+        }
         let message: Message?
         let done: Bool?
         let error: String?

@@ -1,3 +1,4 @@
+import LlamaKit
 import UIKit
 
 /// A non-scrolling, selectable text view: partial selection, Copy, Look Up, and tappable phone
@@ -246,6 +247,9 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     private let thinkingText = makeTextView(style: .callout, color: .secondaryLabel)
     /// The thought process, set off from the answer by a bar down its leading edge.
     private let thinkingBox = UIView()
+    /// "Searched for “…”": its menu lists each search's sources, which open in the browser.
+    private let searchButton = UIButton(configuration: .plain())
+    private var renderedSearches: [WebSearch]?
     private let answer = styled(AnswerTextView(), style: .body, color: .label)
     private let errorLabel = UILabel()
     private let errorRow = UIStackView()
@@ -266,7 +270,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     /// footnote never gets squeezed down to a sliver beside 44 pt buttons.
     private lazy var footerRow = UIStackView(arrangedSubviews: [versionRow, footnote, footerSpacer, footerButtons])
     private lazy var body = UIStackView(arrangedSubviews: [
-        statusRow, progress, thoughtTail, thinkingButton, thinkingBox, answer, errorLabel, errorRow, footerRow,
+        statusRow, progress, thoughtTail, thinkingButton, thinkingBox, searchButton, answer, errorLabel, errorRow, footerRow,
     ])
     /// The footnote moves under the row when beside the pager and buttons it would take more than two lines.
     private var footnoteBelow = false
@@ -317,6 +321,17 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         thinkingButton.contentHorizontalAlignment = .leading
         thinkingButton.isPointerInteractionEnabled = true
         thinkingButton.addAction(UIAction { [weak self] _ in self?.onToggleThinking?() }, for: .primaryActionTriggered)
+
+        var search = config
+        search.imagePlacement = .leading
+        search.imagePadding = 6
+        search.image = UIImage(systemName: "magnifyingglass")
+        search.titleLineBreakMode = .byTruncatingTail
+        searchButton.configuration = search
+        searchButton.contentHorizontalAlignment = .leading
+        searchButton.isPointerInteractionEnabled = true
+        searchButton.showsMenuAsPrimaryAction = true
+        searchButton.isHidden = true
 
         let thinkingBar = UIView()
         thinkingBar.backgroundColor = .tertiaryLabel  // .separator all but vanishes in dark mode
@@ -506,6 +521,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     override func prepareForReuse() {
         super.prepareForReuse()
         renderedKey = nil
+        renderedSearches = nil
         answer.resetCopied()
     }
 
@@ -545,6 +561,8 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         if !thinkingBox.isHidden, thinkingText.text != thinking { thinkingText.text = thinking }
         thoughtTail.isHidden = !(thinkingNow && !thinking.isEmpty && !content.thinkingExpanded)
         if !thoughtTail.isHidden { thoughtTail.text = Self.tail(of: thinking) }
+
+        showSearches(live?.searches ?? message.searches ?? [])
 
         answer.isHidden = text.isEmpty
         let before = renderedKey
@@ -593,6 +611,41 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         footerRow.isHidden = live != nil
         footnote.isHidden = live != nil  // also when it's below the row
         placeFootnote(width: body.bounds.width)
+    }
+
+    /// One line for the searches the model ran, with their sources in its menu: a section per
+    /// search, a row per page (its site underneath), or why the search failed.
+    private func showSearches(_ searches: [WebSearch]) {
+        searchButton.isHidden = searches.isEmpty
+        guard searches != renderedSearches else { return }
+        renderedSearches = searches
+        guard !searches.isEmpty else { return }
+        let failed = searches.allSatisfy { $0.error != nil }
+        let title = failed ? "Couldn't search the web"
+            : searches.count == 1 ? "Searched for “\(searches[0].query)”"
+            : "Searched the web \(searches.count) times"
+        searchButton.configuration?.title = title
+        searchButton.configuration?.image = UIImage(systemName: failed ? "exclamationmark.magnifyingglass" : "magnifyingglass")
+        let sources = searches.reduce(0) { $0 + $1.results.count }
+        searchButton.accessibilityLabel = title
+        searchButton.accessibilityValue = failed ? nil : "\(sources) sources"
+        searchButton.accessibilityHint = "Shows the sources"
+        searchButton.menu = UIMenu(children: searches.map { search in
+            let rows: [UIMenuElement] = if let error = search.error {
+                [UIAction(title: error, attributes: .disabled) { _ in }]
+            } else if search.results.isEmpty {
+                [UIAction(title: "No results", attributes: .disabled) { _ in }]
+            } else {
+                search.results.compactMap { result in
+                    guard let url = URL(string: result.url) else { return nil }
+                    let site = url.host()?.replacingOccurrences(of: "www.", with: "") ?? result.url
+                    return UIAction(title: result.title, subtitle: site, image: UIImage(systemName: "safari")) { _ in
+                        UIApplication.shared.open(url)
+                    }
+                }
+            }
+            return UIMenu(title: "“\(search.query)”", options: .displayInline, children: rows)
+        })
     }
 
     /// The last line or two of the thought stream, for under the status while it thinks.

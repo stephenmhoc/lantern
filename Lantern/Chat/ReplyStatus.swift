@@ -64,6 +64,9 @@ struct PhaseClock {
         case .thinking:
             what = "Thinking"
             intensity = 0.55
+        case .searching(let query):
+            what = "Searching the web for “\(query)”"
+            intensity = 0.45
         case .answering:
             what = "Writing"
             intensity = 1

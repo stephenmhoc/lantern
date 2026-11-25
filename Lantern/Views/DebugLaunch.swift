@@ -1,3 +1,4 @@
+import LlamaKit
 #if DEBUG
 import Foundation
 import CoreSpotlight
@@ -38,6 +39,7 @@ enum DebugLaunch {
 
     static func seed(_ context: ModelContext) {
         if ui?.hasPrefix("compare") == true { seedComparison(context) }
+        if ui == "search" { seedSearch(context) }
         guard arguments.contains("-seedChats"),
               (try? context.fetchCount(FetchDescriptor<Conversation>())) == 0 else { return }
         let day: TimeInterval = 86_400
@@ -158,6 +160,36 @@ extension DebugLaunch {
         try? context.save()
     }
 
+    static let searchChatID = "debug-search"
+
+    /// `-ui search`: a chat on the Mac whose answer ran two web searches, one of which failed.
+    static func seedSearch(_ context: ModelContext) {
+        let id = searchChatID
+        if let chat = ((try? context.fetch(FetchDescriptor<Conversation>(predicate: #Predicate { $0.stateID == id }))) ?? []).first {
+            context.delete(chat)
+        }
+        let chat = Conversation(mode: .mac)
+        chat.stateID = id
+        chat.title = "Ferry to Bainbridge"
+        chat.macModel = "inkling-2-mini:latest"
+        chat.lastActive = .now
+        var reply = StoredMessage(isUser: false)
+        reply.searches = [
+            WebSearch(query: "Seattle Bainbridge ferry schedule today", results: [
+                .init(title: "Seattle / Bainbridge Island – Sailing Schedule", url: "https://wsdot.com/ferries/schedule/seattle-bainbridge",
+                      content: "Departs Seattle 5:30 PM, 6:20 PM, 7:05 PM…"),
+                .init(title: "Bainbridge ferry delays and alerts", url: "https://www.example.com/bainbridge-alerts",
+                      content: "One-boat service this evening."),
+            ]),
+            WebSearch(query: "Bainbridge ferry vehicle wait time", error: "The search took too long."),
+        ]
+        reply.content = "The next sailings from Seattle are at **5:30**, **6:20** and **7:05 PM**. There's one-boat service this evening, so expect waits for cars."
+        reply.footnote = "Inkling 2 Mini on your Mac · 72.0 tok/s · 0.3 s to first token"
+        chat.messages = [StoredMessage(isUser: true, content: "When's the next ferry to Bainbridge?"), reply]
+        context.insert(chat)
+        try? context.save()
+    }
+
     private static var ranSystem = false
 
     static func value(after flag: String) -> String? {
@@ -173,6 +205,7 @@ extension DebugLaunch {
         if ui?.hasPrefix("compare") == true {
             _ = await UIApplication.shared.open(LanternLink.chat(id: comparisonChatID).url)
         }
+        if ui == "search" { _ = await UIApplication.shared.open(LanternLink.chat(id: searchChatID).url) }
         if let string = value(after: "-openURL"), let url = URL(string: string) {
             let opened = await UIApplication.shared.open(url)
             print("OPENURL \(string): \(opened)")

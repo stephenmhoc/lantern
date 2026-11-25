@@ -25,6 +25,9 @@ nonisolated enum Mode: String, Codable, CaseIterable, Identifiable, Sendable {
     /// Runs in Lantern through llama.cpp, from a downloaded file: on device, but not Apple's model,
     /// which runs in a system process and has no file, cache or saved state of Lantern's.
     var usesLlama: Bool { self != .mac && self != .apple }
+    /// Models whose web search is declared in their system turn and answered while they generate
+    /// (`LlamaModel.generate(search:)`). The computer is offered the tool per request instead.
+    var searchesOnDevice: Bool { usesLlama }
 }
 
 /// An on-device model Lantern knows how to run, with the settings it needs.

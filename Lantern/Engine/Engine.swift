@@ -209,7 +209,7 @@ final class Engine {
 
         let mode = conversation.mode
         let thinking = conversation.thinking
-        let system = ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))
+        let system = systemMessage(of: conversation, mode: mode)
         var history = [system] + conversation.history(before: conversation.messages.count - 1)
         let macModel = conversation.resolvedMacModel
         if mode == .mac, conversation.macModel.isEmpty, !macModel.isEmpty { conversation.macModel = macModel }
@@ -241,7 +241,8 @@ final class Engine {
                         live.macModel = macModel
                         if conversation.modelContext != nil, !conversation.isDeleted { conversation.macModel = macModel }
                     }
-                    (stream, request) = try await mac.stream(history, thinking: thinking, model: macModel)
+                    let search = WebSearcher.isEnabled
+                    (stream, request) = try await mac.stream(history, thinking: thinking, model: macModel, search: search)
                     if MacLink.alwaysThinks(macModel) { live.thinkingAsked = true }
                     statsKey = "mac:\(macModel)"
                     conversation.tokenLimit = mac.contextLength
@@ -296,13 +297,22 @@ final class Engine {
                         live.trimmed = true
                     }
                     try Task.checkCancellation()
-                    stream = llama.generate(history, sampling: model.sampling(thinking: thinking), thinking: thinking, checkpoint: checkpoint)
+                    // A search on device keeps three short results: the context is 8K, not the computer's 16K.
+                    let search: (@Sendable (String) async -> WebSearch)? = system.declaresWebSearch
+                        ? { @Sendable query in await WebSearcher.search(query, results: 3, excerpt: 700) } : nil
+                    stream = llama.generate(
+                        history, sampling: model.sampling(thinking: thinking), thinking: thinking, checkpoint: checkpoint,
+                        search: search)
                 }
                 for try await event in stream {
                     switch event {
                     case .reading(let p): live.phase = .reading(p)
                     case .thinking(let t): live.append(thinking: t)
                     case .text(let t): live.append(text: t)
+                    case .searching(let q): live.phase = .searching(q)
+                    case .searched(let s):
+                        live.add(search: s)
+                        write(live, to: conversation, finished: false)  // the sources show as soon as they're in
                     case .done(let s): stats = s
                     }
                     pieces += 1
@@ -427,6 +437,7 @@ final class Engine {
               let i = conversation.index(of: live.id) else { return }
         conversation.messages[i].content = live.text
         conversation.messages[i].thinking = live.thinking
+        conversation.messages[i].searches = live.searches.isEmpty ? nil : live.searches
         conversation.messages[i].finished = finished
         extra(&conversation.messages[i])
         conversation.lastActive = .now
@@ -491,6 +502,15 @@ final class Engine {
     }
 
     /// The chat's own prompt; chats from before prompts were stored get one dated when they began.
+    /// The chat's system message for `mode`: its frozen prompt, declaring web search to a model on
+    /// this device when searching is on (the templates put tools in the system turn; a model on a
+    /// computer is offered it with each request instead). Built the same way for `prepare`, so the
+    /// cache it readies is the one the reply starts from.
+    private func systemMessage(of conversation: Conversation, mode: Mode) -> ChatMessage {
+        let tools = mode.searchesOnDevice && WebSearcher.isEnabled ? [WebSearch.toolName] : []
+        return ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation), tools: tools)
+    }
+
     private func frozenSystemPrompt(of conversation: Conversation) -> String {
         if conversation.systemPrompt.isEmpty { conversation.systemPrompt = Self.systemPrompt(now: conversation.created) }
         return conversation.systemPrompt
@@ -513,6 +533,9 @@ final class Engine {
     /// UserDefaults key (Bool, off by default). When on, a chat too long for the model drops its
     /// oldest turns by itself instead of failing with `.contextFull`.
     static let autoTrimKey = "context.autoTrim"
+    /// Settings' "Search the Web": models on a computer that can use tools may search while
+    /// answering (`MacLink.stream(search:)`, `WebSearcher`). Off by default, and needs a Tavily key.
+    nonisolated static let webSearchKey = "webSearch"
 
     /// After a reply failed with `.contextFull`: leaves the oldest turns out (they stay visible,
     /// the model just no longer sees them; the system prompt is kept) and answers again.
@@ -605,13 +628,13 @@ final class Engine {
         }
         if mode == .apple {
             // The system loads its model while the question is typed; the session holds the chat.
-            let history = [ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))]
+            let history = [systemMessage(of: conversation, mode: mode)]
                 + conversation.history(before: conversation.messages.count)
             apple.prewarm(history, key: Self.appleKey(conversation))
             return
         }
         guard let model = model(for: mode), store.states[model.id] == .ready else { return }
-        let history = [ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation))]
+        let history = [systemMessage(of: conversation, mode: mode)]
             + conversation.history(before: conversation.messages.count)
         let thinking = conversation.thinking
         prepareCount += 1
@@ -1015,6 +1038,8 @@ nonisolated struct TypicalSpeed: Codable, Sendable {
 final class LiveReply {
     enum Phase: Equatable {
         case loading(Double), waiting, reading(Double), thinking, answering
+        /// Waiting for a web search the model asked for.
+        case searching(String)
 
         /// The same for every progress value of a phase.
         fileprivate var step: Int {
@@ -1024,6 +1049,7 @@ final class LiveReply {
             case .reading: 2
             case .thinking: 3
             case .answering: 4
+            case .searching: 5
             }
         }
     }
@@ -1042,6 +1068,8 @@ final class LiveReply {
     }
     private(set) var thinking = ""
     private(set) var text = ""
+    /// Web searches run so far, in order.
+    private(set) var searches: [WebSearch] = []
     private(set) var revision = 0
     /// Why it stopped, if it was stopped for the user rather than by them.
     var stopNote: String?
@@ -1085,6 +1113,11 @@ final class LiveReply {
         phase = .answering
     }
 
+    func add(search: WebSearch) {
+        searches.append(search)
+        revision += 1
+    }
+
     /// One line for the reply while it's under way, e.g. "Thinking · 12 s".
     var status: String? {
         let seconds = Int(Date().timeIntervalSince(started))
@@ -1093,6 +1126,7 @@ final class LiveReply {
         case .waiting: return mode == .mac ? "Asking the Mac…" : "Reading your question…"
         case .reading(let p): return "Reading the chat \(Int(p * 100))%"
         case .thinking: return "Thinking · \(seconds) s"
+        case .searching(let q): return "Searching for “\(q)”"
         case .answering: return nil
         }
     }

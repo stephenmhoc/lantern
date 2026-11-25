@@ -13,6 +13,9 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
     @AppStorage(ReplyDetails.key) private var showMetrics = true
+    @AppStorage(Engine.webSearchKey) private var webSearch = false
+    /// The Tavily key as typed; saved to the Keychain as it changes.
+    @State private var searchKey = WebSearcher.storedKey ?? ""
 
     var body: some View {
         Form {
@@ -42,6 +45,20 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Search the Web", isOn: $webSearch)
+                if webSearch {
+                    SecureField("Tavily API Key", text: $searchKey)
+                        .textContentType(.password)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .onSubmit { WebSearcher.setKey(searchKey) }
+                        .onChange(of: searchKey) { _, key in WebSearcher.setKey(key) }
+                }
+            } footer: {
+                Text(searchFooter)
+            }
+
+            Section {
                 Text(Engine.systemPrompt())
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -68,5 +85,11 @@ struct SettingsView: View {
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
         }
+    }
+
+    /// What the switch does, and what's still missing.
+    private var searchFooter: String {
+        let what = "Gemma, Qwen and the models on your computer can look things up while they answer. This \(UIDevice.current.model) sends their searches to Tavily, with your own API key from tavily.com."
+        return webSearch && searchKey.isEmpty ? what + " Add a key to start searching." : what
     }
 }

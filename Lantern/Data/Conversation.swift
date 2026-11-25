@@ -110,6 +110,9 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     /// How the reply was made and how fast (`ReplyMetrics`). Nil for questions, for replies from
     /// before it existed and for ones that failed before any timing.
     var metrics: ReplyMetrics?
+    /// The web searches the model ran for this answer, in order. Nil for none, and for replies
+    /// from before searching existed.
+    var searches: [WebSearch]?
 
     nonisolated var hasAttachments: Bool { !(attachments ?? []).isEmpty }
 
@@ -118,7 +121,7 @@ struct StoredMessage: Codable, Hashable, Identifiable {
     /// byte for byte the same each time (a saved cache is only reused for an identical prefix).
     nonisolated var chatMessage: ChatMessage? {
         guard error == nil, !content.isEmpty || hasAttachments else { return nil }
-        guard isUser else { return ChatMessage(role: .assistant, content: content) }
+        guard isUser else { return ChatMessage(role: .assistant, content: content, searches: searches ?? []) }
         var parts: [String] = []
         if let dateNote { parts.append(dateNote) }
         for file in attachments ?? [] where file.image == nil {
@@ -149,6 +152,7 @@ struct StoredMessage: Codable, Hashable, Identifiable {
         error = chosen.error
         thoughtSeconds = chosen.thoughtSeconds
         metrics = chosen.metrics
+        searches = chosen.searches
         versions = list
         versionIndex = index == list.count ? nil : index
     }
@@ -174,6 +178,7 @@ struct ReplyVersion: Codable, Hashable {
     var error: String?
     var thoughtSeconds: Double?
     var metrics: ReplyMetrics?
+    var searches: [WebSearch]?
 
     init(_ m: StoredMessage) {
         content = m.content
@@ -182,6 +187,7 @@ struct ReplyVersion: Codable, Hashable {
         error = m.error
         thoughtSeconds = m.thoughtSeconds
         metrics = m.metrics
+        searches = m.searches
     }
 }
 
