@@ -67,24 +67,47 @@ final class ChatTitler {
         }
     }
 
-    /// The first question and answer, cut short: enough to know what the chat is about.
+    /// The first question, cut short. The answer is left out: given it, the model titled the reply
+    /// ("Sky blue due to Rayleigh scattering") instead of the question ("Why the sky is blue").
     private static func excerpt(_ c: Conversation) -> String {
         let question = c.messages.first(where: \.isUser)
-        let answer = c.messages.first(where: { !$0.isUser && !$0.content.isEmpty })
         var q = String((question?.content ?? "").prefix(800))
         if q.isEmpty { q = (question?.attachments ?? []).map(\.name).joined(separator: ", ") }
-        let a = String((answer?.content ?? "").prefix(800))
-        return "Question:\n\(q)\n\nAnswer:\n\(a)"
+        // Framed as something to label, or the model answers it (a translation request came back translated).
+        return "Label this chat. Its first message:\n\"\"\"\n\(q)\n\"\"\""
     }
+
+    /// Tuned against the on-device model: examples did far more than rules (without them titles were
+    /// vague, like "Winter Vehicle Choice" for Subaru Outback vs RAV4, and in Title Case).
+    private nonisolated static let instructions = """
+        You write the short label shown for a chat in a list of past chats, so the person can find it \
+        again. You never answer the question or do what it asks: you only label it.
+
+        Rules:
+        - Two to five words. Capitalize the first word; keep names, acronyms, months and languages as \
+        they are normally written (TCP, March, Japanese).
+        - Name the specific subject, keeping the key words the person used: names, places, products, \
+        languages, technologies.
+        - Say what the chat is about, not what the reply said. No filler like "question about", \
+        "help with", "request for".
+        - Write the label in the language of the first message.
+        - Reply with the label alone: no quotes, no full stop.
+
+        Examples:
+        how long do eggs keep outside the fridge → Eggs outside the fridge
+        Compare the iPhone 16 and Pixel 9 cameras → iPhone 16 vs Pixel 9 cameras
+        write a bash script that renames all my jpgs by date → Bash script to rename JPGs by date
+        translate "thank you very much" into French → "Thank you very much" in French
+        why is the ocean salty → Why the ocean is salty
+        make this sound friendlier: per my last email, please advise → Friendlier email wording
+        plan a week of vegetarian dinners for two → Vegetarian dinner plan
+        hey there → Greeting
+        """
 
     nonisolated static func summarize(_ excerpt: String) async -> String? {
         #if canImport(FoundationModels)
         guard #available(iOS 26, *) else { return nil }
-        let session = LanguageModelSession(model: .default, instructions: """
-            You name chats. Given the start of a chat, reply with a title of two to five words that \
-            says what it is about, like the title of a note. Reply with the title only: no quotes, \
-            no full stop, no "Title:".
-            """)
+        let session = LanguageModelSession(model: .default, instructions: instructions)
         let options = GenerationOptions(temperature: 0.3, maximumResponseTokens: 24)
         guard let response = try? await session.respond(to: excerpt, options: options) else { return nil }
         return clean(response.content)
@@ -97,7 +120,13 @@ final class ChatTitler {
     nonisolated static func clean(_ raw: String) -> String? {
         var t = raw.split(whereSeparator: \.isNewline).first.map(String.init) ?? ""
         if t.lowercased().hasPrefix("title:") { t = String(t.dropFirst(6)) }
-        t = t.trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”‘’*#. ").union(.whitespaces))
+        t = t.trimmingCharacters(in: CharacterSet(charactersIn: "*#. ").union(.whitespaces))
+        // Quotes only when they wrap the whole title: a quoted phrase inside one ("Thank you" in French) stays.
+        let quotes = CharacterSet(charactersIn: "\"'“”‘’")
+        if let f = t.unicodeScalars.first, let l = t.unicodeScalars.last, quotes.contains(f), quotes.contains(l),
+           t.dropFirst().dropLast().allSatisfy({ !"\"“”".contains($0) }) {
+            t = String(t.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+        }
         guard !t.isEmpty, t.count <= 60, t.split(separator: " ").count <= 8 else { return nil }
         return t.prefix(1).uppercased() + t.dropFirst()
     }
