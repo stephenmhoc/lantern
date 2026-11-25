@@ -29,7 +29,7 @@ struct RootView: View {
     @State private var drawerOpen = false
     @GestureState private var drawerDrag: CGFloat = 0
     @State private var query = ""
-    @State private var searching = false
+    @FocusState private var searchFocused: Bool
     @State private var scope = SearchScope.all
     /// What the sidebar shows while a query is typed, computed off the main actor in `search`.
     @State private var results: [ChatSearch.Result] = []
@@ -123,6 +123,11 @@ struct RootView: View {
             // access at launch. It doesn't hold anything up.
             if lastMode == Mode.mac.rawValue, engine.mac.route == .unknown { await engine.mac.resolve() }
         }
+        .task {
+            // Short titles for chats that still have their question as the title, after launch settles.
+            try? await Task.sleep(for: .seconds(3))
+            ChatTitler.shared.backfill(conversations)
+        }
     }
 
     /// iPad: the side panel as a column, which can be hidden.
@@ -136,8 +141,8 @@ struct RootView: View {
                         ToolbarItem(placement: .topBarLeading) {
                             Button("Show sidebar", systemImage: "sidebar.left") { toggleSidebar() }
                         }
-                        ToolbarItem(placement: .topBarTrailing) { newChatButton }
                     }
+                    ToolbarItem(placement: .topBarTrailing) { newChatButton }
                 }
         }
     }
@@ -197,7 +202,8 @@ struct RootView: View {
                     .gesture(drawerGesture(width: width))
                     .accessibilityHidden(true)
 
-                NavigationStack { sidebar }
+                sidebar
+                    .background(Color(.systemBackground).ignoresSafeArea())
                     .frame(width: width)
                     // Rounded at the right, out to the screen's top and bottom edges.
                     .mask { UnevenRoundedRectangle(bottomTrailingRadius: 24, topTrailingRadius: 24).ignoresSafeArea() }
@@ -224,7 +230,7 @@ struct RootView: View {
         // The message box's keyboard would sit over the panel.
         if open { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
         withAnimation(.snappy(duration: 0.3)) { drawerOpen = open }
-        if !open { searching = false }
+        if !open { searchFocused = false }
     }
 
     private var needsAttention: Bool { Readiness.needsAttention(store: store) }
@@ -239,59 +245,41 @@ struct RootView: View {
 
     // MARK: - Sidebar
 
+    /// The side panel: Lantern and search at the top, the chats as plain rows (the open one
+    /// highlighted), Settings and New chat at the bottom. The same view is the iPad's sidebar column
+    /// and the iPhone's drawer; neither has a navigation bar of its own.
     private var sidebar: some View {
-        // Selection-driven rows (no NavigationLink): on iPhone a NavigationLink here pushes twice.
-        List(selection: $selection) {
+        // Buttons, not list selection: the panel's own highlight, the same on iPhone and iPad, and
+        // a tap on the chat already open still closes the drawer.
+        List {
             if isSearching {
                 searchResults
             } else {
                 chatSections
             }
         }
-        // Under the large title on iPhone: with `.sidebar` there, iOS 26 put the field at the bottom
-        // beside the bar of buttons. The sidebar's own placement on iPad.
-        .searchable(text: $query, isPresented: $searching,
-                    placement: hasSidebarToggle ? .sidebar : .navigationBarDrawer(displayMode: .always),
-                    prompt: "Search chats")
-        .searchScopes($scope, activation: .onSearchPresentation) {
-            ForEach(SearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
-        }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .environment(\.defaultMinListRowHeight, 0)
+        .scrollDismissesKeyboard(.immediately)
+        .modifier(TopBar { sidebarHeader })
+        // Settings and New chat sit in the list's own bottom inset.
+        .modifier(BottomBar { sidebarButtons })
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(removing: .sidebarToggle)
         .task(id: searchKey) { await search(searchKey) }
-        .onChange(of: searching) { _, on in if !on { SearchIndex.shared.clear() } }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             SearchIndex.shared.clear()
         }
         .onChange(of: selection) { _, c in
-            if !hasSidebarToggle, drawerOpen { setDrawer(false) }
-            if isSearching, let c, let r = results.first(where: { $0.id == c.persistentModelID }) {
-                // Arrow keys onto a result: jump to its match too (a tap already set it).
-                requestJump(to: r)
-            } else if let requested = jumpRequested, requested != c?.persistentModelID {
+            if let requested = jumpRequested, requested != c?.persistentModelID {
                 // This window's jump nobody took shouldn't fire on some later visit. Only its own:
                 // another window's is for the chat that window shows.
                 ChatJump.shared.clear(for: requested)
                 jumpRequested = nil
             }
         }
-        // Rows carry a preview and a date: give them room on iPad.
-        .navigationSplitViewColumnWidth(min: 280, ideal: 320, max: 400)
-        .navigationTitle("Lantern")
-        // The large title in the bar's own row: nothing else sits up there now that New chat is
-        // at the bottom, so a separate row for it was only empty space.
-        .toolbarTitleDisplayMode(.inlineLarge)
-        // Our own sidebar button, at the far left of the header instead of beside New chat.
-        .toolbar(removing: .sidebarToggle)
-        .toolbar {
-            if hasSidebarToggle {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("Hide sidebar", systemImage: "sidebar.left") { toggleSidebar() }
-                }
-            }
-        }
-        // Settings and New chat sit in the list's own bottom inset, not the navigation toolbar:
-        // on iPhone the sidebar and the chat share one navigation controller, and a toolbar item
-        // of the sidebar's stayed drawn over a chat opened by a link.
-        .modifier(BottomBar { sidebarButtons })
+        .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
         .overlay {
             if history.isEmpty, !isSearching {
                 ContentUnavailableView {
@@ -303,6 +291,53 @@ struct RootView: View {
                 ContentUnavailableView.search(text: trimmedQuery)
             }
         }
+    }
+
+    /// "Lantern" with the flame, the iPad's hide-sidebar button, the search field and, while a
+    /// query is typed, what to search.
+    private var sidebarHeader: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "flame.fill").foregroundStyle(.tint).accessibilityHidden(true)
+                Text("Lantern").font(.title3.weight(.bold)).accessibilityAddTraits(.isHeader)
+                Spacer()
+                if hasSidebarToggle {
+                    Button("Hide sidebar", systemImage: "sidebar.left") { toggleSidebar() }
+                        .labelStyle(.iconOnly)
+                        .font(.title3)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(.rect)
+                        .buttonStyle(.borderless)
+                        .tint(.primary)
+                }
+            }
+            .frame(minHeight: 44)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
+                TextField("Search chats", text: $query)
+                    .focused($searchFocused)
+                    .submitLabel(.search)
+                    .autocorrectionDisabled()
+                if !query.isEmpty {
+                    Button("Clear search", systemImage: "xmark.circle.fill") { query = "" }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(minHeight: 40)
+            .background(Color(.tertiarySystemFill), in: .capsule)
+            if isSearching {
+                Picker("Search in", selection: $scope) {
+                    ForEach(SearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, hasSidebarToggle ? 4 : 8)
+        .padding(.bottom, 8)
     }
 
     /// Settings on the left (badged when it needs a look), New chat on the right, as round glass buttons.
@@ -336,20 +371,19 @@ struct RootView: View {
         .padding(.vertical, 8)
     }
 
-    /// The chats by date, with their swipe actions and menu.
+    /// The chats by date, with their swipe actions and menu. The dates are plain rows rather than
+    /// section headers, which a plain list pins to the top with a bar behind them.
     private var chatSections: some View {
-        ForEach(sections) { section in
-            Section {
-                ForEach(section.chats) { c in
-                    rowActions(ChatRow(conversation: c, answering: engine.running == c.persistentModelID).tag(c), c)
-                }
-            } header: {
-                // On the title's (and the cards') edge rather than indented to the rows' text.
-                // The list ignores header insets, so it's pulled out by the card's inset.
-                Text(section.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, -16)
+        ForEach(Array(sections.enumerated()), id: \.element.id) { i, section in
+            Text(section.title)
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+                .listRowInsets(EdgeInsets(top: i == 0 ? 4 : 18, leading: 20, bottom: 4, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            ForEach(section.chats) { c in
+                chatButton(c) { ChatRow(conversation: c, answering: engine.running == c.persistentModelID) }
             }
         }
     }
@@ -359,35 +393,40 @@ struct RootView: View {
         let byID = Dictionary(conversations.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { a, _ in a })
         return ForEach(results) { r in
             if let c = byID[r.id] {
-                // The list's selection opens the chat (onChange(of: selection) sets the jump); the
-                // tap also sets it, for the chat already shown on iPad, whose selection doesn't change.
-                rowActions(SearchResultRow(result: r).tag(c), c, result: r)
-                    .simultaneousGesture(TapGesture().onEnded { requestJump(to: r) })
+                chatButton(c, result: r) { SearchResultRow(result: r) }
             }
         }
     }
 
-    /// A row's swipe actions and menu, the same for a chat and a search result. `result`: open
-    /// windows at its match too.
-    private func rowActions(_ row: some View, _ c: Conversation, result: ChatSearch.Result? = nil) -> some View {
-        row
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
-                Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
-            }
-            .swipeActions(edge: .leading) {
-                Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") {
-                    togglePin(c)
-                }
+    /// A chat in the panel: opens it (at the match, for a search result) and puts the drawer away,
+    /// with the swipe actions and menu. The open chat is highlighted.
+    private func chatButton(_ c: Conversation, result: ChatSearch.Result? = nil,
+                            @ViewBuilder label: () -> some View) -> some View {
+        Button {
+            if let result { requestJump(to: result) }
+            selection = c
+            if !hasSidebarToggle { setDrawer(false) }
+        } label: {
+            label()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(.rect(cornerRadius: 12))
+        }
+        .buttonStyle(SidebarRowStyle(selected: selection == c))
+        .accessibilityAddTraits(selection == c ? .isSelected : [])
+        .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
+            Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
+        }
+        .swipeActions(edge: .leading) {
+            Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") { togglePin(c) }
                 .tint(.orange)
-            }
-            .contextMenu { menu(for: c, result: result) }
-            // iPhone: open it and put the panel away, even when it's the chat already shown.
-            .simultaneousGesture(TapGesture().onEnded {
-                guard !hasSidebarToggle else { return }
-                selection = c
-                setDrawer(false)
-            })
+        }
+        .contextMenu { menu(for: c, result: result) }
     }
 
     /// Asks the chat screen showing `r`'s chat to scroll to its match. Keyed by the chat, so it
@@ -493,7 +532,7 @@ struct RootView: View {
         } else {
             setDrawer(true)
         }
-        searching = true
+        searchFocused = true
     }
 
     private func step(_ offset: Int) {
@@ -519,7 +558,6 @@ struct RootView: View {
         case "settings"?: showSettings()
         case let ui? where ui.hasPrefix("search:"):
             query = String(ui.dropFirst("search:".count))
-            searching = true
         case let ui?:
             // Menu-bar actions, once the window has settled: delete, newchat, sidebar, next, window.
             Task {
@@ -586,7 +624,7 @@ struct RootView: View {
     /// A `lantern://` link, an App Intent or a Spotlight result, in this window.
     private func handle(_ link: LanternLink) {
         restoreSelection()  // first, in case this arrives before the window appeared
-        searching = false
+        searchFocused = false
         if drawerOpen { setDrawer(false) }
         guard sheet == nil else {
             // Selecting while the sheet goes away can be lost: dismiss, then go on next turn.
@@ -652,6 +690,38 @@ struct BottomBar<Bar: View>: ViewModifier {
         } else {
             content.safeAreaInset(edge: .bottom, spacing: 0) { bar().background(.bar) }
         }
+    }
+}
+
+/// Buttons in a scroll view's top inset (the side panel's header), like `BottomBar`.
+struct TopBar<Bar: View>: ViewModifier {
+    @ViewBuilder let bar: () -> Bar
+
+    func body(content: Content) -> some View {
+        if #available(iOS 26, *) {
+            content.scrollEdgeEffectStyle(.soft, for: .top).safeAreaBar(edge: .top) { bar() }
+        } else {
+            content.safeAreaInset(edge: .top, spacing: 0) { bar().background(.bar) }
+        }
+    }
+}
+
+/// A chat in the side panel: a rounded highlight in the accent colour when it's the open one, a
+/// faint one while pressed or under the pointer.
+private struct SidebarRowStyle: ButtonStyle {
+    let selected: Bool
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(.primary)
+            .background {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(selected ? AnyShapeStyle(Color.accentColor.opacity(0.16))
+                          : configuration.isPressed || hovering ? AnyShapeStyle(Color.primary.opacity(0.07))
+                          : AnyShapeStyle(Color.clear))
+            }
+            .onHover { hovering = $0 }
     }
 }
 

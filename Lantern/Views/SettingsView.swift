@@ -12,6 +12,7 @@ struct SettingsView: View {
     @Environment(ModelStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
+    @AppStorage(ReplyDetails.key) private var showMetrics = true
 
     var body: some View {
         Form {
@@ -30,6 +31,14 @@ struct SettingsView: View {
                         Label("On Your Computers", systemImage: "desktopcomputer")
                     }
                 }
+            }
+
+            Section {
+                Toggle("Speed and Tokens", isOn: $showMetrics)
+            } header: {
+                Text("Chats")
+            } footer: {
+                Text("Under each answer: the model, tokens per second and how long it took to start.")
             }
 
             Section {

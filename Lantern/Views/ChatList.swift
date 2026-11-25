@@ -61,39 +61,35 @@ enum DefaultMode {
     }
 }
 
-/// One chat in the sidebar: title and when, the last message, and the model.
+/// One chat in the side panel: its title (a few words from Apple Intelligence, or the first
+/// question) on up to two lines, then the model and when.
 struct ChatRow: View {
     let conversation: Conversation
     let answering: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(conversation.title).font(.body.weight(.medium)).lineLimit(1)
-                Spacer(minLength: 0)
+            Text(conversation.title)
+                .font(.body)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            HStack(spacing: 4) {
+                Text(conversation.modelTitle)
+                Text("·").accessibilityHidden(true)
                 if answering {
                     // Animates on its own: the row isn't redrawn while the reply streams.
+                    Text("Answering")
                     Image(systemName: "ellipsis")
                         .symbolEffect(.variableColor.iterative, options: .repeat(.continuous))
-                        .foregroundStyle(.tint)
-                        .accessibilityLabel("Answering")
+                        .accessibilityHidden(true)
                 } else {
-                    Text(Self.when(conversation.lastActive)).font(.caption).foregroundStyle(.secondary)
+                    Text(Self.when(conversation.lastActive))
                 }
-            }
-            if let preview = Self.preview(conversation.messages) {
-                Text(preview).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-            }
-            // Pinned chats have their own section, so the row doesn't mark them again.
-            // Not a Label: in a List it gets a fixed-width icon column, which left a gap.
-            HStack(spacing: 4) {
-                Image(systemName: conversation.mode.symbol).imageScale(.small)
-                Text(conversation.modelTitle)
             }
             .font(.caption)
             .foregroundStyle(.secondary)  // tertiary is under 3:1 in dark mode
+            .lineLimit(1)
         }
-        .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityValue(conversation.pinned ? "Pinned" : "")
     }

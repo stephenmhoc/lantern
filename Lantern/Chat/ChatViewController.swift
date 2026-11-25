@@ -124,7 +124,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         // A starter fills the message box for the user to finish; it never replaces a draft.
         let starters = host(EmptyChat(conversation: conversation) { [unowned self] text in
             if composer.text.isEmpty { composer.text = text }
-            composer.textView.becomeFirstResponder()
+            // Next turn: the same tap also reaches `tappedTranscript`, which would put the keyboard away.
+            DispatchQueue.main.async { self.composer.textView.becomeFirstResponder() }
         })
         collectionView.backgroundView = starters.view
 
@@ -157,6 +158,19 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         ])
 
         Speaker.shared.onChange = { [weak self] in self?.reconfigureVisibleAnswers() }
+        // Settings' "Speed and tokens" switch: redraw the answers' footnotes when it changes.
+        showsMetrics = ReplyDetails.shown
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.showsMetrics != ReplyDetails.shown else { return }
+                self.showsMetrics = ReplyDetails.shown
+                self.reconfigureVisibleAnswers()
+            }
+        }
+        // A tap on the transcript (or the new chat's page) away from the message box puts the keyboard away.
+        let tapAway = UITapGestureRecognizer(target: self, action: #selector(tappedTranscript))
+        tapAway.cancelsTouchesInView = false
+        collectionView.addGestureRecognizer(tapAway)
         // Files dropped anywhere on the chat are attached (text dropped on the field is typed).
         view.addInteraction(UIDropInteraction(delegate: self))
         setUpDictation()
@@ -356,6 +370,12 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     private func modelName(for mode: Mode) -> String? {
         mode == .mac ? conversation.modelTitle : mode == .apple ? mode.title : engine.model(for: mode)?.name
+    }
+
+    private var showsMetrics = true
+
+    @objc private func tappedTranscript() {
+        if composer.textView.isFirstResponder { composer.textView.resignFirstResponder() }
     }
 
     private func reconfigureVisibleAnswers() {
@@ -1094,6 +1114,7 @@ struct ChatScreen: View {
     @Environment(\.showSettings) private var showSettings
     @Environment(\.openChat) private var openChat
     @State private var comparing: ComparisonRequest?
+    @Environment(\.horizontalSizeClass) private var sizeClass
 
     /// The reply `CompareView` shows, and which side it starts on.
     struct ComparisonRequest: Identifiable {
@@ -1116,13 +1137,19 @@ struct ChatScreen: View {
                     Label("Export Chat", systemImage: "square.and.arrow.up")
                 }
                 .disabled(conversation.messages.isEmpty)
+                // iPhone: here rather than in the bar, which keeps to the side panel and New chat.
+                if sizeClass == .compact {
+                    Button("Chat Info", systemImage: "info.circle") { showInspector = true }
+                }
             }
             .toolbar {
-                ToolbarItem(placement: .primaryAction) {
-                    Button(showInspector ? "Hide Info" : "Show Info", systemImage: "info.circle") {
-                        withAnimation { showInspector.toggle() }
+                if sizeClass != .compact {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button(showInspector ? "Hide Info" : "Show Info", systemImage: "info.circle") {
+                            withAnimation { showInspector.toggle() }
+                        }
+                        .keyboardShortcut("i", modifiers: [.command, .option])
                     }
-                    .keyboardShortcut("i", modifiers: [.command, .option])
                 }
             }
             // Here rather than presented from UIKit: the screen is rebuilt per chat (`.id`), so the

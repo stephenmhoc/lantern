@@ -1,14 +1,13 @@
 import SwiftUI
 
-/// Shown in an empty chat, the page Lantern opens on: where the answers come from, and a few prompt
-/// ideas (four at a time from `Starter.all`, "More ideas" for the next four). It's the transcript's
-/// background view, so it disappears with the first message.
+/// Shown in an empty chat, the page Lantern opens on: a few prompt ideas, four at a time from
+/// `Starter.all` ("More ideas" for the next four). It's the transcript's background view, so it
+/// disappears with the first message.
 struct EmptyChat: View {
     let conversation: Conversation
     /// Puts a starter's opening words in the message box for the user to finish. Without it the
     /// starters aren't shown, since tapping them would do nothing.
     var onStarter: ((String) -> Void)?
-    @Environment(MacLink.self) private var mac
     @Environment(\.colorScheme) private var colorScheme
     /// Which four ideas show: a different set each new chat, the next set on "More ideas".
     @State private var page = Int.random(in: 0..<Starter.pages)
@@ -37,11 +36,6 @@ struct EmptyChat: View {
                         .background(.tint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: .circle)
                         .accessibilityHidden(true)
                     Text("Ask anything").font(.title2.bold())
-                    Text(message)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             if starters, let onStarter {
@@ -75,12 +69,6 @@ struct EmptyChat: View {
             }
         }
         .frame(maxWidth: 460)
-    }
-
-    private var message: String {
-        guard conversation.mode == .mac else { return "Answers come from this device, with or without internet." }
-        if mac.route == .unreachable { return "Lantern can't reach your Mac right now." }
-        return "Your Mac answers, over your home network or tailnet."
     }
 }
 

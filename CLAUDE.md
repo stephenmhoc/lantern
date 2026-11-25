@@ -44,9 +44,12 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
 - `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window that opens on a new chat (keyboard down, rotating
   prompt ideas from `Starter.all` in `EmptyChatView`), with past chats and Settings in a side
   panel: a sidebar column on iPad (with the inspector as a third column), a drawer sliding over the
-  chat on iPhone (top-left button or edge swipe). The panel has search under the title, date
-  sections, pin, rename and immediate delete (no undo, no in-app toasts) and lists only chats with
-  messages; deleting the chat on screen goes to a new chat. Only a window opened for a chat
+  chat on iPhone (top-left button or edge swipe). The panel is custom (no navigation bar): Lantern and a
+  search field at the top, plain rows (title on two lines, model and time) with the open chat
+  highlighted, pin, rename and immediate delete (no undo, no in-app toasts); it lists only chats
+  with messages. A chat's title starts as its first question; after an answer `ChatTitler` asks
+  Apple Intelligence (when on) for a few words, and only ever replaces a title still equal to the
+  question, so a rename sticks; deleting the chat on screen goes to a new chat. Only a window opened for a chat
   restores its selection;
   `LanternCommands` is the iPad menu bar, reaching the key window through `focusedSceneValue`
   (`SceneActions`, `ChatFocus`); `ChatList` holds the sidebar's grouping and the default mode for new
@@ -57,7 +60,9 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   `_ollama._tcp`, tailnet peers and a typed address). The Models page just lists models: no
   "ready"/"offline" summary. The sidebar's bottom bar has Settings on the left (badged only when no
   model can answer or the build expires soon, `Readiness.needsAttention`) and New chat on the right.
-  The composer collapses to one row (model, field, mic or Stop) while the keyboard is down.
+  The composer collapses to one row (model, field, mic or Stop) while the keyboard is down; a tap
+  on the transcript puts the keyboard away. Settings' "Speed and Tokens" (`ReplyDetails`) trims
+  the line under each answer to only stop and cut-off notes.
 - `Lantern/System`: the ways in from outside the app. `LanternLink` is the `lantern://` scheme
   (`new?mode=fast`, `ask?text=…&mode=`, `chat/<id>`), shared with the widgets. App Intents
   (`LanternIntents`: Ask Lantern, Open Chat and the App Shortcuts phrases; `NewChatIntent`, shared

@@ -380,7 +380,7 @@ struct SearchResultRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(result.title).font(.body.weight(.medium)).lineLimit(1)
+                Text(result.title).font(.body).lineLimit(2)
                 Spacer(minLength: 0)
                 Text(ChatRow.when(result.lastActive)).font(.caption).foregroundStyle(.secondary)
             }
@@ -396,7 +396,6 @@ struct SearchResultRow: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(spoken)
         .accessibilityAddTraits(.isButton)

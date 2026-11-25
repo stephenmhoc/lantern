@@ -71,7 +71,7 @@ final class Engine {
 
     func send(_ text: String, attachments: [Attachment] = [], in conversation: Conversation) {
         guard !isBusy, !text.isEmpty || !attachments.isEmpty else { return }
-        if conversation.messages.isEmpty { conversation.title = String((text.isEmpty ? attachments[0].name : text).prefix(60)) }
+        if conversation.messages.isEmpty { conversation.title = ChatTitler.provisional(text: text, attachments: attachments) }
         _ = frozenSystemPrompt(of: conversation)  // so the date note compares with the chat's own date
         var message = StoredMessage(isUser: true, content: text)
         message.attachments = attachments.isEmpty ? nil : attachments
@@ -385,6 +385,10 @@ final class Engine {
             // A reply that had to load the model first says nothing about the usual wait.
             let loaded = live.waitedForLoad || (live.mode == .mac && (request?.timings.loadSeconds ?? 0) >= 1)
             TypicalSpeed.record(firstToken: loaded ? nil : first, tokensPerSecond: stats.tokensPerSecond, for: statsKey)
+        }
+        // A few words from Apple Intelligence in place of the question, once there's an answer.
+        if stats != nil, error == nil, conversation.modelContext != nil, !conversation.isDeleted {
+            ChatTitler.shared.titleIfNeeded(conversation)
         }
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)  // you may have put it down
