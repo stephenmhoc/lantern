@@ -1,3 +1,4 @@
+import GameController
 import LlamaKit
 import PhotosUI
 import SwiftData
@@ -168,8 +169,12 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         takeJump()
         observeJump()
         // Ready to type on iPad and Mac; on iPhone the keyboard would cover a chat you came to read.
-        // Not behind a sheet (Settings, Readiness), whose keyboard-covered content would be hidden.
-        if traitCollection.userInterfaceIdiom != .phone, view.window?.rootViewController?.presentedViewController == nil {
+        // A new chat is the page the app opens on, with its prompt ideas: there the on-screen
+        // keyboard stays down, so only with a hardware keyboard. Not behind a sheet (Settings,
+        // Readiness), whose keyboard-covered content would be hidden.
+        let keyboardOK = !conversation.messages.isEmpty || GCKeyboard.coalesced != nil
+        if traitCollection.userInterfaceIdiom != .phone, keyboardOK,
+           view.window?.rootViewController?.presentedViewController == nil {
             composer.textView.becomeFirstResponder()
         }
         engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message

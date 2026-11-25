@@ -41,8 +41,13 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   `Dictation.swift` is the composer's mic: on-device only, `SpeechAnalyzer`/`SpeechTranscriber` on
   iOS 26+, `SFSpeechRecognizer` with `requiresOnDeviceRecognition` otherwise; the button is hidden
   when neither works for the language.
-- `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window (sidebar with search under
-  the title, date sections, pin, rename, immediate delete: no undo, no in-app toasts);
+- `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window that opens on a new chat (keyboard down, rotating
+  prompt ideas from `Starter.all` in `EmptyChatView`), with past chats and Settings in a side
+  panel: a sidebar column on iPad (with the inspector as a third column), a drawer sliding over the
+  chat on iPhone (top-left button or edge swipe). The panel has search under the title, date
+  sections, pin, rename and immediate delete (no undo, no in-app toasts) and lists only chats with
+  messages; deleting the chat on screen goes to a new chat. Only a window opened for a chat
+  restores its selection;
   `LanternCommands` is the iPad menu bar, reaching the key window through `focusedSceneValue`
   (`SceneActions`, `ChatFocus`); `ChatList` holds the sidebar's grouping and the default mode for new
   chats; `ModelImport` copies a `.gguf` the user already has into Documents (the Models page's file
