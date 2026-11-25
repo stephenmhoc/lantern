@@ -76,7 +76,7 @@ struct CompareMetricsView: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(letter).font(.subheadline.weight(.semibold))
             if let m {
-                Label(m.modelTitle, systemImage: (Mode(rawValue: m.modeRaw) ?? .fast).symbol)
+                Label(m.labeledTitle, systemImage: (Mode(rawValue: m.modeRaw) ?? .fast).symbol)
                     .labelStyle(.titleAndIcon)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -85,7 +85,7 @@ struct CompareMetricsView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(m.map { "\(letter), \($0.modelTitle)" } ?? letter)
+        .accessibilityLabel(m.map { "\(letter), \($0.labeledTitle)" } ?? letter)
         .accessibilityAddTraits(.isHeader)
     }
 
@@ -166,8 +166,13 @@ struct CompareMetricsView: View {
         }
     }
 
+    private static func thinking(_ m: ReplyMetrics?) -> Value {
+        Value(text: m?.thinking.map { $0 ? "On" : "Off" })
+    }
+
     var rows: [Row] {
         var rows: [Row] = []
+        rows.append(Row(label: "Thinking", a: Self.thinking(a), b: Self.thinking(b)))
         rows.append(Row(label: "First token", a: Self.time(a?.firstTokenSeconds), b: Self.time(b?.firstTokenSeconds)))
         rows.append(Row(label: "First answer word", a: Self.time(a?.firstAnswerSeconds), b: Self.time(b?.firstAnswerSeconds)))
         // The model's own part of that wait: from the end of reading the chat to the answer, which

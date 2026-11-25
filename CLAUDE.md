@@ -233,4 +233,7 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   iPhone, the metrics table, Prefer and Continue With). Only speed and the time to answer after
   reading (first answer word less reading, finding the Mac and connecting) are ranked; load,
   reading, first token and answer time depend on memory, the network or the answer's length.
-  `-ui compare[:b][:metrics]` seeds and shows one.
+  B may be A's own model with thinking the other way:
+  Compare With opens `ComparePicker` (the model picker with a Think First switch for B), and
+  `ReplyMetrics.labeledTitle` adds "· Thinking" to tell the sides apart; Continue With takes the
+  answer's thinking too. `-ui compare[:b][:metrics]` seeds and shows one, `-ui compare:picker` the picker.

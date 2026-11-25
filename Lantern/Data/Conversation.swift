@@ -292,6 +292,12 @@ nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
 
     /// Asked to think (or the model always thinks).
     var thinking: Bool?
+
+    /// The model, with "· Thinking" when it thought: what tells apart the two answers of a
+    /// comparison of one model with thinking on and off.
+    var labeledTitle: String {
+        thinking == true && modeRaw != Mode.apple.rawValue ? "\(modelTitle) · Thinking" : modelTitle
+    }
     /// The oldest turns were left out to fit the context.
     var trimmed: Bool?
     /// Cut off by a limit (`StopReason` raw value) or stopped by the user.

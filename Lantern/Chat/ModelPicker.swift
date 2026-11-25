@@ -6,7 +6,8 @@ import SwiftUI
 /// device and on the computer, one row each; picking one closes it.
 ///
 /// It replaced a UIMenu, which put Thinking in a submenu at the very end of a list too long for
-/// the space above the composer.
+/// the space above the composer. The answer menu's Compare With uses it too (`ComparePicker`), with
+/// the switch for the second answer.
 struct ModelPicker: View {
     struct Row: Identifiable {
         let choice: ModelChoice
@@ -24,11 +25,15 @@ struct ModelPicker: View {
         let rows: [Row]
     }
 
+    var title = "Model"
+    /// Compare With closes with Cancel: picking a model is what starts it.
+    var cancels = false
     /// Read while drawing, so the rows follow the engine and the chat (a model finishing its
-    /// download, the computer answering) while the picker is open.
-    let groups: () -> [Group]
+    /// download, the computer answering) and the switch while the picker is open.
+    let groups: (_ thinking: Bool) -> [Group]
     /// Nil when the chat's model doesn't think at all (Apple Intelligence).
     let thinking: Binding<Bool>?
+    var thinkingFooter = "The model reasons before it answers: slower, but better at hard questions."
     let select: (ModelChoice) -> Void
     let getModels: (() -> Void)?
     let close: () -> Void
@@ -42,10 +47,10 @@ struct ModelPicker: View {
                             Label("Think First", systemImage: "lightbulb")
                         }
                     } footer: {
-                        Text("The model reasons before it answers: slower, but better at hard questions.")
+                        Text(thinkingFooter)
                     }
                 }
-                ForEach(Array(groups().enumerated()), id: \.offset) { _, group in
+                ForEach(Array(groups(thinking?.wrappedValue ?? false).enumerated()), id: \.offset) { _, group in
                     Section(group.title) {
                         ForEach(group.rows) { row($0) }
                     }
@@ -56,10 +61,14 @@ struct ModelPicker: View {
                     }
                 }
             }
-            .navigationTitle("Model")
+            .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) }
+                if cancels {
+                    ToolbarItem(placement: .cancellationAction) { Button("Cancel", action: close) }
+                } else {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done", action: close) }
+                }
             }
         }
     }
@@ -89,5 +98,40 @@ struct ModelPicker: View {
         .disabled(!row.enabled)
         .opacity(row.enabled ? 1 : 0.45)
         .accessibilityAddTraits(row.current ? .isSelected : [])
+    }
+}
+
+/// Compare With: which model writes the second answer, and whether it thinks. The switch starts
+/// as the first answer was made; the first answer's own model can be picked once it's flipped.
+struct ComparePicker: View {
+    /// Whether the answer being compared was written with thinking.
+    let answerThought: Bool
+    let groups: (_ thinking: Bool) -> [ModelPicker.Group]
+    let select: (ModelChoice, _ thinking: Bool) -> Void
+    let close: () -> Void
+    @State private var thinking: Bool
+
+    init(answerThought: Bool, groups: @escaping (_ thinking: Bool) -> [ModelPicker.Group],
+         select: @escaping (ModelChoice, _ thinking: Bool) -> Void, close: @escaping () -> Void) {
+        self.answerThought = answerThought
+        self.groups = groups
+        self.select = select
+        self.close = close
+        _thinking = State(initialValue: answerThought)
+    }
+
+    var body: some View {
+        ModelPicker(
+            title: "Compare With",
+            cancels: true,
+            groups: groups,
+            thinking: $thinking,
+            thinkingFooter: """
+                For the second answer. This one was written with thinking \(answerThought ? "on" : "off"): \
+                switch it to compare the same model \(answerThought ? "without" : "with") it.
+                """,
+            select: { select($0, thinking) },
+            getModels: nil,
+            close: close)
     }
 }

@@ -197,11 +197,13 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
         #if DEBUG
         // -ui compare (or compare:b, with :metrics to scroll to the table): the seeded comparison, once the chat has settled.
-        // -ui compare:chat: the seeded comparison's chat, without opening the sheet.
+        // -ui compare:chat: the seeded comparison's chat, without opening the sheet; compare:picker:
+        // its Compare With picker.
         if let ui = DebugLaunch.ui, ui.hasPrefix("compare"), ui != "compare:chat",
            let reply = conversation.messages.last, reply.comparison != nil {
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(1))
+                if ui == "compare:picker" { self?.showComparePicker(for: reply.id); return }
                 self?.showComparison(reply.id, startOnB: ui.hasPrefix("compare:b"))
             }
         }
@@ -422,11 +424,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     }
 
     /// Answers the last question again with `other`, keeping both answers as a pair to compare.
-    private func compare(with other: ModelChoice) {
+    private func compare(with other: ModelChoice, thinking: Thinking) {
         guard let old = conversation.messages.last, !old.isUser, !engine.isBusy else { return }
         if Speaker.shared.speaking == old.id { Speaker.shared.stop() }
         isPinned = true
-        engine.compare(in: conversation, with: other)
+        engine.compare(in: conversation, with: other, thinking: thinking)
         refresh()
     }
 
@@ -548,7 +550,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             getModels = { close(open) }
         }
         let picker = ModelPicker(
-            groups: { [unowned self] in pickerGroups() },
+            groups: { [unowned self] _ in pickerGroups() },
             thinking: thinking,
             select: { [unowned self] choice in
                 setMode(choice.mode, macModel: choice.macModel)
@@ -556,14 +558,19 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             },
             getModels: getModels,
             close: { close {} })
-        let controller = PickerHost(rootView: picker.environment(engine))
+        let controller = PickerHost(rootView: AnyView(picker.environment(engine)))
         controller.onClose = { [weak self] in if refocus { self?.composer.textView.becomeFirstResponder() } }
         host = controller
+        presentPicker(controller, from: source)
+    }
+
+    /// A sheet on iPhone (half height, pulls up to full), a popover from `source` on iPad.
+    private func presentPicker(_ controller: UIViewController, from source: UIView, rect: CGRect? = nil) {
         controller.modalPresentationStyle = .popover
         controller.preferredContentSize = CGSize(width: 360, height: 520)
         if let popover = controller.popoverPresentationController {
             popover.sourceView = source
-            popover.sourceRect = source.bounds
+            popover.sourceRect = rect ?? source.bounds
             popover.permittedArrowDirections = [.down, .up]
             let sheet = popover.adaptiveSheetPresentationController
             sheet.detents = [.medium(), .large()]
@@ -571,6 +578,54 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             sheet.prefersScrollingExpandsWhenScrolledToEdge = true
         }
         present(controller, animated: true)
+    }
+
+    /// Compare With: the picker for the second answer to `id`, the last reply. Its own model is
+    /// offered only with the thinking switched the other way.
+    private func showComparePicker(for id: UUID) {
+        guard let m = message(id), presentedViewController == nil else { return }
+        let own = answeredBy(m)
+        let thought = m.metrics?.thinking ?? (conversation.thinking != .off)
+        weak var host: UIViewController?
+        let picker = ComparePicker(
+            answerThought: thought,
+            groups: { [unowned self] thinking in compareGroups(own: own, ownThought: thought, thinking: thinking) },
+            select: { [unowned self] choice, thinking in
+                host?.dismiss(animated: true)
+                compare(with: choice, thinking: thinking ? .high : .off)
+            },
+            close: { host?.dismiss(animated: true) })
+        let controller = PickerHost(rootView: AnyView(picker.environment(engine)))
+        host = controller
+        // From the answer's bubble on iPad.
+        let cell = dataSource.indexPath(for: id).flatMap { collectionView.cellForItem(at: $0) }
+        presentPicker(controller, from: cell ?? composer.modeButton)
+    }
+
+    private func compareGroups(own: ModelChoice, ownThought: Bool, thinking: Bool) -> [ModelPicker.Group] {
+        let unreachable = engine.mac.route == .unreachable
+        let (device, mac) = choices
+        func row(_ c: ModelChoice) -> ModelPicker.Row {
+            var note: String?
+            var enabled = isAvailable(c.mode)
+            if isSame(c, own) {
+                let flipped = c.mode != .apple && thinking != ownThought
+                enabled = enabled && flipped
+                note = c.mode == .apple ? "This answer's model"
+                    : flipped ? "This answer's model, thinking \(thinking ? "on" : "off")"
+                    : "This answer's model: switch thinking to compare"
+            } else if !enabled {
+                note = availability(c.mode)
+            } else if c.mode == .apple, thinking {
+                note = "Doesn't think"
+            }
+            let symbol = c.mode == .mac && unreachable ? "exclamationmark.triangle" : c.mode.symbol
+            return ModelPicker.Row(choice: c, title: c.title, symbol: symbol, note: note, enabled: enabled, current: false)
+        }
+        return [
+            .init(title: "On This \(UIDevice.current.model)", rows: device.map(row)),
+            .init(title: availability(.mac), rows: mac.map(row)),
+        ]
     }
 
     private func pickerGroups() -> [ModelPicker.Group] {
@@ -681,20 +736,17 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                          image: UIImage(systemName: c.mode.symbol),
                          attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in retry(c.mode, macModel: c.macModel) }
             }
-            // A second answer from another model, kept beside this one (see CompareView).
-            let own = answeredBy(m)
-            let rivals = (device + mac).filter { !isSame($0, own) }.map { c in
-                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On Your \(engine.mac.computerName)",
-                         image: UIImage(systemName: c.mode.symbol),
-                         attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in compare(with: c) }
-            }
             var retries: [UIMenuElement] = [
                 UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise"),
                          attributes: isAvailable(current) ? [] : .disabled) { [unowned self] _ in retry(current) },
                 UIMenu(title: "Retry With", image: UIImage(systemName: "arrow.triangle.branch"), children: others),
             ]
-            if m.finished, m.error == nil, !m.content.isEmpty, !rivals.isEmpty {
-                retries.append(UIMenu(title: "Compare With", image: UIImage(systemName: "rectangle.split.2x1"), children: rivals))
+            // A second answer, from another model or the same one with thinking the other way,
+            // kept beside this one (see CompareView). In a sheet: a menu has no room for the switch.
+            if m.finished, m.error == nil, !m.content.isEmpty {
+                retries.append(UIAction(title: "Compare With…", image: UIImage(systemName: "rectangle.split.2x1")) {
+                    [unowned self] _ in showComparePicker(for: id)
+                })
             }
             items.append(UIMenu(options: .displayInline, children: retries))
         }
@@ -1299,7 +1351,7 @@ private struct ChatControllerView: UIViewControllerRepresentable {
 
 /// The model picker's controller: says when it's gone, whichever way it went (Done, a pick, or a
 /// swipe down).
-private final class PickerHost<Content: View>: UIHostingController<Content> {
+private final class PickerHost: UIHostingController<AnyView> {
     var onClose: (() -> Void)?
 
     override func viewDidDisappear(_ animated: Bool) {

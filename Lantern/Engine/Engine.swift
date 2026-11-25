@@ -99,8 +99,9 @@ final class Engine {
     /// `finish` when B ends however it ends (answered, failed, stopped, chat deleted), after B's
     /// metrics are stamped and the chat is back on A's model. `next` is B's model while it runs.
     private(set) var comparing: (id: UUID, conversation: PersistentIdentifier, next: ModelChoice?)?
-    /// The live reply that is B, and the model to put the chat back on when it ends (A's).
-    @ObservationIgnored private var comparison: (reply: UUID, mode: Mode, macModel: String)?
+    /// The live reply that is B, and the model and thinking to put the chat back on if B has
+    /// nothing to show (A's).
+    @ObservationIgnored private var comparison: (reply: UUID, mode: Mode, macModel: String, thinking: Thinking)?
 
     /// Answers the last question again with `other` and keeps both answers as a pair (the current
     /// answer is A, the new one B), the current answer stays as a version like Retry.
@@ -110,7 +111,10 @@ final class Engine {
     /// question goes to the model that wrote the history it continues and can reuse its cache.
     /// If B produced nothing (failed or stopped empty) the chat goes back to A's model.
     /// `continueWith` is how the user picks an answer and its model together.
-    func compare(in conversation: Conversation, with other: ModelChoice) {
+    ///
+    /// `thinking`: whether B thinks (nil: as the chat does now). B may be A's own model when the
+    /// thinking differs, to see what thinking buys on the same question.
+    func compare(in conversation: Conversation, with other: ModelChoice, thinking: Thinking? = nil) {
         guard !isBusy, let last = conversation.messages.indices.last else { return }
         let reply = conversation.messages[last]
         guard !reply.isUser, reply.finished, reply.error == nil, !reply.content.isEmpty else { return }
@@ -121,7 +125,12 @@ final class Engine {
             macModel: own.mode == .mac ? own.macModel ?? conversation.resolvedMacModel : nil,
             modelTitle: own.mode == .mac ? MacLink.displayName(own.macModel ?? conversation.resolvedMacModel) : own.mode.title)
         let otherMac = other.mode == .mac ? other.macModel ?? conversation.resolvedMacModel : nil
-        guard other.mode.rawValue != a.modeRaw || (other.mode == .mac && otherMac != a.macModel) else { return }
+        let bThinking = thinking ?? conversation.thinking
+        let sameModel = other.mode.rawValue == a.modeRaw && (other.mode != .mac || otherMac == a.macModel)
+        // The same model only with the other thinking (an answer from before metrics: the chat's
+        // setting). Apple Intelligence's model doesn't think, so it never differs from itself.
+        let aThinks = a.thinking ?? (conversation.thinking != .off)
+        guard !sameModel || (other.mode != .apple && aThinks != (bThinking != .off)) else { return }
         // A was already one side of an earlier comparison: that pair is undone rather than left
         // with one side, so its partner is an ordinary answer again (no compareID, no vote).
         if let earlier = a.compareID {
@@ -134,14 +143,16 @@ final class Engine {
         a.compareID = id
         a.preferred = nil
         conversation.messages[last].metrics = a
-        let back = (mode: conversation.mode, macModel: conversation.macModel)
+        let back = (mode: conversation.mode, macModel: conversation.macModel, thinking: conversation.thinking)
         comparing = (id, conversation.persistentModelID, other)
+        conversation.thinking = bThinking
         retry(in: conversation, mode: other.mode, macModel: other.mode == .mac ? otherMac : nil)
         guard let live, running == conversation.persistentModelID else {  // didn't start
             comparing = nil
+            conversation.thinking = back.thinking
             return
         }
-        comparison = (live.id, back.mode, back.macModel)
+        comparison = (live.id, back.mode, back.macModel, back.thinking)
     }
 
     /// Records a vote on answer `index` of the last reply's `allVersions` (nil clears it).
@@ -166,6 +177,8 @@ final class Engine {
         if let m = conversation.messages[last].metrics, let mode = Mode(rawValue: m.modeRaw) {
             conversation.mode = mode
             if mode == .mac, let macModel = m.macModel, !macModel.isEmpty { conversation.macModel = macModel }
+            // And its thinking, so comparing thinking on and off can be continued either way.
+            if mode != .apple, let thought = m.thinking { conversation.thinking = thought ? .high : .off }
         }
         try? conversation.modelContext?.save()
         // Load its model and restore its saved state (kept per model) before the next question.
@@ -371,6 +384,7 @@ final class Engine {
                 }
                 conversation.mode = pair.mode
                 conversation.macModel = pair.macModel
+                conversation.thinking = pair.thinking
                 try? conversation.modelContext?.save()
             }
             comparison = nil

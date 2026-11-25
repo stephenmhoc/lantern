@@ -272,7 +272,9 @@ struct CompareView: View {
             let others = list.indices.filter { $0 != current }
             guard let ai = others.last(where: { list[$0].metrics?.compareID == running.id }) ?? others.last else { return nil }
             let mode = engine.live?.mode ?? running.next?.mode ?? .mac
-            let title = running.next?.title ?? (mode == .mac ? MacLink.displayName(engine.live?.macModel ?? "") : mode.title)
+            var title = running.next?.title ?? (mode == .mac ? MacLink.displayName(engine.live?.macModel ?? "") : mode.title)
+            // The chat is on B's thinking while B runs.
+            if mode != .apple, conversation.thinking != .off { title += " · Thinking" }
             let b = Answer(content: "", metrics: nil, title: title, mode: mode, index: nil, isRunning: true)
             return Pair(a: answer(list[ai], index: ai), b: b, question: question, canAct: false)
         }
@@ -284,7 +286,7 @@ struct CompareView: View {
     private func answer(_ v: ReplyVersion, index: Int) -> Answer {
         let model = conversation.model(of: v.metrics, footnote: v.footnote, macModels: engine.mac.models)
         let mode = model.mode
-        let title = v.metrics?.modelTitle ?? ChatSearch.modelName(v.footnote) ?? model.title
+        let title = v.metrics?.labeledTitle ?? ChatSearch.modelName(v.footnote) ?? model.title
         return Answer(content: v.content, error: v.error, metrics: v.metrics, title: title,
                       mode: mode, index: index)
     }
