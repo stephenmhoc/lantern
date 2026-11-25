@@ -25,9 +25,14 @@ struct RootView: View {
     @State private var sheet: Sheet?
     @State private var settingsPath: [SettingsPage] = []
     @State private var columns = NavigationSplitViewVisibility.all
-    /// iPhone: whether the side panel is out, and how far a drag has moved it.
+    /// iPhone: whether the side panel is out, and how far a drag has moved it. The drag is plain
+    /// state, not `@GestureState`: that snaps back to 0 the instant the finger lifts, so the panel
+    /// jumped shut for a frame before animating open. It's put back to 0 in the same animation that
+    /// opens or closes the panel, which then carries on from where the finger left it.
     @State private var drawerOpen = false
-    @GestureState private var drawerDrag: CGFloat = 0
+    @State private var drawerDrag: CGFloat = 0
+    /// Whether a drag is under way: to settle the panel when one is cancelled without ending.
+    @GestureState private var drawerDragging = false
     @State private var query = ""
     @FocusState private var searchFocused: Bool
     @State private var scope = SearchScope.all
@@ -214,6 +219,10 @@ struct RootView: View {
                     .accessibilityHidden(!drawerOpen)
                     .accessibilityAction(.escape) { setDrawer(false) }
             }
+            // A drag the system cancelled (no `onEnded`) goes back to where it started.
+            .onChange(of: drawerDragging) { _, dragging in
+                if !dragging, drawerDrag != 0 { setDrawer(drawerOpen) }
+            }
         }
     }
 
@@ -221,17 +230,22 @@ struct RootView: View {
     /// panel (or a flick) it goes the rest of the way.
     private func drawerGesture(width: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 10)
-            .updating($drawerDrag) { value, state, _ in state = value.translation.width }
+            .updating($drawerDragging) { _, dragging, _ in dragging = true }
+            .onChanged { drawerDrag = $0.translation.width }
             .onEnded { value in
                 let moved = value.predictedEndTranslation.width
-                if drawerOpen ? moved < -width / 3 : moved > width / 3 { setDrawer(!drawerOpen) }
+                let flip = drawerOpen ? moved < -width / 3 : moved > width / 3
+                setDrawer(flip ? !drawerOpen : drawerOpen)
             }
     }
 
     private func setDrawer(_ open: Bool) {
         // The message box's keyboard would sit over the panel.
         if open { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
-        withAnimation(.snappy(duration: 0.3)) { drawerOpen = open }
+        withAnimation(.snappy(duration: 0.3)) {
+            drawerOpen = open
+            drawerDrag = 0
+        }
         if !open { searchFocused = false }
     }
 
