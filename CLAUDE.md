@@ -46,7 +46,7 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   panel: a sidebar column on iPad (with the inspector as a third column), a drawer sliding over the
   chat on iPhone (top-left button or edge swipe). The panel is custom (no navigation bar): Lantern and a
   search field at the top, plain rows (title on two lines, model and time) with the open chat
-  highlighted, pin, rename and immediate delete (no undo, no in-app toasts); it lists only chats
+  highlighted, pin, rename and immediate delete (no undo, no in-app toasts) by swipe (`SwipeRow`: round buttons inside the row, not the list's swipe actions; never a full swipe) or the context menu; it lists only chats
   with messages. A chat's title starts as its first question; after an answer `ChatTitler` asks
   Apple Intelligence (when on) for a few words, and only ever replaces a title still equal to the
   question, so a rename sticks; deleting the chat on screen goes to a new chat. Only a window opened for a chat
@@ -104,7 +104,7 @@ The official xcframework has no simulator slice. For the simulator, build llama.
 `build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
 simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't map its buffers.
 Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
-`-seedChats`, `-ui readiness|settings|inspector|search:<text>|delete|newchat|sidebar|next|window`,
+`-seedChats`, `-ui readiness|settings|inspector|search:<text>|delete|newchat|sidebar|swipe|swipepin|next|window`,
 `-testflight` (show the expiry and reminders), `-importModel <path>`, `-markdownSample full|partial`
 (every answer shows a Markdown sample, `partial` cut off mid code fence), and `-selftest`.
 For the system integration: `-openURL <lantern://…>` (the app opens the link through the system

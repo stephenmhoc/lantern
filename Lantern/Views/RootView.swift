@@ -36,6 +36,8 @@ struct RootView: View {
     /// The query and scope `results` are for: "No results" waits until the current one has run.
     @State private var resultsFor: SearchKey?
     @State private var renaming: Conversation?
+    /// The row whose swipe actions are out, if any.
+    @State private var swiped: SwipeOpen?
     @State private var renameText = ""
     /// The chat this window last asked `ChatJump` to scroll, to clear only its own request.
     @State private var jumpRequested: PersistentIdentifier?
@@ -262,6 +264,9 @@ struct RootView: View {
         .scrollContentBackground(.hidden)
         .environment(\.defaultMinListRowHeight, 0)
         .scrollDismissesKeyboard(.immediately)
+        .onScrollPhaseChange { _, phase in if phase != .idle { putSwipeAway() } }
+        .onChange(of: query) { putSwipeAway() }
+        .onChange(of: drawerOpen) { putSwipeAway() }
         .modifier(TopBar { sidebarHeader })
         // Settings and New chat sit in the list's own bottom inset.
         .modifier(BottomBar { sidebarButtons })
@@ -399,34 +404,38 @@ struct RootView: View {
     }
 
     /// A chat in the panel: opens it (at the match, for a search result) and puts the drawer away,
-    /// with the swipe actions and menu. The open chat is highlighted.
+    /// with its swipe actions (`SwipeRow`) and menu. The open chat is highlighted.
     private func chatButton(_ c: Conversation, result: ChatSearch.Result? = nil,
                             @ViewBuilder label: () -> some View) -> some View {
-        Button {
-            if let result { requestJump(to: result) }
-            selection = c
-            if !hasSidebarToggle { setDrawer(false) }
-        } label: {
-            label()
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(.rect(cornerRadius: 12))
+        SwipeRow(id: c.persistentModelID, open: $swiped, pinned: c.pinned,
+                 onPin: { withAnimation { togglePin(c) } },
+                 onRename: { startRename(c) },
+                 onDelete: { withAnimation { delete(c) } }) {
+            Button {
+                // With a row's actions out, a tap anywhere in the list just puts them away.
+                if swiped != nil { putSwipeAway(); return }
+                if let result { requestJump(to: result) }
+                selection = c
+                if !hasSidebarToggle { setDrawer(false) }
+            } label: {
+                label()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 9)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(.rect(cornerRadius: 12))
+            }
+            .buttonStyle(SidebarRowStyle(selected: selection == c))
+            .accessibilityAddTraits(selection == c ? .isSelected : [])
+            .contextMenu { menu(for: c, result: result) }
         }
-        .buttonStyle(SidebarRowStyle(selected: selection == c))
-        .accessibilityAddTraits(selection == c ? .isSelected : [])
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
-        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
-            Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.indigo)
-        }
-        .swipeActions(edge: .leading) {
-            Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") { togglePin(c) }
-                .tint(.orange)
-        }
-        .contextMenu { menu(for: c, result: result) }
+    }
+
+    private func putSwipeAway() {
+        guard swiped != nil else { return }
+        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { swiped = nil }
     }
 
     /// Asks the chat screen showing `r`'s chat to scroll to its match. Keyed by the chat, so it
@@ -566,6 +575,13 @@ struct RootView: View {
                 case "delete": actions.deleteSelected?()
                 case "newchat": newChat()
                 case "sidebar": actions.toggleSidebar?()
+                case "swipe", "swipepin":
+                    // The first chat's swipe actions out (Rename and Delete, or Pin), in the open panel.
+                    if !hasSidebarToggle { setDrawer(true) }
+                    try? await Task.sleep(for: .seconds(0.5))
+                    if let c = sections.first?.chats.first {
+                        withAnimation { swiped = SwipeOpen(id: c.persistentModelID, edge: ui == "swipe" ? .trailing : .leading) }
+                    }
                 case "next": actions.next?()
                 case "window": if let c = conversations.last { openWindow(id: LanternApp.mainWindow, value: c.persistentModelID) }
                 default: break

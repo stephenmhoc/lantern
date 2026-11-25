@@ -8,7 +8,7 @@ import UIKit
 /// (`simctl launch <device> com.merimerimeri.Lantern -seedChats -ui inspector`):
 /// - `-seedChats`: adds sample chats across the sidebar's sections, once.
 /// - `-ui readiness|settings|inspector|search:<text>`: opens that on launch.
-/// - `-ui delete|newchat|sidebar|next|window`: runs that action a second after launch (window:
+/// - `-ui delete|newchat|sidebar|swipe|swipepin|next|window`: runs that action a second after launch (window:
 ///   opens the oldest chat in a new window).
 /// - `-testflight` (in ReadinessView): pretend to be a TestFlight install.
 /// - `-openURL <lantern://…>`: the app opens the link itself two seconds after launch, through the
