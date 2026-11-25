@@ -16,6 +16,9 @@ import LlamaKit
 // match byte for byte, then after a stopped reply and as a retry, which must not re-read the chat.
 // --draft drafts with an MTP model (Gemma 4's mtp-gemma-4-*-it.gguf); greedy output must not change.
 // --render prints the hand-written template's renders as JSON lines, to compare with the Jinja.
+// --search declares web search and answers the model's calls with Tavily (TAVILY_API_KEY), as
+// the app does on device: a question that needs a search, a follow-up that must append to the
+// cache with the searches in its history, a reload from the saved state, and one needing none.
 // --bench reads a ~3,100-token prompt and a short one, 256 tokens each: first token is the honest
 // prompt time (the prompt's own figure stops before the GPU has finished).
 let args = Array(CommandLine.arguments.dropFirst().dropFirst())
@@ -42,12 +45,28 @@ if args.contains("--render") {
         [sys, .init(role: .user, content: "One"), .init(role: .assistant, content: "\nFirst answer.\n"),
          .init(role: .user, content: "Two"), .init(role: .assistant, content: "Second <b>answer</b>"),
          .init(role: .user, content: "<file name=\"a.txt\">x\ny</file>\n\nThree")],
+        // Web search declared, and a past reply that searched twice (one failed), then answered.
+        [ChatMessage(role: .system, content: sys.content, tools: [WebSearch.toolName]), .init(role: .user, content: "Ferry?")],
+        [ChatMessage(role: .system, content: sys.content, tools: [WebSearch.toolName]), .init(role: .user, content: "Ferry?"),
+         .init(role: .assistant, content: " The next one is at 5:30. ", searches: [
+            WebSearch(query: "Bainbridge ferry", results: [.init(title: "Schedule", url: "https://wsdot.com/a", content: "5:30 PM\n6:20 PM")]),
+            WebSearch(query: "ferry delays", error: "The search took too long."),
+         ]),
+         .init(role: .user, content: "And after that?")],
     ]
     for messages in cases {
         for thinking in [Thinking.off, .high] {
             guard let r = LlamaModel.renderedPrompt(path: path, messages, thinking: thinking) else { exit(1) }
+            // As the Jinja takes them: a reply's searches as its call turns and tool results, ahead of it.
+            let jinja: [[String: Any]] = messages.flatMap { m -> [[String: Any]] in
+                (m.searches ?? []).flatMap { search -> [[String: Any]] in [
+                    ["role": "assistant", "content": "", "tool_calls": [["function": ["name": WebSearch.toolName, "arguments": ["query": search.query]]]]],
+                    ["role": "tool", "content": search.modelText],
+                ] } + [["role": m.role.rawValue, "content": m.content]]
+            }
             let json: [String: Any] = [
-                "messages": messages.map { ["role": $0.role.rawValue, "content": $0.content] },
+                "messages": jinja, "tools": messages.first?.declaresWebSearch == true,
+                "toolDescription": WebSearch.toolDescription, "queryDescription": WebSearch.queryDescription,
                 "thinking": thinking != .off, "prompt": r.prompt, "systemPrefix": r.systemPrefix ?? NSNull(),
             ]
             print(String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self))
@@ -70,20 +89,26 @@ struct Reply {
     var thinking = ""
     var stats = GenerationStats()
     var firstToken = 0.0
+    var searches: [WebSearch] = []
 }
 
 /// Returns the answer; stops reading after `stopAfter` pieces if given.
 @MainActor func ask(
     _ model: LlamaModel, _ history: [ChatMessage], stopAfter: Int? = nil, checkpoint: URL? = nil, quiet: Bool = false,
-    maxTokens: Int? = nil
+    maxTokens: Int? = nil, search: (@Sendable (String) async -> WebSearch)? = nil
 ) async throws -> Reply {
     var reply = Reply()
     var pieces = 0
     let start = Date()
     for try await event in model.generate(
-        history, sampling: sampling, thinking: thinking, maxTokens: maxTokens ?? (thinking == .off ? 1500 : 3500), checkpoint: checkpoint)
+        history, sampling: sampling, thinking: thinking, maxTokens: maxTokens ?? (thinking == .off ? 1500 : 3500), checkpoint: checkpoint,
+        search: search)
     {
         switch event {
+        case .searching(let q): print("\n[searching “\(q)”]", terminator: "")
+        case .searched(let s):
+            reply.searches.append(s)
+            print("[\(s.results.count) results\(s.error.map { ", error: \($0)" } ?? "")]")
         case .reading(let p): if !quiet { print(String(format: "[reading %.0f%%]", p * 100), terminator: "") }
         case .thinking(let t):
             if reply.firstToken == 0 { reply.firstToken = Date().timeIntervalSince(start) }
@@ -173,6 +198,59 @@ if args.contains("--bench") {
                          r.stats.tokensPerSecond, r.firstToken))
             if !quiet { print(r.text) }
         }
+    }
+    exit(0)
+}
+if args.contains("--search") {
+    // The app's on-device search: Tavily, three results of up to 700 characters each.
+    @Sendable func tavily(_ query: String) async -> WebSearch {
+        guard let key = ProcessInfo.processInfo.environment["TAVILY_API_KEY"] else {
+            return WebSearch(query: query, error: "No TAVILY_API_KEY.")
+        }
+        var request = URLRequest(url: URL(string: "https://api.tavily.com/search")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["query": query, "max_results": 3])
+        struct Found: Decodable { struct Item: Decodable { let title: String?; let url: String; let content: String? }; let results: [Item]? }
+        guard let (data, _) = try? await URLSession.shared.data(for: request),
+              let found = try? JSONDecoder().decode(Found.self, from: data) else { return WebSearch(query: query, error: "The search failed.") }
+        return WebSearch(query: query, results: (found.results ?? []).map {
+            .init(title: $0.title ?? $0.url, url: $0.url, content: WebSearch.excerpt($0.content ?? "", limit: 700))
+        })
+    }
+    let question = firstPrompt.hasPrefix("In two sentences: how do I purify") ? "What's the weather forecast for Seattle tomorrow?" : firstPrompt
+    let tooled = ChatMessage(role: .system, content: system.content, tools: [WebSearch.toolName])
+    let checkpoint = URL.temporaryDirectory.appending(path: "lantern-smoke-\(getpid())")
+    defer { try? FileManager.default.removeItem(at: checkpoint) }
+    var history = [tooled, ChatMessage(role: .user, content: question)]
+    var follow = Reply()
+    do {
+        let model = try load()
+        print("> \(question)")
+        let first = try await ask(model, history, checkpoint: checkpoint, search: tavily)
+        check("it searched", !first.searches.isEmpty && first.searches.allSatisfy { $0.error == nil })
+        check("it answered after searching", !first.text.isEmpty)
+        history += [.init(role: .assistant, content: first.text, searches: first.searches),
+                    .init(role: .user, content: "Summarise that in one sentence.")]
+        print("> \(history.last!.content)")
+        follow = try await ask(model, history, checkpoint: checkpoint, search: tavily)
+        if !(model.canRewind && thinking != .off) {  // Gemma re-renders with thinking on
+            check("the follow-up appended to the cache, searches included", follow.stats.reusedTokens >= first.stats.promptTokens)
+        }
+        // Not saved (no checkpoint): the follow-up's state stays the latest for the reload below.
+        history += [.init(role: .assistant, content: follow.text, searches: follow.searches),
+                    .init(role: .user, content: "What is 12 times 12?")]
+        print("> What is 12 times 12?")
+        let plain = try await ask(model, history, search: tavily)
+        check("arithmetic needs no search", plain.searches.isEmpty)
+    }
+    if !(thinking != .off && path.lowercased().contains("gemma")) {
+        // Reopened: the last question from the follow-up's saved state, without reading the chat.
+        let model = try load()
+        print("> (reloaded) \(history.last!.content)")
+        let again = try await ask(model, history, checkpoint: checkpoint, quiet: true, search: tavily)
+        check("the saved state with searches was restored", again.stats.restored && again.stats.reusedTokens > 0)
     }
     exit(0)
 }

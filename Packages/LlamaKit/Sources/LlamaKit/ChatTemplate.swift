@@ -76,7 +76,7 @@ struct ChatTemplate {
     func renderSystemPrefix(_ messages: [ChatMessage], thinking: Thinking) -> String? {
         guard let system = messages.first, system.role == .system else { return nil }
         switch format {
-        case .gemma4: return "<bos><|turn>system\n" + (thinking.isOn ? "<|think|>\n" : "") + trim(system.content) + "<turn|>\n"
+        case .gemma4: return "<bos>" + gemmaSystem(system, thinking: thinking)
         case .qwen35: return qwenTurn(system)
         }
     }
@@ -91,28 +91,94 @@ struct ChatTemplate {
     }
 
     private func gemmaTurn(_ m: ChatMessage) -> String {
-        "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(trim(content(m)))<turn|>\n"
+        if m.role == .system { return gemmaSystem(m, thinking: .off) }
+        // A reply that searched: each call and its result, then the answer, all in one model turn.
+        let searches = m.role == .assistant ? (m.searches ?? []).map { gemmaCall($0.query) + gemmaResponse($0) }.joined() : ""
+        return "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(searches)\(trim(content(m)))<turn|>\n"
+    }
+
+    /// The system turn: thinking switch, the prompt, then any tool declarations.
+    private func gemmaSystem(_ system: ChatMessage, thinking: Thinking) -> String {
+        "<|turn>system\n" + (thinking.isOn ? "<|think|>\n" : "") + trim(system.content)
+            + (system.declaresWebSearch ? gemmaWebSearchDeclaration : "") + "<turn|>\n"
     }
 
     // Gemma 4: a leading system message is its own turn; the template trims all content.
     private func gemma4(_ messages: [ChatMessage], thinking: Thinking) -> String {
         var out = "<bos>"
         var rest = messages[...]
-        let system = messages.first?.role == .system ? messages.first?.content : nil
-        if system != nil { rest = rest.dropFirst() }
-        if thinking.isOn || system != nil {
-            out += "<|turn>system\n"
-            if thinking.isOn { out += "<|think|>\n" }
-            out += trim(system ?? "") + "<turn|>\n"
+        if let system = messages.first, system.role == .system {
+            rest = rest.dropFirst()
+            out += gemmaSystem(system, thinking: thinking)
+        } else if thinking.isOn {
+            out += "<|turn>system\n<|think|>\n<turn|>\n"
         }
         return out + rest.map(gemmaTurn).joined() + "<|turn>model\n"
     }
 
-    /// Qwen 3.5 (ChatML), without tools: every content trimmed; a past reply is just its answer
-    /// (the template drops the thinking of replies before the last question, and Lantern's
-    /// messages always end with one). No BOS.
+    /// Gemma's own quote token: strings in declarations, calls and results are wrapped in it.
+    private static let q = "<|\"|>"
+
+    /// `web_search` as the template's `format_function_declaration` writes it.
+    private var gemmaWebSearchDeclaration: String {
+        let q = Self.q
+        return "<|tool>declaration:\(WebSearch.toolName){description:\(q)\(WebSearch.toolDescription)\(q)"
+            + ",parameters:{properties:{query:{description:\(q)\(WebSearch.queryDescription)\(q),type:\(q)STRING\(q)}}"
+            + ",required:[\(q)query\(q)],type:\(q)OBJECT\(q)}}<tool|>"
+    }
+
+    private func gemmaCall(_ query: String) -> String {
+        "<|tool_call>call:\(WebSearch.toolName){query:\(Self.q)\(query)\(Self.q)}<tool_call|>"
+    }
+
+    private func gemmaResponse(_ search: WebSearch) -> String {
+        "<|tool_response>response:\(WebSearch.toolName){value:\(Self.q)\(Self.unquoted(search.modelText))\(Self.q)}<tool_response|>"
+    }
+
+    /// Search results are web text: anything in them that reads as the template's own markup is
+    /// taken out, so a page can't close the result early or open a turn.
+    private static func unquoted(_ text: String) -> String {
+        var out = text
+        for marker in ["<|\"|>", "<|tool_response>", "<tool_response|>", "<|turn>", "<turn|>", "<|im_start|>", "<|im_end|>",
+                       "<tool_response>", "</tool_response>", "<tool_call>", "</tool_call>", "<|tool_call>", "<tool_call|>"] {
+            out = out.replacingOccurrences(of: marker, with: "")
+        }
+        return out
+    }
+
+    /// Qwen 3.5 (ChatML): every content trimmed; a past reply is just its answer (the template
+    /// drops the thinking of replies before the last question, and Lantern's messages always end
+    /// with one), after any searches it ran, each its own call and result turns. No BOS.
     private func qwenTurn(_ m: ChatMessage) -> String {
-        "<|im_start|>\(m.role.rawValue)\n\(trim(m.content))<|im_end|>\n"
+        if m.role == .system, m.declaresWebSearch {
+            let prompt = trim(m.content)
+            return "<|im_start|>system\n" + qwenWebSearchDeclaration + (prompt.isEmpty ? "" : "\n\n" + prompt) + "<|im_end|>\n"
+        }
+        let searches = m.role == .assistant ? (m.searches ?? []).map {
+            "<|im_start|>assistant\n" + qwenCall($0.query) + "<|im_end|>\n" + qwenResponseTurn($0)
+        }.joined() : ""
+        return searches + "<|im_start|>\(m.role.rawValue)\n\(trim(m.content))<|im_end|>\n"
+    }
+
+    /// The tools block Qwen's template opens the system turn with, `web_search` as `tojson` writes it.
+    private var qwenWebSearchDeclaration: String {
+        func json(_ s: String) -> String {
+            String(decoding: try! JSONEncoder().encode(s), as: UTF8.self).replacingOccurrences(of: "\\/", with: "/")
+        }
+        let tool = "{\"type\": \"function\", \"function\": {\"name\": \(json(WebSearch.toolName)), \"description\": \(json(WebSearch.toolDescription)), "
+            + "\"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \(json(WebSearch.queryDescription))}}, "
+            + "\"required\": [\"query\"]}}}"
+        return "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + tool + "\n</tools>"
+            + "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>"
+    }
+
+    private func qwenCall(_ query: String) -> String {
+        "<tool_call>\n<function=\(WebSearch.toolName)>\n<parameter=query>\n\(query)\n</parameter>\n</function>\n</tool_call>"
+    }
+
+    /// A search's result, as the user turn the template wraps tool results in.
+    private func qwenResponseTurn(_ search: WebSearch) -> String {
+        "<|im_start|>user\n<tool_response>\n\(trim(Self.unquoted(search.modelText)))\n</tool_response><|im_end|>\n"
     }
 
     /// Qwen 3.5 thinks only when asked (`enable_thinking`); otherwise the prompt closes an empty
@@ -125,11 +191,53 @@ struct ChatTemplate {
         messages.map(qwenTurn).joined() + qwenGenerationPrompt(thinking)
     }
 
+    // MARK: - Tool calls while generating
+
+    /// The tokens that open and close a tool call in the model's output.
+    var toolCallStart: String { format == .gemma4 ? "<|tool_call>" : "<tool_call>" }
+    var toolCallEnd: String { format == .gemma4 ? "<tool_call|>" : "</tool_call>" }
+
+    /// The search query in a call's text (what came between `toolCallStart` and `toolCallEnd`), or
+    /// nil if it isn't a `web_search` call with one.
+    func searchQuery(inCall text: String) -> String? {
+        let query: Substring?
+        switch format {
+        case .gemma4:
+            // call:web_search{query:<|"|>…<|"|>}
+            guard text.contains("call:\(WebSearch.toolName)") else { return nil }
+            query = text.firstMatch(of: /query:<\|"\|>(?<q>[\s\S]*?)<\|"\|>/)?.output.q
+                ?? text.firstMatch(of: /query:"(?<q>[^"]*)"/)?.output.q
+        case .qwen35:
+            // <function=web_search> <parameter=query> … </parameter>
+            guard text.contains("<function=\(WebSearch.toolName)>") else { return nil }
+            query = text.firstMatch(of: /<parameter=query>(?<q>[\s\S]*?)<\/parameter>/)?.output.q
+        }
+        let trimmed = query.map { trim(String($0)) } ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// What follows a finished call (the model's output ends with `toolCallEnd`): the result, then
+    /// whatever lets the model carry on with its reply. Gemma continues the same turn (into a
+    /// fresh thought when thinking); Qwen closes its turn, gets the result as a user turn and
+    /// starts a new reply, as its template renders tool results.
+    func renderToolResult(_ search: WebSearch, thinking: Thinking) -> String {
+        switch format {
+        case .gemma4: gemmaResponse(search) + (thinking.isOn ? "<|channel>thought\n" : "")
+        case .qwen35: "<|im_end|>\n" + qwenResponseTurn(search) + qwenGenerationPrompt(thinking)
+        }
+    }
+
     private func trim(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     func makeParser(thinking: Thinking) -> OutputParser {
         // Qwen's prompt opens the think block itself, so its output starts inside it.
         OutputParser(format: format, thinking: format == .qwen35 && thinking.isOn)
+    }
+
+    /// The parser for the model's output after a tool result (`renderToolResult`), which opens a
+    /// thought for it when thinking.
+    func makeParserAfterToolResult(thinking: Thinking) -> OutputParser {
+        OutputParser(format: format, thinking: thinking.isOn)
     }
 }
 

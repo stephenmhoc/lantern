@@ -11,15 +11,30 @@ public struct ChatMessage: Sendable, Hashable, Codable {
     /// projector loaded (`loadVision`). Nil when there are none, so saved transcripts from before
     /// images existed still decode and compare equal.
     public var images: [Data]?
-    public init(role: Role, content: String, images: [Data] = []) {
+    /// On a reply: the web searches the model ran before writing `content`, in order. Each goes
+    /// back to the model as its call and result, ahead of the answer. Nil when there were none, so
+    /// saved transcripts from before searching existed still decode and compare equal.
+    public var searches: [WebSearch]?
+    /// On the system message: the tools declared to the model (`WebSearch.toolName`), which the
+    /// templates put in the system turn. Part of the message, so a chat whose tools change no
+    /// longer matches its cache or saved state, exactly as its prompt wouldn't. Nil for none.
+    public var tools: [String]?
+    public init(role: Role, content: String, images: [Data] = [], searches: [WebSearch] = [], tools: [String] = []) {
         self.role = role
         self.content = content
         self.images = images.isEmpty ? nil : images
+        self.searches = searches.isEmpty ? nil : searches
+        self.tools = tools.isEmpty ? nil : tools
     }
+
+    /// Whether this (system) message declares web search.
+    public var declaresWebSearch: Bool { tools?.contains(WebSearch.toolName) == true }
 
     public var hasImages: Bool { !(images ?? []).isEmpty }
     /// The same turn, text only: what a model without vision sees.
-    public var withoutImages: ChatMessage { ChatMessage(role: role, content: content) }
+    public var withoutImages: ChatMessage {
+        ChatMessage(role: role, content: content, searches: searches ?? [], tools: tools ?? [])
+    }
 }
 
 public struct Sampling: Sendable, Hashable {
@@ -114,6 +129,9 @@ public enum Generation: Sendable {
     case reading(Double)
     case thinking(String)
     case text(String)
+    /// The model asked to search the web for this; the results follow as `.searched`.
+    case searching(String)
+    case searched(WebSearch)
     case done(GenerationStats)
 }
 
@@ -308,9 +326,13 @@ public final class LlamaModel: @unchecked Sendable {
     /// `checkpoint` is a directory for this conversation's saved state. When the cache doesn't
     /// already hold the conversation, a matching state found there is loaded instead of reading
     /// the chat again, and the new state is saved there once the reply ends cleanly.
+    ///
+    /// When the system message declares web search (`ChatMessage.tools`), a call the model writes
+    /// is answered with `search` (reported as `.searching` and `.searched`), its result added to
+    /// the end of the cache, and the reply carries on: nothing is ever rewound for it.
     public func generate(
         _ messages: [ChatMessage], sampling: Sampling, thinking: Thinking = .off, maxTokens: Int = 2048,
-        checkpoint: URL? = nil
+        checkpoint: URL? = nil, search: (@Sendable (String) async -> WebSearch)? = nil
     ) -> AsyncThrowingStream<Generation, Error> {
         let stopped = OSAllocatedUnfairLock(initialState: false)
         return AsyncThrowingStream { continuation in
@@ -319,7 +341,7 @@ public final class LlamaModel: @unchecked Sendable {
                 do {
                     let stats = try self.run(
                         messages, sampling: sampling, thinking: thinking, maxTokens: maxTokens, checkpoint: checkpoint,
-                        isStopped: { stopped.withLock { $0 } }, emit: { continuation.yield($0) })
+                        search: search, isStopped: { stopped.withLock { $0 } }, emit: { continuation.yield($0) })
                     continuation.yield(.done(stats))
                     continuation.finish()
                 } catch {
@@ -372,7 +394,7 @@ public final class LlamaModel: @unchecked Sendable {
 
     private func run(
         _ input: [ChatMessage], sampling: Sampling, thinking: Thinking, maxTokens: Int, checkpoint: URL?,
-        isStopped: () -> Bool, emit: (Generation) -> Void
+        search: (@Sendable (String) async -> WebSearch)?, isStopped: () -> Bool, emit: (Generation) -> Void
     ) throws -> GenerationStats {
         var stats = GenerationStats()
         let batch = llama_batch_ext_init(ctx)!
@@ -443,6 +465,12 @@ public final class LlamaModel: @unchecked Sendable {
         var answer = ""
         var endedCleanly = false
         var ended = false
+        // Tool calls: only where the system turn declared the tool. A call's tokens are collected
+        // (never shown) until it closes; then it's answered before the next token is picked.
+        let tools = messages.first?.declaresWebSearch == true
+        var searches: [WebSearch] = []
+        var call: [UInt8]?
+        var closedCall: String?
         func send(_ text: String, marker: Bool, control: Bool = false) {
             switch parser.consume(text, marker: marker, control: control) {
             case .thinking(let t): emit(.thinking(t))
@@ -463,7 +491,25 @@ public final class LlamaModel: @unchecked Sendable {
             stats.generatedTokens += 1
             let attr = llama_vocab_get_attr(vocab, token).rawValue
             let control = attr & LLAMA_TOKEN_ATTR_CONTROL.rawValue != 0
-            if control || attr & LLAMA_TOKEN_ATTR_USER_DEFINED.rawValue != 0 {
+            let marker = control || attr & LLAMA_TOKEN_ATTR_USER_DEFINED.rawValue != 0
+            if tools {
+                let raw = piece(token, special: true)
+                if call != nil {
+                    if marker, String(decoding: raw, as: UTF8.self) == template.toolCallEnd {
+                        closedCall = String(decoding: call!, as: UTF8.self)
+                        call = nil
+                    } else {
+                        call! += raw
+                    }
+                    return true
+                }
+                if marker, String(decoding: raw, as: UTF8.self) == template.toolCallStart {
+                    if let rest = utf8.flush() { send(rest, marker: false) }
+                    call = []
+                    return true
+                }
+            }
+            if marker {
                 if let rest = utf8.flush() { send(rest, marker: false) }
                 send(String(decoding: piece(token, special: true), as: UTF8.self), marker: true, control: control)
             } else if let text = utf8.append(piece(token, special: false)) {
@@ -479,8 +525,46 @@ public final class LlamaModel: @unchecked Sendable {
         // every token is still sampled from the model's own distribution.
         var next = llama_sampler_sample(smpl, ctx, -1)
         var state = drafter?.targetState(ctx, -1) ?? []
+        /// Answers the call that just closed (its last token is in the cache): runs the search,
+        /// adds the result after it and picks the next token from there.
+        func answerCall() throws {
+            guard let text = closedCall else { return }
+            closedCall = nil
+            var result: WebSearch
+            if let query = template.searchQuery(inCall: text) {
+                if searches.count >= Self.searchLimit {
+                    result = WebSearch(query: query, error: "That's as many searches as one answer can run.")
+                } else if let search {
+                    emit(.searching(query))
+                    result = Self.wait(isStopped: isStopped) { await search(query) }
+                        ?? WebSearch(query: query, error: "The search was stopped.")
+                } else {
+                    result = WebSearch(query: query, error: "Searching isn't available right now.")
+                }
+            } else {
+                result = WebSearch(query: "", error: "The search couldn't be read: give the query as the query parameter.")
+            }
+            var tokens = try tokenize(template.renderToolResult(result, thinking: thinking))
+            if cached.count + tokens.count > contextLength - Self.replyRoom / 2 {
+                result = WebSearch(query: result.query, error: "The results were too long for this chat.")
+                tokens = try tokenize(template.renderToolResult(result, thinking: thinking))
+            }
+            searches.append(result)
+            emit(.searched(result))
+            try feed(tokens, batch: batch, isStopped: { false }, emit: { _ in })
+            stats.promptTokens += tokens.count
+            parser = template.makeParserAfterToolResult(thinking: thinking)
+            next = llama_sampler_sample(smpl, ctx, -1)
+            if let drafter { state = drafter.targetState(ctx, -1) }
+        }
         generation: while stats.generatedTokens < maxTokens, cached.count < contextLength, !isStopped() {
             guard commit(next) else { break }
+            if closedCall != nil {
+                // The call's closing token isn't in the cache yet: put it there, then the result.
+                try feed([next], batch: batch, isStopped: { false }, emit: { _ in })
+                try answerCall()
+                continue
+            }
             let room = min(contextLength - cached.count - 1, maxTokens - stats.generatedTokens)
             let drafts = drafter?.draft(after: next, at: cached.count, state: state, limit: room) ?? []
             stats.draftedTokens += drafts.count
@@ -494,6 +578,7 @@ public final class LlamaModel: @unchecked Sendable {
                     guard stats.generatedTokens < maxTokens, !isStopped(), commit(picked) else { break generation }
                     cached.append(picked)
                     i += 1
+                    if closedCall != nil { break }  // a drafted call closed: answer it below
                     continue
                 }
                 next = picked
@@ -501,6 +586,7 @@ public final class LlamaModel: @unchecked Sendable {
                 break
             }
             if i < drafts.count { _ = llama_memory_seq_rm(llama_get_memory(ctx), 0, llama_pos(cached.count), -1) }
+            if closedCall != nil { try answerCall() }
             used.withLock { $0 = cached.count }
         }
         if drafter != nil {
@@ -514,11 +600,32 @@ public final class LlamaModel: @unchecked Sendable {
             stats.stopReason = isStopped() ? .stopped : stats.generatedTokens >= maxTokens ? .maxTokens : .contextFull
         }
         if endedCleanly {
-            transcript = (messages + [ChatMessage(role: .assistant, content: answer)], thinking)
+            transcript = (messages + [ChatMessage(role: .assistant, content: answer, searches: searches)], thinking)
             // Worth saving only if a later turn could continue it (not Gemma with thinking on).
             if template.canContinue(from: thinking, to: thinking) { unsaved = checkpoint }
         }
         return stats
+    }
+
+    /// Searches one reply may run; a call past it is told so, and the model answers.
+    static let searchLimit = 3
+
+    /// Runs `work` from `queue` (which waits on it), giving up when the reply is stopped.
+    private static func wait<T: Sendable>(isStopped: () -> Bool, _ work: @escaping @Sendable () async -> T) -> T? {
+        let result = OSAllocatedUnfairLock<T?>(initialState: nil)
+        let done = DispatchSemaphore(value: 0)
+        let task = Task {
+            let value = await work()
+            result.withLock { $0 = value }
+            done.signal()
+        }
+        while done.wait(timeout: .now() + .milliseconds(200)) == .timedOut {
+            if isStopped() {
+                task.cancel()
+                return nil
+            }
+        }
+        return result.withLock { $0 }
     }
 
     /// The messages after `base` if `messages` extends it in a way the cache can follow: same
