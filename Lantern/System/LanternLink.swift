@@ -5,6 +5,8 @@ import Foundation
 /// - `lantern://new` or `lantern://new?mode=fast`: a new chat, in that mode or the usual one.
 /// - `lantern://ask?text=…&mode=smart`: a new chat that sends `text` straight away.
 /// - `lantern://chat/<id>`: opens a chat. The id is `Conversation.stateID`.
+/// - `lantern://pair?v=1&name=…&fp=<sha256>&code=…&addr=host:port&addr=…`: pairs with a computer's
+///   bridge (the QR code in Lantern for Mac's "Pair a Device").
 ///
 /// Modes are `Mode` raw values (`fast` is Gemma 4 E2B, `smart` Gemma 4 E4B, `qwen` Qwen 3.5 4B,
 /// `mac` the Mac, `apple` Apple Intelligence); anything else means the usual mode.
@@ -12,6 +14,17 @@ nonisolated enum LanternLink: Equatable, Sendable {
     case new(mode: String?)
     case ask(text: String, mode: String?)
     case chat(id: String)
+    case pair(PairOffer)
+
+    /// A computer offering to pair: its name, its certificate's SHA-256 (hex), a one-time code and
+    /// the addresses it answers on (home network and tailnet, each with its port).
+    struct PairOffer: Equatable, Sendable, Identifiable {
+        let name: String
+        let fingerprint: String
+        let code: String
+        let addresses: [String]
+        var id: String { code }
+    }
 
     static let scheme = "lantern"
 
@@ -27,6 +40,11 @@ nonisolated enum LanternLink: Equatable, Sendable {
         case "ask":
             guard let text = value("text") else { self = .new(mode: value("mode")); return }
             self = .ask(text: text, mode: value("mode"))
+        case "pair":
+            guard let fp = value("fp"), let code = value("code") else { return nil }
+            let addresses = components.queryItems?.filter { $0.name == "addr" }.compactMap(\.value).filter { !$0.isEmpty } ?? []
+            guard !addresses.isEmpty else { return nil }
+            self = .pair(PairOffer(name: value("name") ?? "Your Computer", fingerprint: fp, code: code, addresses: addresses))
         case "chat":
             let id = components.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
             guard !id.isEmpty else { return nil }
@@ -50,6 +68,11 @@ nonisolated enum LanternLink: Equatable, Sendable {
         case .chat(let id):
             components.host = "chat"
             components.path = "/" + id
+        case .pair(let offer):
+            components.host = "pair"
+            components.queryItems = [.init(name: "v", value: "1"), .init(name: "name", value: offer.name),
+                                     .init(name: "fp", value: offer.fingerprint), .init(name: "code", value: offer.code)]
+                + offer.addresses.map { .init(name: "addr", value: $0) }
         }
         return components.url!
     }

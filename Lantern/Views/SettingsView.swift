@@ -4,6 +4,7 @@ import SwiftUI
 /// Pages pushed inside the Settings sheet.
 enum SettingsPage: Hashable {
     case readiness
+    case personalization
 }
 
 struct SettingsView: View {
@@ -14,6 +15,7 @@ struct SettingsView: View {
     @Environment(\.openURL) private var openURL
     @AppStorage(ReplyDetails.key) private var showMetrics = true
     @AppStorage(Engine.webSearchKey) private var webSearch = false
+    @AppStorage(Engine.customPromptKey) private var customPrompt = ""
     /// The Tavily key as typed; saved to the Keychain as it changes.
     @State private var searchKey = WebSearcher.storedKey ?? ""
 
@@ -59,14 +61,17 @@ struct SettingsView: View {
             }
 
             Section {
-                Text(Engine.systemPrompt())
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                NavigationLink(value: SettingsPage.personalization) {
+                    LabeledContent {
+                        Text(customPrompt.isEmpty || Engine.customInstructions == nil ? "Default" : "Custom")
+                    } label: {
+                        Label("Instructions", systemImage: "text.quote")
+                    }
+                }
             } header: {
-                Text("System prompt")
+                Text("Personalization")
             } footer: {
-                Text("What every model is told at the start of a new chat. Each chat keeps the prompt it started with.")
+                Text("What every model is told at the start of a new chat.")
             }
 
             Section("This device") {

@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// Settings › On Your Computers: the computer Ollama runs on (a Mac Studio, reached over the home
-/// network or the tailnet), its models and how Lantern reaches it. Without one it's the Add a
+/// Settings › On Your Computers: the paired Mac whose bridge serves its models (a Mac Studio, reached
+/// over the home network or the tailnet), its models and how Lantern reaches it. Without one it's the Add a
 /// Computer list. It checks the computer while open, and only then: nothing here runs at launch.
 struct ComputersView: View {
     @Environment(MacLink.self) private var mac
@@ -19,7 +19,10 @@ struct ComputersView: View {
     /// The inline Add a Computer list stays up through its setup, after the addresses are saved.
     @State private var addingInline = false
 
-    private var configured: Bool { MacLink.normalized(lanHost) != nil || MacLink.normalized(tailnetHost) != nil }
+    /// A computer is set up once this device is paired with its bridge.
+    private var configured: Bool {
+        MacPairing.isPaired && (MacLink.normalized(lanHost) != nil || MacLink.normalized(tailnetHost) != nil)
+    }
     private var name: String { MacLink.computerName(stored: storedName, lan: lanHost, tailnet: tailnetHost) }
 
     var body: some View {
@@ -79,7 +82,7 @@ struct ComputersView: View {
                 test = nil
             }
         } message: {
-            Text("Lantern forgets how to reach it. Chats with its models stay, and you can add it again.")
+            Text("Lantern forgets how to reach it and its pairing. Chats with its models stay, and you can pair it again.")
         }
         // Checks while the page is open: when it opens, when the addresses change, and the loaded
         // models every 15 seconds. Leaving the page cancels it.
@@ -112,7 +115,7 @@ struct ComputersView: View {
                 }
                 .font(.subheadline)
                 if let version {
-                    Text("Ollama \(version)").font(.subheadline).foregroundStyle(.secondary)
+                    Text(version).font(.subheadline).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -157,7 +160,7 @@ struct ComputersView: View {
         } header: {
             Text("New Chats Use")
         } footer: {
-            Text("A chat keeps the model it first answered with. To add a model, pull it in Ollama on \(name).")
+            Text("A chat keeps the model it first answered with. To add a model, add it in Ollama or LM Studio on \(name).")
         }
     }
 

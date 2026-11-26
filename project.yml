@@ -74,9 +74,9 @@ targets:
             UTTypeConformsTo: [public.plain-text]
             UTTypeTagSpecification:
               public.filename-extension: [md, markdown]
-        NSLocalNetworkUsageDescription: Lantern finds your computers running Ollama on your home network and talks to them there.
+        NSLocalNetworkUsageDescription: Lantern finds your Mac on your home network and talks to its models there, encrypted.
         # Add a Computer browses for Ollama, which scripts/mac-ollama-setup.sh advertises over Bonjour.
-        NSBonjourServices: [_ollama._tcp]
+        NSBonjourServices: [_lantern._tcp]
         # Dictation in the message box, recognized on this device only.
         NSMicrophoneUsageDescription: Lantern listens when you tap the microphone, to type what you say.
         NSSpeechRecognitionUsageDescription: Lantern turns what you say into text on this device. Nothing is sent anywhere.
@@ -113,6 +113,48 @@ targets:
 
   # Home screen and Lock Screen widgets and a Control Center control. Deep links and static
   # content only, so it needs no App Group.
+  # Lantern on the Mac: a menu bar app that serves this Mac's models (Ollama, LM Studio…) to paired
+  # iPhones and iPads through lantern-bridge (Bridge/, Go, built into the app). Same bundle ID as
+  # the iOS app, so a Mac app later can be the same purchase.
+  LanternMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - LanternMac
+    info:
+      path: LanternMac/Info.plist
+      properties:
+        CFBundleName: Lantern
+        CFBundleDisplayName: Lantern
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true  # the menu bar only, no Dock icon
+        LSApplicationCategoryType: public.app-category.productivity
+        NSHumanReadableCopyright: ""
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern
+        PRODUCT_NAME: Lantern
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO  # the bridge's build reads Bridge/ and runs Go
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        SWIFT_APPROACHABLE_CONCURRENCY: YES
+    preBuildScripts:
+      - name: Build lantern-bridge
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          export PATH="/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:$PATH"
+          out="$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/lantern-bridge"
+          mkdir -p "$(dirname "$out")"
+          cd "$SRCROOT/Bridge"
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$out" .
+          # Signed like the app, before the app's own signature seals it.
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
+            codesign --force --options runtime --timestamp=none --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$out"
+          fi
+
   LanternWidgets:
     type: app-extension
     platform: iOS

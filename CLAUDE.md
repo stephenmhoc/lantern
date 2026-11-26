@@ -15,8 +15,8 @@ MainActor default isolation, SwiftData. Five modes behind one chat:
   `Lantern/Engine/AppleModel.swift`). One `LanguageModelSession` per chat, rebuilt from stored history
   when it differs; no thinking; images on iOS 27. Its status (`AppleStatus`) replaces a download.
   Siri/App Intents call it "Built-in Model" (Apple trademarks are rejected there, ITMS-90626).
-- **Your computers** (`Mode.mac`): every model Ollama has on the Mac Studio (Inkling 2 Mini, Gemma 4 31B,
-  Muse Glimmer), home network first (works with the internet down), tailnet second. A chat keeps
+- **Your computers** (`Mode.mac`): every model the Mac Studio serves (Ollama's Inkling 2 Mini, Gemma 4 31B,
+  Muse Glimmer; LM Studio and others too) through Lantern for Mac's bridge (see Bridge), home network first (works with the internet down), tailnet second. A chat keeps
   its model in `Conversation.macModel` (fixed by its first reply); the picker lists each by
   `MacLink.displayName` under "On Your <computer name>" with `desktopcomputer`, on-device ones with
   a chip. Never call them "cloud". One computer for now (`mac.lan`, `mac.tailnet`, `mac.name`).
@@ -32,7 +32,8 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   `ChatTemplate`s for `gemma4` and `qwen35`) and the `lantern-smoke` Mac CLI.
 - `Lantern/Engine`: `Engine` owns the one generation that can run at a time (send, stop, retry,
   `prepare`, saved state, backgrounding, unloading, model self-test); `ModelStore` downloads;
-  `MacLink` talks to Ollama.
+  `MacLink` talks to the computer's bridge (`BridgeAPI`: the OpenAI API plus `/lantern/v1/…`);
+  `MacPairing` holds the pairing (pinned certificate, token in the Keychain) and pairs from a link.
 - `Lantern/Chat`: the chat screen, in UIKit. `ChatScreen` at the bottom of `ChatViewController.swift`
   is its SwiftUI wrapper: editable title and title menu (Rename, Export as Markdown), the inspector,
   and the banner shown while another chat or a model test holds the engine. `Attachments.swift`
@@ -56,15 +57,20 @@ files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (fr
   chats; `ModelImport` copies a `.gguf` the user already has into Documents (the Models page's file
   picker and drop target). Settings has "On This iPhone" (the Models page: `ReadinessView`, pushed as
   `SettingsPage.readiness`; rows in `ModelRows.swift`, details behind a tap) and "On Your Computers"
-  (`Views/Computers/`: `ComputersView`, the Add a Computer sheet finding Ollama by Bonjour
-  `_ollama._tcp`, tailnet peers and a typed address). The Models page just lists models: no
+  (`Views/Computers/`: `ComputersView`; Add a Computer explains pairing from the Mac's QR code,
+  pastes a pairing link, lists bridges found by Bonjour `_lantern._tcp` (`BridgeBrowser`) and signs
+  in to the tailnet; `PairingSheet` pairs from a `lantern://pair` link). A computer counts as set
+  up only once paired. The Models page just lists models: no
   "ready"/"offline" summary. The sidebar's bottom bar has Settings on the left (badged only when no
   model can answer or the build expires soon, `Readiness.needsAttention`) and New chat on the right.
   The composer collapses to one row (model, field, mic or Stop) while the keyboard is down; its
   model button opens `ModelPicker` (a sheet on iPhone, a popover on iPad: a Think First switch, since
   `Thinking.low` and `.high` do the same, then every model), not a UIMenu; a tap
   on the transcript puts the keyboard away. Settings' "Speed and Tokens" (`ReplyDetails`) trims
-  the line under each answer to only stop and cut-off notes.
+  the line under each answer to only stop and cut-off notes. Settings' Personalization (`PersonalizationView`) holds
+  the user's own instructions (`Engine.customPromptKey`), which replace the default text of new
+  chats' prompts; "This conversation began on …" always follows them. Unset (or the default as it
+  was), the prompt is exactly the default. Existing chats keep theirs (frozen, see Rules).
 - `Lantern/System`: the ways in from outside the app. `LanternLink` is the `lantern://` scheme
   (`new?mode=fast`, `ask?text=…&mode=`, `chat/<id>`), shared with the widgets. App Intents
   (`LanternIntents`: Ask Lantern, Open Chat and the App Shortcuts phrases; `NewChatIntent`, shared
@@ -106,7 +112,7 @@ The official xcframework has no simulator slice. For the simulator, build llama.
 `build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
 simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't map its buffers.
 Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
-`-seedChats`, `-ui readiness|settings|inspector|search:<text>|search|delete|newchat|sidebar|swipe|swipepin|next|window`,
+`-seedChats`, `-ui readiness|settings|personalization|inspector|search:<text>|search|delete|newchat|sidebar|swipe|swipepin|next|window`,
 `-testflight` (show the expiry and reminders), `-importModel <path>`, `-markdownSample full|partial`
 (every answer shows a Markdown sample, `partial` cut off mid code fence), and `-selftest`.
 For the system integration: `-openURL <lantern://…>` (the app opens the link through the system
@@ -115,10 +121,12 @@ itself; `simctl openurl` stops at an "Open in Lantern?" prompt that needs a tap)
 `-spotlightQuery <text>` (searches Lantern's own Spotlight items after indexing).
 
 `scripts/mac-ollama-setup.sh install` (run on the Mac Studio) installs a login agent that gives
-Ollama.app `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=3` and `OLLAMA_CONTEXT_LENGTH=16384`
-(the app only passes launchd's environment to `ollama serve` when it starts after it, and ignores a
-polite quit, so the script kills and reopens it) and preloads Inkling, the one model kept for good. A second agent advertises Ollama over Bonjour
-(`dns-sd -R … _ollama._tcp`, TXT `host=` and `tailnet=`) so Add a Computer finds it.
+Ollama.app `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=3`, `OLLAMA_CONTEXT_LENGTH=16384` and
+`OLLAMA_HOST=127.0.0.1:11434` (this Mac only: devices go through the bridge) (the app only passes
+launchd's environment to `ollama serve` when it starts after it, and ignores a polite quit, so the
+script kills and reopens it), and removes the old `_ollama._tcp` Bonjour agent. Lantern for Mac
+(installed in /Applications, Open at Login) runs the bridge, keeps Inkling loaded and advertises
+`_lantern._tcp`. Build it with `xcodebuild -scheme LanternMac -configuration Release`.
 
 `scripts/fetch-tailscale.sh` builds TailscaleKit (needs Go) for signing into the tailnet; without it
 `Tailnet` compiles out.
@@ -165,8 +173,8 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   `gemmaE4BVision`: optional extras on each Gemma's Models detail page, ~1 GB, loaded beside it only when a chat has an image;
   `LlamaModel.loadVision`). A prompt with images is tokenized by mtmd and always rendered in full;
   each image position gets a stand-in token from its bytes, so the shared prefix is reused and an
-  image is encoded once. Only models that can rewind have a projector here. Mac sends them in Ollama's `images` if `/api/show` lists
-  `vision` for the model, else fails a question about an image with `MacError.noVision`.
+  image is encoded once. Only models that can rewind have a projector here. Mac sends them as `image_url` data URLs if the
+  bridge's `/v1/models` lists `vision` for the model, else fails a question about an image with `MacError.noVision`.
 - **Leaving the app mid-reply (iOS 26+)**: `Engine` submits a `BGContinuedProcessingTaskRequest`
   (`com.merimerimeri.Lantern.reply.<uuid>`, registered just before, strategy `.fail`) as a reply
   starts: always for Mac, for on-device only if `BGTaskScheduler.supportedResources` has `.gpu`
@@ -175,17 +183,30 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   Without a started task it's the old behaviour: on-device stops ("Stopped when you left
   Lantern"), Mac gets the usual few seconds. A reply that finishes in the background posts a
   local notification (provisional authorization, never a prompt).
-- **Mac latency.** Requests for Inkling carry `keep_alive: -1` (a request's value overrides the
-  server's; Ollama's 5-minute default meant reloading the model for most questions); the other Mac
-  models send none, so the server's 30 minutes applies (all three resident held ~60 GB), and `Engine.prepare` calls
-  `MacLink.warm()` (an empty `/api/chat` with the same `num_ctx`, which loads the model) when a Mac
-  chat opens or typing starts. `resolve()` races the home network and the tailnet; a network change
+- **Mac latency.** The bridge keeps the models pinned in Lantern for Mac ("Keep loaded", Inkling)
+  in memory: the OpenAI API has no `keep_alive`, so after each request for one it warms it again
+  with `keep_alive: -1`; the others get the server's 30 minutes (all three resident held ~60 GB).
+  `Engine.prepare` calls `MacLink.warm()` (`POST /lantern/v1/warm`, which loads the model and
+  answers at once) when a Mac chat opens or typing starts. `resolve()` races the home network and the tailnet; a network change
   (`NWPathMonitor`) marks the route stale so a send re-checks instead of hanging on a dead route.
   The tailnet probe races Lantern's own node against the Tailscale app's VPN and the route
-  remembers which answered. The footnote breaks down the wait (found the Mac, connected, loaded,
-  read the chat; `MacLink.Timings`). Keep `num_ctx` the same on every request: a different one
-  makes Ollama reload the model. Inkling thinks even with `think: false` (Ollama just hides it,
-  so nothing showed for seconds); `MacLink.alwaysThinks` models are always asked for thinking.
+  remembers which answered. The footnote breaks down the wait (found the Mac, connected;
+  `MacLink.Timings`): the OpenAI API reports no load or reading time, so the time to the first
+  token stands for both. Thinking is `reasoning_effort` ("none" off, only for a model listed as
+  thinking) and streams as `delta.reasoning` (Ollama) or `reasoning_content`. Inkling thinks even
+  when told not to (Ollama just hides it, so nothing showed for seconds); `MacLink.alwaysThinks`
+  models are always asked for thinking.
+- **Bridge** (`Bridge/`, Go, `lantern-bridge`, built into Lantern for Mac by its pre-build script).
+  Serves every local model server it finds (Ollama 11434, LM Studio 1234, llama.cpp 8080, vLLM 8000,
+  Jan 1337) as one OpenAI API on :11443: TLS 1.3 with its own self-signed certificate, which
+  devices pin by SHA-256, and a token per device (stored hashed, `devices.json`). Pairing: "Pair a
+  Device" shows `lantern://pair?v=1&name=…&fp=…&code=…&addr=…` as a QR code; the device POSTs the
+  one-time code (10 minutes) to `/lantern/v1/pair` and gets its token. It advertises
+  `_lantern._tcp` (TXT `fp=`). The Mac app (`LanternMac/`, a menu bar extra) runs it as a child
+  process, or adopts one already running, and talks to it over `admin.sock` in
+  `~/Library/Application Support/Lantern/Bridge`; it warns when Ollama itself listens on the
+  network and can make it local-only. `cd Bridge && go test ./...`; `lantern-bridge pair` prints a
+  QR code in the terminal. Debug Lantern for Mac takes `-panel`, `-pair` and `-snapshot <folder>`.
 - **Web search**, for every model. Settings' "Search the Web" (`Engine.webSearchKey`,
   off by default) plus the user's own Tavily API key (Keychain, `WebSearcher`; Ollama's own web
   search needs paid credits). This device runs every search (`WebSearcher.search`), at most
@@ -200,8 +221,9 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   so the call renders back byte for byte. Results carry `published` ("Nov 25, 2026"), shown to the
   model and in the sources menu; older stored searches have neither and render as before.
   The cell shows "Searched for “…”" with the sources in its menu.
-  - Computer: Ollama models with the `tools` capability are offered `web_search` per request
-    (`MacLink.stream(search:)`); a call goes back as a `tool` turn. Five results of 1,500 characters.
+  - Computer: models listed with `tools` are offered `web_search` per request
+    (`MacLink.stream(search:)`); a call goes back as an assistant `tool_calls` turn and a `tool`
+    message with its `tool_call_id` (stored searches get ids `call_1`… in order). Five results of 1,500 characters.
   - Gemma and Qwen: the tool is declared in the system turn (`ChatMessage.tools` on the system
     message, set by `Engine.systemMessage`), so switching search changes the prompt and the next
     reply reads the chat again. `LlamaModel.run` collects a call between `toolCallStart` and

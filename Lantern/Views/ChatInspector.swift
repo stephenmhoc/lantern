@@ -85,7 +85,8 @@ struct ChatInspector: View {
             }
 
             Section("System prompt") {
-                Text(Engine.systemPrompt())
+                // The chat's own: it keeps the prompt it started with, whatever Settings says now.
+                Text(conversation.systemPrompt.isEmpty ? Engine.systemPrompt(now: conversation.created) : conversation.systemPrompt)
                     .font(.callout)
                     .textSelection(.enabled)
             }
@@ -97,7 +98,7 @@ struct ChatInspector: View {
         switch conversation.mode {
         case .mac:
             let name = conversation.resolvedMacModel
-            return name.isEmpty ? "Ollama's first model" : "\(MacLink.displayName(name)) (\(name))"
+            return name.isEmpty ? "the Mac's first model" : "\(MacLink.displayName(name)) (\(name))"
         case .apple:
             let status = engine.apple.status
             return status.isAvailable ? Mode.apple.title : "\(Mode.apple.title) (\(status.short.lowercased()))"

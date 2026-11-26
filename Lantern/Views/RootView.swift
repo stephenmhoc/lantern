@@ -52,6 +52,9 @@ struct RootView: View {
     private let router = SystemRouter.shared
 
     /// Readiness lives inside Settings: showing it opens Settings with it pushed.
+    /// A computer being paired from its QR code.
+    @State private var pairing: LanternLink.PairOffer?
+
     enum Sheet: String, Identifiable {
         case settings
         var id: String { rawValue }
@@ -89,11 +92,13 @@ struct RootView: View {
                     .navigationDestination(for: SettingsPage.self) { page in
                         switch page {
                         case .readiness: ReadinessView { sheet = nil }
+                        case .personalization: PersonalizationView()
                         }
                     }
             }
             .presentationSizing(.page)
         }
+        .sheet(item: $pairing) { PairingSheet(offer: $0) }
         .alert("Rename Chat", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $renameText)
             Button("Rename") { rename() }
@@ -579,6 +584,9 @@ struct RootView: View {
         switch DebugLaunch.ui {
         case "readiness"?: showSettings(readiness: true)
         case "settings"?: showSettings()
+        case "personalization"?:
+            settingsPath = [.personalization]
+            sheet = .settings
         case let ui? where ui.hasPrefix("search:"):
             query = String(ui.dropFirst("search:".count))
         case let ui?:
@@ -678,6 +686,8 @@ struct RootView: View {
         case .chat(let id):
             query = ""
             if let c = conversations.first(where: { $0.stateID == id }) { selection = c }
+        case .pair(let offer):
+            pairing = offer
         }
     }
 

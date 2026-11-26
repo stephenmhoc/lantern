@@ -109,7 +109,8 @@ final class Tailnet {
             bus = try await client.watchIPNBus(mask: [.initialState], consumer: BusWatcher(tailnet: self))
             try await node.up()  // returns once signed in
             let (config2, _) = try await URLSessionConfiguration.tailscaleSession(node)
-            session = URLSession(configuration: config2)
+            // Pinned like every other way to the computer: TLS to the bridge runs inside the tailnet too.
+            session = URLSession(configuration: config2, delegate: PinningDelegate.shared, delegateQueue: nil)
             state = .connected
             await refreshPeers()
         } catch {

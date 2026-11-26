@@ -491,14 +491,36 @@ final class Engine {
         return m
     }
 
+    /// The user's own instructions for new chats (Settings > Personalization), in place of the
+    /// default ones; empty for the default.
+    nonisolated static let customPromptKey = "customPrompt"
+
+    /// The default instructions, as the Personalization page shows them to start from.
+    nonisolated static let defaultInstructions = """
+        You are Lantern, a helpful assistant running privately on the user's own device. Answer \
+        clearly and concisely, and use lists or numbered steps when they make an answer easier to follow.
+        """
+
+    /// The user's instructions, or nil for the default (none set, or the default as it was).
+    nonisolated static var customInstructions: String? {
+        let text = (UserDefaults.standard.string(forKey: customPromptKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty || text == defaultInstructions ? nil : text
+    }
+
     /// The prompt new chats are created with. The date is the day the chat starts: it's stored on
     /// the chat and never changes, so the models' caches and saved states stay valid overnight.
+    /// Custom instructions replace the default text; the date always follows them, since a model
+    /// that searches or is asked about "today" needs it.
     nonisolated static func systemPrompt(now: Date = .now) -> String {
-        """
-        You are Lantern, a helpful assistant running privately on the user's own device. This \
-        conversation began on \(now.formatted(date: .complete, time: .omitted)). Answer clearly and \
-        concisely, and use lists or numbered steps when they make an answer easier to follow.
-        """
+        let date = now.formatted(date: .complete, time: .omitted)
+        if let custom = customInstructions {
+            return custom + "\n\nThis conversation began on \(date)."
+        }
+        return """
+            You are Lantern, a helpful assistant running privately on the user's own device. This \
+            conversation began on \(date). Answer clearly and \
+            concisely, and use lists or numbered steps when they make an answer easier to follow.
+            """
     }
 
     /// The chat's own prompt; chats from before prompts were stored get one dated when they began.
