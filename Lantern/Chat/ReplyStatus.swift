@@ -94,3 +94,18 @@ struct PhaseClock {
         return formatter.string(from: TimeInterval(seconds)) ?? format(seconds)
     }
 }
+
+/// Settings' "Speed and tokens" switch for the line under each answer. Off, the line keeps only
+/// what the answer can't do without: that it was stopped or cut off, or that earlier messages were
+/// left out. The model's name and the speed, timings and route go.
+enum ReplyDetails {
+    static let key = "chat.showMetrics"
+
+    static var shown: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
+
+    static func essentials(of footnote: String) -> String {
+        footnote.components(separatedBy: " · ")
+            .filter { $0.hasPrefix("Stopped") || $0.hasPrefix("Cut off") || $0.hasPrefix("Earlier messages") }
+            .joined(separator: " · ")
+    }
+}

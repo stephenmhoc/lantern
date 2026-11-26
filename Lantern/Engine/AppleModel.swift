@@ -57,7 +57,7 @@ nonisolated enum AppleStatus: Equatable, Sendable {
         }
         #endif
         #if canImport(FoundationModels)
-        guard #available(iOS 26, *) else { return .needsNewerSystem }
+        guard #available(iOS 26, macOS 26, *) else { return .needsNewerSystem }
         switch SystemLanguageModel.default.availability {
         case .available: return .available
         case .unavailable(.deviceNotEligible): return .notEligible
@@ -134,7 +134,7 @@ final class AppleLink {
     /// The most a chat holds, in tokens: the model's context (4,096 until iOS 26.4 reported it).
     var contextSize: Int {
         #if canImport(FoundationModels)
-        if #available(iOS 26, *) { return SystemLanguageModel.default.contextSize }
+        if #available(iOS 26, macOS 26, *) { return SystemLanguageModel.default.contextSize }
         #endif
         return 4096
     }
@@ -142,7 +142,7 @@ final class AppleLink {
     /// iOS 27's model may take images (`.vision`); iOS 26's can't.
     var seesImages: Bool {
         #if canImport(FoundationModels)
-        if #available(iOS 27, *), status.isAvailable { return SystemLanguageModel.default.capabilities.contains(.vision) }
+        if #available(iOS 27, macOS 27, *), status.isAvailable { return SystemLanguageModel.default.capabilities.contains(.vision) }
         #endif
         return false
     }
@@ -152,7 +152,7 @@ final class AppleLink {
     /// Builds the chat's session ahead of the question and lets the system load the model.
     func prewarm(_ history: [ChatMessage], key: String) {
         #if canImport(FoundationModels)
-        guard #available(iOS 26, *), status.isAvailable, !history.isEmpty else { return }
+        guard #available(iOS 26, macOS 26, *), status.isAvailable, !history.isEmpty else { return }
         let session = session(for: history, key: key, rebuildFrom: history)
         session.prewarm()
         #endif
@@ -183,7 +183,7 @@ final class AppleLink {
         into continuation: AsyncThrowingStream<Generation, Error>.Continuation
     ) async throws {
         #if canImport(FoundationModels)
-        guard #available(iOS 26, *) else { throw AppleError.unavailable(.needsNewerSystem) }
+        guard #available(iOS 26, macOS 26, *) else { throw AppleError.unavailable(.needsNewerSystem) }
         guard status.isAvailable else { throw AppleError.unavailable(status) }
         for (n, attempt) in attempts.enumerated() {
             guard let question = attempt.history.last, question.role == .user else { throw AppleError.failed("Nothing to answer.") }
@@ -215,7 +215,7 @@ final class AppleLink {
                         continuation.yield(.text(String(now.dropFirst(text.count))))
                     }
                     text = now
-                    if #available(iOS 27, *) {
+                    if #available(iOS 27, macOS 27, *) {
                         stats.promptTokens = snapshot.usage.input.totalTokenCount
                         stats.reusedTokens = snapshot.usage.input.cachedTokenCount
                         stats.generatedTokens = snapshot.usage.output.totalTokenCount
@@ -268,15 +268,15 @@ final class AppleLink {
     #if canImport(FoundationModels)
     /// Whether the history leaves room for an answer: the prompt may take up to three quarters of
     /// the context, as `fittingStart` keeps for llama.cpp. True where tokens can't be counted.
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private func fits(_ history: [ChatMessage]) async -> Bool {
-        guard #available(iOS 26.4, *),
+        guard #available(iOS 26.4, macOS 26.4, *),
               let tokens = try? await SystemLanguageModel.default.tokenCount(for: Self.transcript(history)) else { return true }
         return tokens <= contextSize * 3 / 4
     }
 
     /// The chat's session if it holds exactly `held`, else a new one holding it.
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private func session(for held: [ChatMessage], key: String, rebuildFrom history: [ChatMessage]) -> LanguageModelSession {
         if let cached = sessions[key], cached.held == held, let session = cached.session as? LanguageModelSession, !session.isResponding {
             sessions[key]?.used = .now
@@ -295,7 +295,7 @@ final class AppleLink {
 
     /// The system prompt as instructions (with the search tool when it's declared), then the turns
     /// as prompts and responses, each answer's searches before it as the calls and what they found.
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private static func transcript(_ messages: [ChatMessage]) -> Transcript {
         var entries: [Transcript.Entry] = []
         var calls = 0
@@ -326,18 +326,18 @@ final class AppleLink {
     }
 
     /// An earlier question's images, for a model that can see; none otherwise (its text still goes).
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private static func imageSegments(_ m: ChatMessage) -> [Transcript.Segment] {
-        guard #available(iOS 27, *), SystemLanguageModel.default.capabilities.contains(.vision) else { return [] }
+        guard #available(iOS 27, macOS 27, *), SystemLanguageModel.default.capabilities.contains(.vision) else { return [] }
         return (m.images ?? []).compactMap(cgImage).map {
             .attachment(Transcript.AttachmentSegment(content: .image(Transcript.ImageAttachment($0))))
         }
     }
 
     /// The question: its images first (as Gemma sees them), then its text.
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private static func prompt(_ m: ChatMessage, seesImages: Bool) -> Prompt {
-        if #available(iOS 27, *), seesImages {
+        if #available(iOS 27, macOS 27, *), seesImages {
             let images = (m.images ?? []).compactMap(cgImage).map { FoundationModels.Attachment($0) }
             if !images.isEmpty { return Prompt { images; m.content } }
         }
@@ -349,17 +349,17 @@ final class AppleLink {
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
 
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private static func isContextFull(_ error: Error) -> Bool {
-        if #available(iOS 27, *), let e = error as? LanguageModelError, case .contextSizeExceeded = e { return true }
+        if #available(iOS 27, macOS 27, *), let e = error as? LanguageModelError, case .contextSizeExceeded = e { return true }
         if let e = error as? LanguageModelSession.GenerationError, case .exceededContextWindowSize = e { return true }
         return false
     }
 
     /// The framework's errors as short sentences of Lantern's own.
-    @available(iOS 26, *)
+    @available(iOS 26, macOS 26, *)
     private static func translate(_ error: Error) -> Error {
-        if #available(iOS 27, *), let e = error as? LanguageModelError {
+        if #available(iOS 27, macOS 27, *), let e = error as? LanguageModelError {
             switch e {
             case .guardrailViolation: return AppleError.guardrail
             case .refusal: return AppleError.refusal
@@ -369,7 +369,7 @@ final class AppleLink {
             default: return AppleError.failed(e.localizedDescription)
             }
         }
-        if #available(iOS 27, *), let e = error as? SystemLanguageModel.Error, case .assetsUnavailable = e {
+        if #available(iOS 27, macOS 27, *), let e = error as? SystemLanguageModel.Error, case .assetsUnavailable = e {
             return AppleError.unavailable(.notReady)
         }
         if let e = error as? LanguageModelSession.GenerationError {
@@ -421,7 +421,7 @@ nonisolated final class SearchSink: @unchecked Sendable {
 #if canImport(FoundationModels)
 /// The web search tool, as Gemma and Qwen are given it: the same name, description and query, and
 /// the model reads the same text back (`WebSearch.modelText`).
-@available(iOS 26, *)
+@available(iOS 26, macOS 26, *)
 nonisolated struct WebSearchTool: Tool {
     let sink: SearchSink
     let name = WebSearch.toolName

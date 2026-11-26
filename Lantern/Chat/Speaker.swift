@@ -22,8 +22,10 @@ import NaturalLanguage
         let plain = Markdown.plainText(text)
         guard !plain.isEmpty else { return }
         // Spoken audio plays even with the ring switch off, like a podcast, and ducks other audio.
+        #if os(iOS)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .spokenAudio, options: [.duckOthers])
         try? AVAudioSession.sharedInstance().setActive(true)
+        #endif
         let utterance = AVSpeechUtterance(string: plain)
         utterance.voice = Self.voice(for: plain)
         speaking = id
@@ -60,10 +62,12 @@ import NaturalLanguage
         // Also after Stop, whose utterance is no longer current: until the session is let go,
         // other apps' audio stays ducked. Not if dictation has taken the session over since
         // (Stop comes just before it starts): that would cut off its microphone.
+        #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         if speaking == nil, !synthesizer.isSpeaking, session.category == .playback {
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
         }
+        #endif
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {

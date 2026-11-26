@@ -131,7 +131,7 @@ final class MacLink {
             Task { @MainActor in self?.networkChanged(summary) }
         }
         pathMonitor.start(queue: DispatchQueue(label: "Lantern.MacLink.path"))
-        #if DEBUG
+        #if DEBUG && os(iOS)
         ComputersDebug.presentIfAsked(self)  // `-ui computers|addcomputer`
         #endif
     }

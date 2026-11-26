@@ -1,10 +1,12 @@
+#if os(iOS)
 import BackgroundTasks
+import UIKit
+#endif
 import Foundation
 import LlamaKit
 import Observation
 import os
 import SwiftData
-import UIKit
 import UserNotifications
 
 /// Runs the one generation that can happen at a time, in whichever mode a chat uses. Only one
@@ -37,7 +39,9 @@ final class Engine {
     @ObservationIgnored private var prepared: (mode: Mode, conversation: Conversation)?
     @ObservationIgnored private var prepareCount = 0
     @ObservationIgnored private var inBackground = false
+    #if os(iOS)
     @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
+    #endif
     /// iOS 26+: the `BGContinuedProcessingTask` keeping the running reply going after leaving the
     /// app, once the system has started it (`AnyObject` so the property exists on iOS 18).
     @ObservationIgnored private var continued: AnyObject?
@@ -53,18 +57,29 @@ final class Engine {
         }
         // The model's cache and buffers are the app's largest dirty memory, and what's in them is
         // saved: under memory pressure, give them back rather than be killed.
+        #if os(iOS)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.unload() }
         }
-        #if DEBUG
+        #endif
+        #if DEBUG && os(iOS)
         if ProcessInfo.processInfo.arguments.contains("-featuretest") { Task { await runFeatureTest() } }
         #endif
     }
 
     func model(for mode: Mode) -> CatalogModel? {
         CatalogModel.preferred(for: mode, downloaded: store.downloaded)
+    }
+
+    /// How a footnote names where a computer's model ran: on the Mac itself, its own.
+    nonisolated static var onTheComputer: String {
+        #if os(macOS)
+        "on this Mac"
+        #else
+        "on your Mac"
+        #endif
     }
 
     // MARK: - Chats
@@ -218,8 +233,10 @@ final class Engine {
         live.thinkingAsked = thinking != .off && mode != .apple  // Apple's model doesn't think
         self.live = live
         running = conversation.persistentModelID
+        #if os(iOS)
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
         beginContinuedProcessing(mode: mode, chatTitle: conversation.title)
+        #endif
 
         task = Task {
             var stats: GenerationStats?
@@ -316,10 +333,12 @@ final class Engine {
                     case .done(let s): stats = s
                     }
                     pieces += 1
+                    #if os(iOS)
                     if Date().timeIntervalSince(lastProgress) > 0.5 {
                         reportContinuedProgress(pieces)
                         lastProgress = .now
                     }
+                    #endif
                     if Date().timeIntervalSince(lastSave) > 5 {  // so a crash keeps most of the answer
                         write(live, to: conversation, finished: false)
                         lastSave = .now
@@ -338,7 +357,7 @@ final class Engine {
         _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?,
         request: MacLink.Request?
     ) {
-        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) on your Mac"
+        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) \(Self.onTheComputer)"
                      : live.mode == .apple ? live.mode.title : loadedModel?.name ?? live.mode.title]
         if let stats, stats.generatedTokens > 0 { parts.append(String(format: "%.1f tok/s", stats.tokensPerSecond)) }
         if let first = live.firstTokenSeconds { parts.append(String(format: "%.1f s to first token", first)) }
@@ -414,18 +433,24 @@ final class Engine {
         if stats != nil, error == nil, conversation.modelContext != nil, !conversation.isDeleted {
             ChatTitler.shared.titleIfNeeded(conversation)
         }
+        #if os(iOS)
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)  // you may have put it down
         }
+        #endif
+        #if os(iOS)
         if inBackground, stats != nil || error != nil {
             notifyFinished(conversation, reply: live, failed: error != nil)
         }
+        #endif
         self.live = nil
         running = nil
         task = nil
+        #if os(iOS)
         UIApplication.shared.isIdleTimerDisabled = false
         endContinuedProcessing(success: error == nil)
         endBackgroundTask()
+        #endif
         pruneStates()
     }
 
@@ -671,7 +696,7 @@ final class Engine {
 
     // MARK: - Saved state
 
-    private static let stateRoot = URL.cachesDirectory.appending(path: "kv")
+    private static let stateRoot = Folders.caches.appending(path: "kv")
     /// Above this, the least recently used chats' states are deleted. A long Gemma chat's state is
     /// a few tens of MB.
     private static let stateBudget: Int64 = 3_000_000_000
@@ -738,6 +763,7 @@ final class Engine {
 
     // MARK: - Leaving the app
 
+    #if os(iOS)
     /// On iOS 26+, a reply whose continued-processing task the system started keeps going (an
     /// on-device one only where background GPU is allowed; see `beginContinuedProcessing`).
     /// Otherwise iOS doesn't allow GPU work in the background, so an on-device reply stops when you
@@ -782,6 +808,8 @@ final class Engine {
         }
     }
 
+    #endif
+
     /// Back in front: load the model for the chat that was open again.
     func didBecomeActive() {
         inBackground = false
@@ -791,6 +819,7 @@ final class Engine {
         if let prepared, llama == nil { prepare(mode: prepared.mode, for: prepared.conversation) }
     }
 
+    #if os(iOS)
     private func endBackgroundTask() {
         guard backgroundTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(backgroundTask)
@@ -812,7 +841,7 @@ final class Engine {
     /// so they're treated like the Mac's: Lantern only has to stay running to receive the text.
     /// With `.fail`, a request iOS can't start now is refused outright.
     private func beginContinuedProcessing(mode: Mode, chatTitle: String) {
-        guard #available(iOS 26, *) else { return }
+        guard #available(iOS 26, macOS 26, *) else { return }
         let needsGPU = mode.usesLlama && !Self.onCPU
         if needsGPU, !BGTaskScheduler.supportedResources.contains(.gpu) { return }
         let id = "\(Self.continuedPrefix).\(UUID().uuidString)"
@@ -856,7 +885,7 @@ final class Engine {
     }
 
     private func reportContinuedProgress(_ pieces: Int) {
-        guard #available(iOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
+        guard #available(iOS 26, macOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
         let done = Int64(pieces)
         if done >= task.progress.totalUnitCount * 9 / 10 { task.progress.totalUnitCount = done * 5 / 4 + 1 }
         task.progress.completedUnitCount = done
@@ -864,11 +893,12 @@ final class Engine {
 
     private func endContinuedProcessing(success: Bool) {
         continuedID = nil
-        guard #available(iOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
+        guard #available(iOS 26, macOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
         continued = nil
         task.progress.completedUnitCount = task.progress.totalUnitCount
         task.setTaskCompleted(success: success)
     }
+
 
     // MARK: - Telling the user a reply finished while away
 
@@ -888,6 +918,8 @@ final class Engine {
         let request = UNNotificationRequest(identifier: "reply-\(live.id)", content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
     }
+
+    #endif
 
     // MARK: - Apple Intelligence
 
@@ -922,6 +954,22 @@ final class Engine {
 
     /// Frees the model's memory, after saving the state of the chat it holds. It's loaded again
     /// when next needed. Called on a memory warning, on leaving the app, and from Settings.
+    /// Quitting (the Mac): stops any reply, saves the model's state and frees it. llama.cpp's
+    /// Metal device is torn down as the process exits and aborts if a model still holds its buffers.
+    func shutDown() async {
+        let running = task
+        task?.cancel()
+        await running?.value
+        pendingLoad?.cancel.set()
+        _ = try? await pendingLoad?.task.value
+        pendingLoad = nil
+        if let old = llama {
+            llama = nil
+            loadedModel = nil
+            await old.flush()  // `old` is freed here, its last reference gone
+        }
+    }
+
     func unload() {
         guard !isBusy, let old = llama else { return }
         llama = nil

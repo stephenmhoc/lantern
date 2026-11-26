@@ -1,4 +1,8 @@
+#if os(iOS)
 import UIKit
+#else
+import AppKit
+#endif
 
 extension NSAttributedString.Key {
     /// Marks a code block or table, so `BlockLayoutManager` can draw one even background behind it.
@@ -25,8 +29,8 @@ enum Markdown {
     private static let listIndent: CGFloat = 24
     private static let paragraphGap: CGFloat = 10
 
-    static func render(_ text: String, color: UIColor = .label, traits: UITraitCollection = .current) -> NSAttributedString {
-        let body = UIFont.preferredFont(forTextStyle: .body, compatibleWith: traits)
+    static func render(_ text: String, color: PlatformColor = .lanternLabel, traits: TextTraits = .current) -> NSAttributedString {
+        let body = PlatformFont.lanternStyle(.body, traits)
         let options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .full, failurePolicy: .returnPartiallyParsedIfPossible)
         guard let parsed = try? AttributedString(markdown: text, options: options) else {
@@ -35,7 +39,7 @@ enum Markdown {
 
         // Each ordered list's marker column fits its widest number, so "10." doesn't push its text
         // onto the next line. Components run from the innermost out: an item's list follows it.
-        let digits = UIFont.monospacedDigitSystemFont(ofSize: body.pointSize, weight: .regular)
+        let digits = PlatformFont.monospacedDigitSystemFont(ofSize: body.pointSize, weight: .regular)
         var columns: [Int: CGFloat] = [:]
         for run in parsed.runs {
             guard let components = run.presentationIntent?.components else { continue }
@@ -145,13 +149,13 @@ enum Markdown {
             }
 
             if let level = heading {
-                let style: UIFont.TextStyle = level == 1 ? .title2 : level == 2 ? .title3 : .headline
-                font = UIFont.preferredFont(forTextStyle: style, compatibleWith: traits).withTraits(.traitBold)
+                let style: PlatformFont.TextStyle = level == 1 ? .title2 : level == 2 ? .title3 : .headline
+                font = PlatformFont.lanternStyle(style, traits).bold()
                 paragraph.paragraphSpacingBefore = atStart && startsBlock ? 0 : level <= 2 ? 14 : 8
                 paragraph.paragraphSpacing = level <= 2 ? 6 : 4
             }
             if let quote {
-                attributes[.foregroundColor] = UIColor.secondaryLabel
+                attributes[.foregroundColor] = PlatformColor.lanternSecondaryLabel
                 attributes[.lanternQuote] = quote
                 paragraph.firstLineHeadIndent = 16
                 paragraph.headIndent = 16
@@ -177,7 +181,7 @@ enum Markdown {
                         marker = "\t" + ["•", "◦", "▪︎"][min(listDepth, 3) - 1] + "\t"
                     }
                     out.append(NSAttributedString(string: marker, attributes: [
-                        .font: markerFont, .foregroundColor: item.ordered ? color : UIColor.secondaryLabel,
+                        .font: markerFont, .foregroundColor: item.ordered ? color : PlatformColor.lanternSecondaryLabel,
                         .paragraphStyle: markerStyle,
                     ]))
                 }
@@ -201,7 +205,7 @@ enum Markdown {
             if let rule {
                 // The parser gives a break as "⸻"; it stays in the text (for copying) but invisible,
                 // and BlockLayoutManager draws a hairline through its line instead.
-                attributes[.foregroundColor] = UIColor.clear
+                attributes[.foregroundColor] = PlatformColor.clear
                 attributes[.lanternRule] = rule
                 font = .systemFont(ofSize: 8)
                 paragraph.paragraphSpacingBefore = 4
@@ -209,16 +213,16 @@ enum Markdown {
             }
 
             if let cell {
-                font = .preferredFont(forTextStyle: .subheadline, compatibleWith: traits)
-                if cell.header { font = font.withTraits(.traitBold) }
+                font = PlatformFont.lanternStyle(.subheadline, traits)
+                if cell.header { font = font.bold() }
             }
             if let inline = run.inlinePresentationIntent {
-                if inline.contains(.stronglyEmphasized) { font = font.withTraits(.traitBold) }
-                if inline.contains(.emphasized) { font = font.withTraits(.traitItalic) }
+                if inline.contains(.stronglyEmphasized) { font = font.bold() }
+                if inline.contains(.emphasized) { font = font.italic() }
                 if inline.contains(.code) {
                     font = codeFont(size: font.pointSize * 0.9 / traitsScale(traits), traits: traits)
                     // A table already sits on the same fill; a second one inside it only looks muddy.
-                    if cell == nil { attributes[.backgroundColor] = UIColor.tertiarySystemFill }
+                    if cell == nil { attributes[.backgroundColor] = PlatformColor.tertiarySystemFill }
                 }
                 if inline.contains(.strikethrough) { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
             }
@@ -252,7 +256,7 @@ enum Markdown {
     /// block at the very start or end a hairline paragraph to draw into.
     private static func padBlocksAtEdges(_ out: NSMutableAttributedString) {
         guard out.length > 0 else { return }
-        let hairline: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 1)]
+        let hairline: [NSAttributedString.Key: Any] = [.font: PlatformFont.systemFont(ofSize: 1)]
         if out.attribute(.lanternBlock, at: out.length - 1, effectiveRange: nil) != nil {
             out.append(NSAttributedString(string: "\n\u{200B}", attributes: hairline))
         }
@@ -291,15 +295,12 @@ enum Markdown {
 
     // MARK: - Code
 
-    /// Monospaced at `size` points for the default text size, scaled with Dynamic Type.
-    private static func codeFont(size: CGFloat, traits: UITraitCollection) -> UIFont {
-        UIFontMetrics(forTextStyle: .body).scaledFont(
-            for: .monospacedSystemFont(ofSize: size, weight: .regular), compatibleWith: traits)
+    private static func codeFont(size: CGFloat, traits: TextTraits) -> PlatformFont {
+        PlatformFont.lanternCode(size: size, traits: traits)
     }
 
-    /// How much Dynamic Type scales body text, to turn a scaled size back into a default one.
-    private static func traitsScale(_ traits: UITraitCollection) -> CGFloat {
-        UIFontMetrics(forTextStyle: .body).scaledValue(for: 17, compatibleWith: traits) / 17
+    private static func traitsScale(_ traits: TextTraits) -> CGFloat {
+        PlatformFont.lanternTextScale(traits)
     }
 
     private static func blockParagraph(before: CGFloat = 0, after: CGFloat = 0) -> NSMutableParagraphStyle {
@@ -315,20 +316,20 @@ enum Markdown {
     /// The block's first line: its language, if given. `AnswerTextView` puts a Copy button at the
     /// line's trailing end, which is why the line is there even without a language.
     private static func appendCodeHeader(
-        to out: NSMutableAttributedString, hint: String?, code: String, index: Int, traits: UITraitCollection
+        to out: NSMutableAttributedString, hint: String?, code: String, index: Int, traits: TextTraits
     ) {
-        let small = UIFont.preferredFont(forTextStyle: .caption1, compatibleWith: traits)
+        let small = PlatformFont.lanternStyle(.caption1, traits)
         var trimmed = code
         if trimmed.hasSuffix("\n") { trimmed.removeLast() }
         let label = hint.flatMap { $0.isEmpty ? nil : $0 } ?? "\u{200B}"
         out.append(NSAttributedString(string: label + "\n", attributes: [
-            .font: small, .foregroundColor: UIColor.secondaryLabel, .paragraphStyle: blockParagraph(before: 10, after: 6),
+            .font: small, .foregroundColor: PlatformColor.lanternSecondaryLabel, .paragraphStyle: blockParagraph(before: 10, after: 6),
             .lanternBlock: "code-\(index)", .lanternCode: trimmed,
         ]))
     }
 
     private static func appendCode(
-        to out: NSMutableAttributedString, _ code: String, index: Int, color: UIColor, traits: UITraitCollection
+        to out: NSMutableAttributedString, _ code: String, index: Int, color: PlatformColor, traits: TextTraits
     ) {
         var code = code
         if code.hasSuffix("\n") { code.removeLast() }
@@ -431,11 +432,8 @@ enum Markdown {
 /// characters), a hairline under a table's header row, a bar beside each block quote and a hairline
 /// for each thematic break.
 nonisolated final class BlockLayoutManager: NSLayoutManager {
-    /// The table header's line and a thematic break: the separator, or with Increase Contrast
-    /// something that reads.
-    private static let hairlineColor = UIColor { $0.accessibilityContrast == .high ? .tertiaryLabel : .separator }
-    /// In dark mode a code block's or table's fill is close to the background, so a hairline edges it.
-    private static let blockEdge = UIColor { $0.userInterfaceStyle == .dark ? .separator : .clear }
+    private static var hairlineColor: PlatformColor { .lanternHairline }
+    private static var blockEdge: PlatformColor { .lanternBlockEdge }
 
     override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: CGPoint) {
         super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
@@ -446,9 +444,9 @@ nonisolated final class BlockLayoutManager: NSLayoutManager {
 
         eachRun(of: .lanternBlock, in: characters, storage: storage) { used in
             let rect = CGRect(x: 0, y: used.minY - 8, width: width, height: used.height + 16)
-            UIColor.secondarySystemFill.setFill()
-            let path = UIBezierPath(roundedRect: rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0.25, dy: 0.25),
-                                    cornerRadius: 10)
+            PlatformColor.secondarySystemFill.setFill()
+            let path = PlatformBezierPath.lanternRounded(rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: 0.25, dy: 0.25),
+                                                         radius: 10)
             path.fill()
             Self.blockEdge.setStroke()
             path.lineWidth = hairline
@@ -457,16 +455,16 @@ nonisolated final class BlockLayoutManager: NSLayoutManager {
         eachRun(of: .lanternTableHeader, in: characters, storage: storage) { used in
             let inset = Markdown.blockInset
             Self.hairlineColor.setFill()
-            UIBezierPath(rect: CGRect(x: origin.x + inset, y: origin.y + used.maxY + 4.5, width: width - 2 * inset, height: hairline)).fill()
+            PlatformBezierPath(rect: CGRect(x: origin.x + inset, y: origin.y + used.maxY + 4.5, width: width - 2 * inset, height: hairline)).fill()
         }
         eachRun(of: .lanternQuote, in: characters, storage: storage) { used in
-            UIColor.tertiaryLabel.setFill()
+            PlatformColor.lanternTertiaryLabel.setFill()
             let bar = CGRect(x: origin.x + 2, y: origin.y + used.minY + 1, width: 3, height: used.height - 2)
-            UIBezierPath(roundedRect: bar, cornerRadius: 1.5).fill()
+            PlatformBezierPath.lanternRounded(bar, radius: 1.5).fill()
         }
         eachRun(of: .lanternRule, in: characters, storage: storage) { used in
             Self.hairlineColor.setFill()
-            UIBezierPath(rect: CGRect(x: origin.x, y: origin.y + used.midY.rounded(), width: width, height: hairline)).fill()
+            PlatformBezierPath(rect: CGRect(x: origin.x, y: origin.y + used.midY.rounded(), width: width, height: hairline)).fill()
         }
     }
 
@@ -488,12 +486,5 @@ nonisolated final class BlockLayoutManager: NSLayoutManager {
             }
             if !rect.isNull { draw(rect) }
         }
-    }
-}
-
-extension UIFont {
-    func withTraits(_ traits: UIFontDescriptor.SymbolicTraits) -> UIFont {
-        guard let d = fontDescriptor.withSymbolicTraits(fontDescriptor.symbolicTraits.union(traits)) else { return self }
-        return UIFont(descriptor: d, size: pointSize)
     }
 }

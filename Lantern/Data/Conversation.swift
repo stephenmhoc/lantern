@@ -228,8 +228,8 @@ extension Conversation {
             if let mode = Mode.allCases.first(where: { $0.isOnDevice && $0.title == name }) {
                 return ModelChoice(mode: mode, macModel: nil)
             }
-            let suffix = " on your Mac"
-            let macName = name.hasSuffix(suffix) ? String(name.dropLast(suffix.count)) : name
+            let suffix = [" on your Mac", " on this Mac"].first { name.hasSuffix($0) }
+            let macName = suffix.map { String(name.dropLast($0.count)) } ?? name
             if let model = ([resolvedMacModel] + macModels).first(where: { !$0.isEmpty && MacLink.displayName($0) == macName }) {
                 return ModelChoice(mode: .mac, macModel: model)
             }

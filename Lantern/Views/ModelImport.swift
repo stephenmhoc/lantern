@@ -46,7 +46,7 @@ nonisolated enum ModelImport {
         }
 
         let fm = FileManager.default
-        let dest = URL.documentsDirectory.appending(path: model.filename)
+        let dest = Folders.models.appending(path: model.filename)
         if source.standardizedFileURL == dest.standardizedFileURL { return model }
         if let existing = try? dest.resourceValues(forKeys: [.fileSizeKey]).fileSize, Int64(existing) == model.bytes {
             return model  // already here
@@ -57,7 +57,7 @@ nonisolated enum ModelImport {
         if move, (try? fm.moveItem(at: source, to: temp)) != nil {
             return try finish(model, from: temp, to: dest)
         }
-        let free = (try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let free = (try? Folders.models.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage) ?? 0
         guard free >= model.bytes + 500_000_000 else { throw Failure.noSpace(model.bytes + 500_000_000) }
         try fm.copyItem(at: source, to: temp)

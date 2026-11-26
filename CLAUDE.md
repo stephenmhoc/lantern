@@ -202,11 +202,28 @@ script kills and reopens it), and removes the old `_ollama._tcp` Bonjour agent. 
   devices pin by SHA-256, and a token per device (stored hashed, `devices.json`). Pairing: "Pair a
   Device" shows `lantern://pair?v=1&name=…&fp=…&code=…&addr=…` as a QR code; the device POSTs the
   one-time code (10 minutes) to `/lantern/v1/pair` and gets its token. It advertises
-  `_lantern._tcp` (TXT `fp=`). The Mac app (`LanternMac/`, a menu bar extra) runs it as a child
+  `_lantern._tcp` (TXT `fp=`). The Mac app (`LanternMac/`) runs it as a child
   process, or adopts one already running, and talks to it over `admin.sock` in
   `~/Library/Application Support/Lantern/Bridge`; it warns when Ollama itself listens on the
   network and can make it local-only. `cd Bridge && go test ./...`; `lantern-bridge pair` prints a
-  QR code in the terminal. Debug Lantern for Mac takes `-panel`, `-pair` and `-snapshot <folder>`.
+  QR code in the terminal. Debug Lantern for Mac takes `-panel`, `-pair`, `-snapshot <folder>
+  [-snapshotDelay s] [-dark]`, `-settings <general|personalization|models|search|devices>` and
+  `-ask <text> [-mode fast|smart|qwen|mac|apple] [-quit]` (sends in a new chat, logs `ASK done`).
+- **Lantern for Mac is a full chat app** (`LanternMac/`): a Dock app with windows (`MacRootView`:
+  sidebar of chats with `ChatSection`/`ChatSearch`, `ChatPane`: SwiftUI transcript read at 15 Hz
+  with answers in an AppKit `AnswerNSTextView` on `BlockLayoutManager`, message box with model,
+  Think First and Send), Settings (General, Personalization, Models, Web Search, Devices: pairing
+  and the bridge) and the menu bar extra; closing the last window keeps the bridge running. It
+  shares `Lantern/Engine`, `Lantern/Data` and the platform-neutral chat files (`Markdown` through
+  `PlatformText.swift`, `AttachmentReader`, `ReplyStatus`, `Speaker`, `EmptyChatView`); iOS-only
+  code there is behind `#if os(iOS)`, availability checks name both (`iOS 26, macOS 26, *`).
+  `ThisMac` pairs the app with its own bridge over the admin socket ("Lantern on This Mac", hidden
+  from device lists) and points `MacLink` at 127.0.0.1, so `Mode.mac` is "This Mac's models".
+  Chats are in `~/Library/Application Support/Lantern/Chats.store`, GGUFs in `…/Lantern/Models`
+  (`Folders`), saved states in `Caches/com.merimerimeri.Lantern`. Quit waits for
+  `Engine.shutDown()` (`AppDelegate`): llama.cpp aborts in `exit` if a model still holds Metal
+  buffers. `Engine` and `BridgeController` are static singletons there, not `@State` (an `App`'s
+  state read in `init` can be another instance).
 - **Web search**, for every model. Settings' "Search the Web" (`Engine.webSearchKey`,
   off by default) plus the user's own Tavily API key (Keychain, `WebSearcher`; Ollama's own web
   search needs paid credits). This device runs every search (`WebSearcher.search`), at most

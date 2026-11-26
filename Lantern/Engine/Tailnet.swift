@@ -1,6 +1,8 @@
 import Foundation
 import Observation
+#if canImport(UIKit)
 import UIKit
+#endif
 #if canImport(TailscaleKit)
 import TailscaleKit
 #endif

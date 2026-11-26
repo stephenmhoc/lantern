@@ -2,7 +2,6 @@ import Foundation
 import LlamaKit
 import Network
 import Observation
-import UIKit
 
 /// Model files live in Documents, so they also show up in Finder (over a cable) and the Files app:
 /// that's how to copy one from the Mac without internet. They're excluded from backups.
@@ -73,7 +72,7 @@ final class ModelStore: NSObject {
         }
     }
 
-    func url(for model: CatalogModel) -> URL { URL.documentsDirectory.appending(path: model.filename) }
+    func url(for model: CatalogModel) -> URL { Folders.models.appending(path: model.filename) }
 
     var downloaded: Set<String> { Set(states.filter { $0.value == .ready }.map(\.key)) }
 
@@ -106,19 +105,19 @@ final class ModelStore: NSObject {
 
     func refreshRetired() {
         retired = CatalogModel.retiredFilenames.compactMap { name in
-            let file = URL.documentsDirectory.appending(path: name)
+            let file = Folders.models.appending(path: name)
             guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize else { return nil }
             return (name, Int64(size))
         }
     }
 
     func deleteRetired() {
-        for (name, _) in retired { try? FileManager.default.removeItem(at: URL.documentsDirectory.appending(path: name)) }
+        for (name, _) in retired { try? FileManager.default.removeItem(at: Folders.models.appending(path: name)) }
         refreshRetired()
     }
 
     static var freeBytes: Int64 {
-        (try? URL.documentsDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        (try? Folders.models.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
             .volumeAvailableCapacityForImportantUsage) ?? 0
     }
 
@@ -195,7 +194,7 @@ extension ModelStore: URLSessionDownloadDelegate {
         guard let id = downloadTask.taskDescription,
               let model = CatalogModel.files.first(where: { $0.id == id }) else { return }
         let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 0
-        let dest = URL.documentsDirectory.appending(path: model.filename)
+        let dest = Folders.models.appending(path: model.filename)
         var error: String?
         if status == 200 {
             do {

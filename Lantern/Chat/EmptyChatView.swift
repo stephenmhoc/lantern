@@ -21,8 +21,10 @@ struct EmptyChat: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 20)
+        #if os(iOS)
         // The message box covers the bottom of this view: centre in what's left above it.
         .padding(.bottom, 96)
+        #endif
     }
 
     private func content(starters: Bool, header: Bool) -> some View {
@@ -30,12 +32,17 @@ struct EmptyChat: View {
             if header {
                 VStack(spacing: 10) {
                     Image(systemName: conversation.mode == .mac ? "desktopcomputer" : "flame.fill")
-                        .font(.system(size: 30, weight: .medium))
+                        .font(.system(size: Self.badge * 0.47, weight: .medium))
                         .foregroundStyle(.tint)
-                        .frame(width: 64, height: 64)
+                        .frame(width: Self.badge, height: Self.badge)
                         .background(.tint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: .circle)
                         .accessibilityHidden(true)
                     Text("Ask anything").font(.title2.bold())
+                    #if os(macOS)
+                    Text("\(conversation.modelTitle) · on this Mac")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    #endif
                 }
             }
             if starters, let onStarter {
@@ -50,13 +57,15 @@ struct EmptyChat: View {
                             Label("More ideas", systemImage: "arrow.clockwise").font(.subheadline)
                         }
                         .buttonStyle(.borderless)
+                        #if os(iOS)
                         .hoverEffect(.highlight)
+                        #endif
                     }
                     // A Grid, not a LazyVGrid, so both cards in a row are as tall as the taller one.
                     Grid(horizontalSpacing: 10, verticalSpacing: 10) {
-                        ForEach(0..<shown.count / 2, id: \.self) { row in
+                        ForEach(0..<shown.count / Self.columns, id: \.self) { row in
                             GridRow {
-                                ForEach(shown[row * 2..<row * 2 + 2]) { starter in
+                                ForEach(shown[row * Self.columns..<(row + 1) * Self.columns]) { starter in
                                     StarterButton(starter: starter) { onStarter(starter.prompt) }
                                 }
                             }
@@ -68,8 +77,18 @@ struct EmptyChat: View {
                 }
             }
         }
-        .frame(maxWidth: 460)
+        .frame(maxWidth: Self.width)
     }
+
+    #if os(iOS)
+    private static let badge: CGFloat = 64
+    private static let width: CGFloat = 460
+    private static let columns = 2
+    #else
+    private static let badge: CGFloat = 52
+    private static let width: CGFloat = 640
+    private static let columns = 4
+    #endif
 }
 
 /// A way to start a chat: a short title, and the opening words it puts in the message box.
@@ -110,6 +129,7 @@ struct Starter: Identifiable {
 private struct StarterButton: View {
     let starter: Starter
     let action: () -> Void
+    @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
@@ -125,13 +145,31 @@ private struct StarterButton: View {
                     .multilineTextAlignment(.leading)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            .padding(14)
+            .padding(Self.padding)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .background(Color(.secondarySystemBackground), in: .rect(cornerRadius: 16))
-            .contentShape(.rect(cornerRadius: 16))
+            .background(hovering ? Self.hoverFill : Self.cardFill, in: .rect(cornerRadius: Self.radius))
+            .contentShape(.rect(cornerRadius: Self.radius))
         }
         .buttonStyle(.plain)
+        #if os(iOS)
         .hoverEffect(.highlight)
+        #else
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .help(starter.prompt.trimmingCharacters(in: .whitespacesAndNewlines) + "…")
+        #endif
         .accessibilityHint("Starts the message for you to finish")
     }
+
+    #if os(iOS)
+    private static let cardFill = Color(.secondarySystemBackground)
+    private static let hoverFill = cardFill
+    private static let padding: CGFloat = 14
+    private static let radius: CGFloat = 16
+    #else
+    private static let cardFill = Color(nsColor: .quaternarySystemFill)
+    private static let hoverFill = Color(nsColor: .tertiarySystemFill)
+    private static let padding: CGFloat = 12
+    private static let radius: CGFloat = 10
+    #endif
 }

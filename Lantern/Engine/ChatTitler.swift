@@ -106,7 +106,7 @@ final class ChatTitler {
 
     nonisolated static func summarize(_ excerpt: String) async -> String? {
         #if canImport(FoundationModels)
-        guard #available(iOS 26, *) else { return nil }
+        guard #available(iOS 26, macOS 26, *) else { return nil }
         let session = LanguageModelSession(model: .default, instructions: instructions)
         let options = GenerationOptions(temperature: 0.3, maximumResponseTokens: 24)
         guard let response = try? await session.respond(to: excerpt, options: options) else { return nil }

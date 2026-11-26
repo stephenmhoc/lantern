@@ -122,6 +122,22 @@ targets:
     deploymentTarget: "15.0"
     sources:
       - LanternMac
+      # Shared with iOS: the engine, stored chats and links. iOS-only parts are behind `#if os(iOS)`.
+      - path: Lantern/Engine
+        excludes: [FeatureTest.swift]
+      - Lantern/Data
+      - Lantern/System/LanternLink.swift
+      - Lantern/Views/ChatSearch.swift
+      - Lantern/Views/ChatList.swift
+      - Lantern/Chat/Markdown.swift
+      - Lantern/Chat/PlatformText.swift
+      - Lantern/Chat/AttachmentReader.swift
+      - Lantern/Chat/ReplyStatus.swift
+      - Lantern/Chat/Speaker.swift
+      - Lantern/Chat/MarkdownSample.swift
+      - Lantern/Chat/EmptyChatView.swift
+    dependencies:
+      - package: LlamaKit
     info:
       path: LanternMac/Info.plist
       properties:
@@ -129,13 +145,14 @@ targets:
         CFBundleDisplayName: Lantern
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        LSUIElement: true  # the menu bar only, no Dock icon
         LSApplicationCategoryType: public.app-category.productivity
         NSHumanReadableCopyright: ""
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern
         PRODUCT_NAME: Lantern
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
         ENABLE_HARDENED_RUNTIME: YES
         ENABLE_USER_SCRIPT_SANDBOXING: NO  # the bridge's build reads Bridge/ and runs Go
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor

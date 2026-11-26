@@ -94,13 +94,14 @@ struct BridgeMenu: View {
     private func devices(_ status: BridgeController.Status) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Paired Devices").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            if status.devices.isEmpty {
+            let devices = status.devices.filter { $0.name != ThisMac.deviceName }
+            if devices.isEmpty {
                 Text("None yet. Pair your iPhone or iPad to use these models from it.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            ForEach(status.devices) { device in
+            ForEach(devices) { device in
                 HStack {
                     Image(systemName: device.name.localizedCaseInsensitiveContains("ipad") ? "ipad" : "iphone")
                         .foregroundStyle(.secondary)
@@ -135,7 +136,10 @@ struct BridgeMenu: View {
                     Button("Restart") { bridge.restart() }
                 }
                 Spacer()
-                Button("Quit Lantern") { NSApp.terminate(nil) }
+                Button("Quit Lantern") {
+                    // From the run loop: Quit waits on the main actor for the engine to free its model.
+                    NSApp.perform(#selector(NSApplication.terminate(_:)), with: nil, afterDelay: 0)
+                }
             }
         }
     }
