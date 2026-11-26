@@ -19,8 +19,8 @@ struct ChatTemplate {
 
     let format: Format
 
-    /// Gemma 4 12B's template opens a reply with an empty thought channel when thinking is off
-    /// (E2B and E4B's don't). Without it in the prompt the model writes those tokens itself.
+    /// Some Gemma 4 templates (the 12B's; not E2B or E4B) open a reply with an empty thought
+    /// channel when thinking is off. Without it in the prompt the model writes those tokens itself.
     /// Past replies get it too, though the Jinja leaves it out of history: it's what the cache
     /// holds, so a re-render (Retry, reopening a chat) still matches it token for token.
     let emptyThought: Bool

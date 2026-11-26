@@ -98,9 +98,6 @@ public struct ModelOptions: Sendable, Hashable {
     public var batchSize: Int
     /// A draft stops at a token the drafter is less sure of than this (llama.cpp's `p_min`).
     public var draftMinProbability: Float = 0.5
-    /// Whether sliding-window layers keep the whole context (needed to rewind anywhere) or only
-    /// their window plus a batch. Nil: full for a model that can rewind.
-    public var fullWindowCache: Bool?
 
     public init(
         contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false,
@@ -274,11 +271,9 @@ public final class LlamaModel: @unchecked Sendable {
         }
 
         var cp = llama_context_default_params()
-        // Attention-only models can drop the end of their cache. Whether they can go back any
-        // further depends on their sliding-window layers remembering more than the window.
-        let attentionOnly = !llama_model_is_hybrid(model) && !llama_model_is_recurrent(model)
-        let fullWindows = options.fullWindowCache ?? attentionOnly
-        let canRewind = attentionOnly && (fullWindows || llama_model_n_swa(model) == 0)
+        // Attention-only models can rewind anywhere, with their sliding-window layers keeping
+        // the whole context. Hybrids are only appended to, restored or cleared.
+        let canRewind = !llama_model_is_hybrid(model) && !llama_model_is_recurrent(model)
         cp.n_ctx = options.contextLength
         cp.n_batch = UInt32(options.batchSize)
         cp.n_ubatch = UInt32(options.batchSize)
@@ -293,7 +288,7 @@ public final class LlamaModel: @unchecked Sendable {
         }
         // A model that can't rewind has no use for sliding-window layers remembering more than
         // their window: less cache and a slightly faster prefill.
-        cp.swa_full = fullWindows
+        cp.swa_full = canRewind
         let threads = Self.threadCount
         cp.n_threads = threads
         cp.n_threads_batch = threads
@@ -313,7 +308,7 @@ public final class LlamaModel: @unchecked Sendable {
         self.canRewind = canRewind
         self.threads = threads
         self.batchSize = options.batchSize
-        if attentionOnly, let draftPath = options.draftModel {
+        if canRewind, let draftPath = options.draftModel {
             drafter = Drafter(path: draftPath, params: mp, target: model, targetContext: ctx, targetParams: cp,
                               maxTokens: options.draftTokens, minProbability: options.draftMinProbability)
         }

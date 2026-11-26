@@ -7,8 +7,8 @@ finished. When in doubt, delete.
 A chat is answered by one of two models:
 
 - **This device's model** (`Mode.device`): the best Gemma 4 its memory runs, picked by
-  `CatalogModel.device` and never by the user. 12B (6.7 GB) on 12 GB devices, E4B (4.2 GB) on 8 GB,
-  E2B (2.6 GB) on 6 GB. Each comes with its MTP drafter (faster, same output) and vision projector,
+  `CatalogModel.device` and never by the user. E4B (4.2 GB) on 8 GB devices, E2B (2.6 GB) on 6 GB
+  (the 12B was tried and dropped: its files are retired). Each comes with its MTP drafter (faster, same output) and vision projector,
   as one download. The model belongs to the device, not the chat: a chat stores only "this device
   or the Mac", so any device continues any chat with its own model (the chats sync through iCloud:
   `ChatStore`), and every reply records the model that wrote it (`ReplyMetrics.modelTitle`).
@@ -28,8 +28,7 @@ moves old chats over at launch. Apple Intelligence only names chats (`ChatTitler
 ## Layout
 
 - `Packages/LlamaKit`: the llama.cpp wrapper (`LlamaModel` with the drafter, hand-written
-  `ChatTemplate`s) and the `lantern-smoke` Mac CLI. Its Qwen template and non-rewinding paths stay:
-  the 12B's windowed cache uses the same append-only path.
+  `ChatTemplate`s) and the `lantern-smoke` Mac CLI. Its Qwen template and non-rewinding paths stay.
 - `Lantern/Engine`: `Engine` owns the one generation (send, stop, retry, compare, `prepare`, saved
   state, leaving the app); `ModelCatalog` the three Gemmas and their options; `ModelStore` the
   download; `MacLink`/`BridgeAPI`/`MacPairing`/`Tailnet` the Mac; `WebSearcher` Tavily;
@@ -71,14 +70,14 @@ cd Packages/LlamaKit && swift build -c release
 .build/release/lantern-smoke <model.gguf> [load flags] --mmproj <mmproj.gguf> --image <file>
 .build/release/lantern-smoke <model.gguf> [load flags] --search [--think]   # TAVILY_API_KEY
 .build/release/lantern-smoke <model.gguf> --render    # template renders, to compare with the Jinja
-# Load flags, as CatalogModel.options: E2B/E4B `--lazy --f16`, 12B `--f16` (or `--swa-window`).
+# Load flags, as CatalogModel.options: `--lazy --f16`.
 
 # 2. The app, in the booted simulator: ask, answer, retry, reopen, follow up. Prints E2E PASS/FAIL.
 scripts/e2e.sh          # this device's model (E2B files cloned from Models/)
 scripts/e2e.sh --mac    # the Mac, if the simulator is paired
 ```
 
-Debug launch arguments (`DebugLaunch.swift`): `-model e2b|e4b|12b`, `-seedChats`,
+Debug launch arguments (`DebugLaunch.swift`): `-model e2b|e4b`, `-seedChats`,
 `-ui welcome|model|modelpage|settings|mac|personalization|sidebar|search:<text>|chat|picker|compare|comparepicker`,
 `-testflight`, `-e2e [-mac]`, `-pairCode <code> [-pairAt host:port@fingerprint]`. The Mac also takes
 `-role serve|client|none`, `-ui role|pair`, `-light`/`-dark` and `-snapshot <path> [-snapshotDelay s]`
@@ -139,15 +138,12 @@ DEVELOPER_ID_CERT_PASSWORD and SPARKLE_PRIVATE_KEY.
 - **An unpaired Mac is never selected.** `Conversation.answeringMode` is what answers: a chat
   stored as `mac` answers on this device while no Mac is paired, and the picker's Mac row then
   leads to Settings (on a Mac, always `mac`, with a banner until it can answer). Use `answeringMode`, not `mode`, to decide where a reply goes.
-- **Per-model settings live in `CatalogModel`.** E2B/E4B: lazy embeddings, F16 cache. 12B: batch
-  512, no lazy embeddings, and its cache in `Gemma12BCache.chosen` (`.f16`, `.q8` or `.windowed`),
-  to be settled on a real iPhone; saved states are keyed by cache type, so switching is safe.
+- **Per-model settings live in `CatalogModel`.** E2B/E4B: lazy embeddings, F16 cache.
 - **llama.cpp is pinned** in `scripts/fetch-llama.sh`. Before moving the pin or touching
   `LlamaModel.run`/`reuse`, run the smoke test on each Gemma (`--state`, `--think --stop`, with
   `--draft`).
 - **Chat templates are hand-written** (`ChatTemplate.swift`); check with `--render`.
-- **A model that can't rewind is only appended to, restored or cleared** (`canRewind`: hybrids, and
-  the 12B with a windowed cache); history passed back must be byte-identical to what was streamed.
+- **A model that can't rewind is only appended to, restored or cleared** (`canRewind`: hybrids); history passed back must be byte-identical to what was streamed.
 - **Going back means restoring.** Each clean turn end is saved to
   `Caches/kv/<Conversation.stateID>/<model id>`; reopening, Retry, a message after Stop and a new
   chat start from a saved state. All of it is in `LlamaModel`; `Engine` only passes the directory.

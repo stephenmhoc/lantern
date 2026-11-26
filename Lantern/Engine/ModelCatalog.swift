@@ -81,20 +81,14 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
     static let gemmaE4B = gemma(
         "E4B", minGB: 8, weights: 4_215_695_776, drafter: 59_678_016, projector: 990_372_672,
         options: ModelOptions(lazyEmbeddings: true, f16Cache: true))
-    /// No per-layer embeddings, so nothing to read lazily; a smaller batch, since its compute
-    /// buffers are the largest.
-    static let gemma12B = gemma(
-        "12B", minGB: 12, weights: 6_716_356_800, drafter: 253_708_800, projector: 175_115_840,
-        options: Gemma12BCache.chosen.options)
-
     /// Best first.
-    static let all = [gemma12B, gemmaE4B, gemmaE2B]
+    static let all = [gemmaE4B, gemmaE2B]
 
     /// This device's model: the best its memory can run. Devices report a little less than their
     /// marketed RAM, so there's 10% slack. Never a choice the user makes.
     static let device: CatalogModel = {
         #if DEBUG
-        // `-model e2b|e4b|12b`: the simulator reports the Mac's memory and runs on the CPU.
+        // `-model e2b|e4b`: the simulator reports the Mac's memory and runs on the CPU.
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-model"), args.indices.contains(i + 1),
            let asked = all.first(where: { $0.name.lowercased().hasSuffix(args[i + 1].lowercased()) }) {
@@ -112,25 +106,6 @@ nonisolated struct CatalogModel: Identifiable, Hashable, Sendable {
     /// files, once this device's model is here.
     static let retiredFilenames = [
         "Qwen3.5-4B-UD-Q4_K_XL.gguf", "Inkling-2-Mini-UD-Q2_K_XL.gguf", "Inkling-2-Mini-UD-IQ3_XXS.gguf",
+        "gemma-4-12B-it-qat-UD-Q4_K_XL.gguf", "mtp-gemma-4-12B-it.gguf", "gemma-4-12B-it-qat-mmproj-F16.gguf",
     ]
-}
-
-/// The 12B's KV cache, still to be settled by a test on a real iPhone: change `chosen`.
-/// Saved states are keyed by the cache type, so switching just makes chats read again once.
-nonisolated enum Gemma12BCache {
-    /// F16, every layer keeping the whole context: fastest attention, rewinds anywhere, most memory.
-    case f16
-    /// Q8_0: half the memory, slower attention.
-    case q8
-    /// F16, sliding-window layers keeping only their window: less memory, but the cache can only
-    /// be appended to or restored (like a hybrid model), so Retry reads from a saved state.
-    case windowed
-
-    static let chosen = Gemma12BCache.f16
-
-    var options: ModelOptions {
-        var o = ModelOptions(lazyEmbeddings: false, f16Cache: self != .q8, batchSize: 512)
-        if self == .windowed { o.fullWindowCache = false }
-        return o
-    }
 }

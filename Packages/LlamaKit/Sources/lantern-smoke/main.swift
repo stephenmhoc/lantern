@@ -21,12 +21,10 @@ import LlamaKit
 // lantern-smoke <model.gguf> --render
 //     The hand-written template's renders as JSON lines, to compare with the GGUF's Jinja.
 //
-// How the model is loaded, as `CatalogModel.options` does: --lazy (E2B, E4B), --f16, and
-// --swa-window for the 12B's windowed cache (`Gemma12BCache.windowed`), which is only appended to
-// or restored.
+// How the model is loaded, as `CatalogModel.options` does: --lazy and --f16.
 let args = Array(CommandLine.arguments.dropFirst().dropFirst())
 guard CommandLine.arguments.count > 1 else {
-    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--swa-window] [--draft <mtp.gguf>] [--think] [--stop] [prompt]")
+    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--draft <mtp.gguf>] [--think] [--stop] [prompt]")
     print("       lantern-smoke <model.gguf> --state [--retry-first] | --search | --render | --mmproj <mmproj.gguf> --image <file>")
     exit(2)
 }
@@ -80,8 +78,7 @@ let firstPrompt = args.enumerated().first { !$0.element.hasPrefix("--") && ($0.o
 let thinking: Thinking = args.contains("--think") ? .low : .off
 let sampling = Sampling(temperature: 0, topK: 40, topP: 0.95)
 var options = ModelOptions(
-    lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"), draftModel: value(after: "--draft"), batchSize: 512)
-if args.contains("--swa-window") { options.fullWindowCache = false }
+    lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"), draftModel: value(after: "--draft"))
 let system = ChatMessage(role: .system, content: "You are Lantern, a helpful assistant. This conversation began on Sunday, November 22, 2026.")
 
 struct Reply {

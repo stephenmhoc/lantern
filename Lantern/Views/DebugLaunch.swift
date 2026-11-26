@@ -7,7 +7,7 @@ import UIKit
 
 /// Launch arguments for a Debug build in the simulator
 /// (`simctl launch <device> com.merimerimeri.Lantern -seedChats -ui sidebar`):
-/// - `-model e2b|e4b|12b`: this device's model (`CatalogModel.device`); the simulator reports the
+/// - `-model e2b|e4b`: this device's model (`CatalogModel.device`); the simulator reports the
 ///   Mac's memory and runs llama.cpp on the CPU, so E2B is the one to use there.
 /// - `-seedChats`: sample chats, once, the newest holding a comparison and a web search.
 /// - `-ui welcome|model|modelpage|settings|mac|personalization|sidebar|search:<text>|chat|picker|compare|comparepicker`:
