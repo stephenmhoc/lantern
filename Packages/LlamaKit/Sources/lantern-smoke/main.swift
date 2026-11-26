@@ -1,39 +1,38 @@
 import Foundation
 import LlamaKit
 
-// swift run lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [prompt]
-//     [--draft <mtp.gguf> [--draft-max n]] [--batch n] [--temp t | --qwen-sampling] [--second <text>]
-// swift run lantern-smoke <model.gguf> --template | --render
-// swift run lantern-smoke <model.gguf> --bench [--verbose] [--draft <mtp.gguf>] [--batch n]
-// swift run lantern-smoke <model.gguf> --mmproj <mmproj.gguf> --image <file> [--lazy] [--f16] [--draft <mtp.gguf>]
+// The models end to end, through the wrapper the app uses. Greedy, so runs can be compared.
 //
-// --image asks about an image, then a text follow-up, then a retry of the follow-up: the image must
-// be encoded once and its positions reused after that.
+// lantern-smoke <model.gguf> [--think] [--stop] [--draft <mtp.gguf>] [prompt]
+//     Two turns, so the second shows whether the cache was extended. --stop first stops a reply
+//     after 10 pieces and checks the next one still runs in full. --draft drafts with the MTP
+//     model (mtp-gemma-4-*-it.gguf); the output must not change.
+// lantern-smoke <model.gguf> --state [--retry-first] [--think] [--draft <mtp.gguf>]
+//     Saved state: the chat reopened after a reload, retried, continued after a stopped reply,
+//     and a new chat, none of which may read the chat again. --retry-first also retries the first
+//     answer with the cache live and after a reload: the reload must read the chat again (a
+//     restored state holds only the last window of the sliding-window layers) and give the same answer.
+// lantern-smoke <model.gguf> --mmproj <mmproj.gguf> --image <file>
+//     Asks about an image, then a follow-up, then a retry: the image must be encoded once.
+// lantern-smoke <model.gguf> --search [--think]
+//     Declares web search and answers the model's calls with Tavily (TAVILY_API_KEY), as the app
+//     does: a question that needs a search, a follow-up that must append to the cache with the
+//     searches in its history, one needing none, and a reload from the saved state.
+// lantern-smoke <model.gguf> --render
+//     The hand-written template's renders as JSON lines, to compare with the GGUF's Jinja.
 //
-// Two turns, so the second shows whether the cache was extended. --stop also stops a reply after
-// 10 pieces first and checks the next generation still runs in full. --state checks saved state:
-// the second turn is repeated after reloading the model from the first turn's checkpoint and must
-// match byte for byte, then after a stopped reply and as a retry, which must not re-read the chat.
-// --draft drafts with an MTP model (Gemma 4's mtp-gemma-4-*-it.gguf); greedy output must not change.
-// --render prints the hand-written template's renders as JSON lines, to compare with the Jinja.
-// --search declares web search and answers the model's calls with Tavily (TAVILY_API_KEY), as
-// the app does on device: a question that needs a search, a follow-up that must append to the
-// cache with the searches in its history, a reload from the saved state, and one needing none.
-// --bench reads a ~3,100-token prompt and a short one, 256 tokens each: first token is the honest
-// prompt time (the prompt's own figure stops before the GPU has finished).
+// How the model is loaded, as `CatalogModel.options` does: --lazy (E2B, E4B), --f16, and
+// --swa-window for the 12B's windowed cache (`Gemma12BCache.windowed`), which is only appended to
+// or restored.
 let args = Array(CommandLine.arguments.dropFirst().dropFirst())
 guard CommandLine.arguments.count > 1 else {
-    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--think] [--stop] [--state] [--draft <mtp.gguf>] [prompt]")
-    print("       lantern-smoke <model.gguf> --template | --render | --bench")
+    print("usage: lantern-smoke <model.gguf> [--lazy] [--f16] [--swa-window] [--draft <mtp.gguf>] [--think] [--stop] [prompt]")
+    print("       lantern-smoke <model.gguf> --state [--retry-first] | --search | --render | --mmproj <mmproj.gguf> --image <file>")
     exit(2)
 }
 let path = CommandLine.arguments[1]
 func value(after flag: String) -> String? {
     args.firstIndex(of: flag).flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
-}
-if args.contains("--template") {
-    print(LlamaModel.rawTemplate(path: path) ?? "(no template)")
-    exit(0)
 }
 if args.contains("--render") {
     // Renders a few conversations with the hand-written template, as JSON lines, for comparing
@@ -77,14 +76,12 @@ if args.contains("--render") {
     }
     exit(0)
 }
-let firstPrompt = args.enumerated().first { !$0.element.hasPrefix("--") && ($0.offset == 0 || !["--second", "--mmproj", "--image", "--draft", "--draft-max", "--batch", "--temp"].contains(args[$0.offset - 1])) }?.element ?? "In two sentences: how do I purify water if the power is out?"
+let firstPrompt = args.enumerated().first { !$0.element.hasPrefix("--") && ($0.offset == 0 || !["--mmproj", "--image", "--draft"].contains(args[$0.offset - 1])) }?.element ?? "In two sentences: how do I purify water if the power is out?"
 let thinking: Thinking = args.contains("--think") ? .low : .off
-// Greedy unless --temp is given (--qwen-sampling: Qwen 3.5's recommended settings).
-let sampling = args.contains("--qwen-sampling") ? Sampling.qwen35(thinking: thinking != .off)
-    : Sampling(temperature: value(after: "--temp").flatMap(Float.init) ?? 0, topK: 40, topP: 0.95)
-let options = ModelOptions(
-    lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"), draftModel: value(after: "--draft"),
-    draftTokens: value(after: "--draft-max").flatMap(Int.init) ?? 3, batchSize: value(after: "--batch").flatMap(Int.init) ?? 512)
+let sampling = Sampling(temperature: 0, topK: 40, topP: 0.95)
+var options = ModelOptions(
+    lazyEmbeddings: args.contains("--lazy"), f16Cache: args.contains("--f16"), draftModel: value(after: "--draft"), batchSize: 512)
+if args.contains("--swa-window") { options.fullWindowCache = false }
 let system = ChatMessage(role: .system, content: "You are Lantern, a helpful assistant. This conversation began on Sunday, November 22, 2026.")
 
 struct Reply {
@@ -153,10 +150,7 @@ struct Reply {
 }
 
 
-// With greedy decoding and thinking on, Qwen 3.5 can deliberate over the emoji (and other wordings)
-// until it runs out of tokens, and a reply that doesn't end cleanly leaves nothing to check.
-let second = value(after: "--second")
-    ?? (thinking == .off ? "Now say it in one short sentence. Use an emoji." : "Thanks. Which one is quickest?")
+let second = thinking == .off ? "Now say it in one short sentence. Use an emoji." : "Thanks. Which one is quickest?"
 
 if let projector = value(after: "--mmproj"), let imagePath = value(after: "--image") {
     let image = try Data(contentsOf: URL(fileURLWithPath: imagePath))
@@ -180,28 +174,6 @@ if let projector = value(after: "--mmproj"), let imagePath = value(after: "--ima
         print("> (no vision) counting")
         let counted = await model.countTokens(history)
         check("counting includes the image", counted >= first.stats.promptTokens - 20)
-    }
-    exit(0)
-}
-if args.contains("--bench") {
-    // Speed only: a long prompt (about 3,000 tokens) read from nothing, then a 256-token answer, and
-    // a short prompt with a 256-token answer. Greedy; the texts are printed in full with --verbose.
-    let filler = (1...90).map { i in
-        "Note \(i): the shelter on Elm Street keeps \(i * 3) blankets, \(i + 4) lanterns and water for \(i * 2) days; check it weekly."
-    }.joined(separator: "\n")
-    let long = [system, ChatMessage(role: .user, content: filler + "\n\nSummarise these notes in detail, as a numbered list.")]
-    let short = [system, ChatMessage(role: .user, content: "Write a detailed guide to planting a vegetable garden.")]
-    do {
-        let model = try load()
-        let quiet = !args.contains("--verbose")
-        for (name, history) in [("warmup", short), ("long", long), ("short", short)] {
-            print("> \(name)")
-            let r = try await ask(model, history, quiet: quiet, maxTokens: 256)
-            print(String(format: "BENCH %@ prompt %.0f tok/s, gen %.1f tok/s, first token %.2fs",
-                         name, Double(r.stats.promptTokens - r.stats.reusedTokens) / max(r.stats.promptSeconds, 1e-6),
-                         r.stats.tokensPerSecond, r.firstToken))
-            if !quiet { print(r.text) }
-        }
     }
     exit(0)
 }
@@ -278,6 +250,11 @@ if args.contains("--state") {
         if !(model.canRewind && thinking != .off) {  // Gemma re-renders with thinking on
             check("second turn appended", expected.stats.reusedTokens > firstReply.stats.promptTokens)
         }
+        if args.contains("--retry-first") {
+            print("> (retry of the first answer, cache live)")
+            let live = try await ask(model, history.dropLast(), quiet: true)
+            check("a retry of the first answer, cache live, gives the same answer", live.text == firstReply.text)
+        }
     }
     do {
         // A fresh load, as after the app was closed: the chat is reopened from the second turn's
@@ -297,6 +274,13 @@ if args.contains("--state") {
             let left = ((try? FileManager.default.contentsOfDirectory(atPath: legacy.path)) ?? []).filter { $0 != "model" }
             check("the legacy state was adopted, nothing left behind", left.isEmpty
                   && FileManager.default.fileExists(atPath: checkpoint.appending(path: "latest.json").path))
+            if args.contains("--retry-first") {
+                // Retry of the first (long) answer after a reload: the cache is cut back by a whole reply.
+                print("> (retry of the first answer, after restoring)")
+                let again = try await ask(model, history.dropLast(), quiet: true)
+                check("a retry of the first answer, after restoring, gives the same answer", again.text == firstReply.text)
+                exit(0)
+            }
             print("> (retry) \(second)")
             let retried = try await ask(model, history + [.init(role: .user, content: second)], checkpoint: checkpoint, quiet: true)
             check("retry didn't re-read the chat", retried.stats.reusedTokens > firstReply.stats.promptTokens)

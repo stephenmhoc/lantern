@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(llama)
 import llama
+#endif
 
 /// Whether a reasoning model thinks before answering. Gemma 4 and Qwen 3.5 only have thinking on or
 /// off, so `low` and `high` both mean on; the cases stay because chats store them.
@@ -17,9 +19,17 @@ struct ChatTemplate {
 
     let format: Format
 
+    /// Gemma 4 12B's template opens a reply with an empty thought channel when thinking is off
+    /// (E2B and E4B's don't). Without it in the prompt the model writes those tokens itself.
+    /// Past replies get it too, though the Jinja leaves it out of history: it's what the cache
+    /// holds, so a re-render (Retry, reopening a chat) still matches it token for token.
+    let emptyThought: Bool
+
+    #if canImport(llama)
     /// Nil for any model whose template isn't one of these.
     init?(model: OpaquePointer) {
         guard let raw = llama_model_chat_template(model, nil).map({ String(cString: $0) }) else { return nil }
+        emptyThought = raw.contains("'<|channel>thought\\n<channel|>'")
         if raw.contains("<|turn>") {
             format = .gemma4
         } else if raw.contains("<|im_start|>"), raw.contains("<think>") {
@@ -28,6 +38,7 @@ struct ChatTemplate {
             return nil
         }
     }
+    #endif
 
     /// The end-of-generation token that closes a model turn the way the template does. A reply that
     /// ends on any other (e.g. Gemma's `<eos>`) can't be continued token-for-token.
@@ -52,9 +63,11 @@ struct ChatTemplate {
     /// whole chat again, so its cache keeps each reply as it was streamed (thinking included) and
     /// only turns are appended. A full render happens only without a cache or saved state, or when
     /// the kept thinking has filled the context.
-    func canContinue(from old: Thinking, to new: Thinking) -> Bool {
+    func canContinue(from old: Thinking, to new: Thinking, keepingThinking: Bool = false) -> Bool {
         switch format {
-        case .gemma4: !old.isOn && !new.isOn
+        // Kept thinking (a cache that can't be cut back): the switch is in the system turn, so
+        // only the same setting continues.
+        case .gemma4: keepingThinking ? old.isOn == new.isOn : !old.isOn && !new.isOn
         case .qwen35: true  // thinking only changes the generation prompt, which comes after
         }
     }
@@ -65,7 +78,7 @@ struct ChatTemplate {
     func renderContinuation(_ turns: [ChatMessage], thinking: Thinking) -> String {
         switch format {
         case .gemma4:
-            turnEnd + "\n" + turns.map(gemmaTurn).joined() + "<|turn>model\n"
+            turnEnd + "\n" + turns.map { gemmaTurn($0, thinking: thinking) }.joined() + gemmaModelStart(thinking)
         case .qwen35:
             turnEnd + "\n" + turns.map(qwenTurn).joined() + qwenGenerationPrompt(thinking)
         }
@@ -90,11 +103,17 @@ struct ChatTemplate {
         (m.images ?? []).map { _ in Self.mediaMarker + "\n" }.joined() + m.content
     }
 
-    private func gemmaTurn(_ m: ChatMessage) -> String {
+    private func gemmaTurn(_ m: ChatMessage, thinking: Thinking) -> String {
         if m.role == .system { return gemmaSystem(m, thinking: .off) }
+        guard m.role == .assistant else { return "<|turn>\(m.role.rawValue)\n\(trim(content(m)))<turn|>\n" }
         // A reply that searched: each call and its result, then the answer, all in one model turn.
-        let searches = m.role == .assistant ? (m.searches ?? []).map { gemmaCall($0) + gemmaResponse($0) }.joined() : ""
-        return "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(searches)\(trim(content(m)))<turn|>\n"
+        let searches = (m.searches ?? []).map { gemmaCall($0) + gemmaResponse($0) }.joined()
+        return gemmaModelStart(thinking) + searches + trim(content(m)) + "<turn|>\n"
+    }
+
+    /// The start of a model turn: the generation prompt, and how each past reply begins.
+    private func gemmaModelStart(_ thinking: Thinking) -> String {
+        "<|turn>model\n" + (emptyThought && !thinking.isOn ? "<|channel>thought\n<channel|>" : "")
     }
 
     /// The system turn: thinking switch, the prompt, then any tool declarations.
@@ -113,7 +132,7 @@ struct ChatTemplate {
         } else if thinking.isOn {
             out += "<|turn>system\n<|think|>\n<turn|>\n"
         }
-        return out + rest.map(gemmaTurn).joined() + "<|turn>model\n"
+        return out + rest.map { gemmaTurn($0, thinking: thinking) }.joined() + gemmaModelStart(thinking)
     }
 
     /// Gemma's own quote token: strings in declarations, calls and results are wrapped in it.
@@ -315,6 +334,7 @@ struct OutputParser {
     }
 }
 
+#if canImport(llama)
 extension LlamaModel {
     /// The raw Jinja template from the GGUF, for checking the hand-written formats against.
     public static func rawTemplate(path: String) -> String? {
@@ -338,3 +358,4 @@ extension LlamaModel {
         return (template.render(messages, thinking: thinking), template.renderSystemPrefix(messages, thinking: thinking))
     }
 }
+#endif

@@ -1,0 +1,345 @@
+name: Release the Mac App
+
+# Lantern for Mac (the Catalyst build of the same target) outside the App Store: archived with the
+# Developer ID, signed inside out, notarized and stapled, as a DMG to download and a zip Sparkle
+# updates from. Both go on the GitHub release v<version> beside the iOS build's IPA (release.yml
+# runs on the same tags); the appcast goes on the fixed `appcast` release, where the app's
+# SUFeedURL points (project.yml). GitHub Actions only builds and publishes: this isn't CI.
+#
+# Secrets: DEVELOPER_ID_CERT_BASE64 and DEVELOPER_ID_CERT_PASSWORD (the Developer ID Application
+# certificate and its key, as a .p12), SPARKLE_PRIVATE_KEY (the EdDSA key whose public half is
+# LANTERN_UPDATE_KEY), and the App Store Connect API key the iOS release uses (ASC_KEY_ID,
+# ASC_ISSUER_ID, ASC_API_KEY_P8_BASE64) for the Developer ID profile (iCloud needs one) and
+# notarization. Variable: RELEASES_REPO (owner/name), else this repository.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (for example, 2.0.1)'
+        required: true
+      release_notes:
+        description: 'What changed, for the update window (HTML or plain text)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # One at a time, because each run numbers its build from the published appcast.
+  group: release-mac
+  cancel-in-progress: false
+
+env:
+  CONFIGURATION: Release
+  ARCHIVE_PATH: build/LanternMac.xcarchive
+  EXPORT_PATH: build/mac-export
+  STAGING: build/dmg
+  KEYCHAIN_NAME: build.keychain-db
+  KEYCHAIN_PASSWORD: temporary-ci-password
+  APPLE_TEAM_ID: 8G4H6268W7
+  BUNDLE_ID: com.merimerimeri.Lantern
+  SPM_CACHE: build/SourcePackages
+  RELEASES_REPO: ${{ vars.RELEASES_REPO || github.repository }}
+
+jobs:
+  release:
+    name: Archive, Sign, Notarize, and Publish
+    runs-on: xcode-27
+    timeout-minutes: 90
+
+    steps:
+      - name: Check Secrets
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          missing=0
+          for name in DEVELOPER_ID_CERT_BASE64 DEVELOPER_ID_CERT_PASSWORD SPARKLE_PRIVATE_KEY \
+                      ASC_KEY_ID ASC_ISSUER_ID ASC_API_KEY_P8_BASE64; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The repository secret $name isn't set. The Mac release needs it (see the top of release-mac.yml)."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The same Xcode as local builds and the iOS release.
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_27.2.app
+          xcodebuild -version
+
+      - name: Set Up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      # Vendor/ and the Xcode project aren't committed. The Mac leaves out llama.cpp and
+      # TailscaleKit, but the project refers to both.
+      - name: Fetch Frameworks and Generate Project
+        run: |
+          brew install xcodegen
+          scripts/fetch-llama.sh
+          scripts/fetch-tailscale.sh
+          xcodegen generate
+
+      - name: Compute Version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_INPUT: ${{ github.event.inputs.version }}
+        run: |
+          VERSION="${VERSION_INPUT:-${GITHUB_REF_NAME#v}}"
+          VERSION="${VERSION#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Version $VERSION isn't like 2.0.1."; exit 1; }
+
+          # Sparkle compares the build number, so it has to beat what's published.
+          PUBLISHED=$(gh release download appcast -R "$RELEASES_REPO" -p appcast.xml -O - 2>/dev/null \
+            | sed -n 's:.*<sparkle\:version>\([0-9]*\)</sparkle\:version>.*:\1:p' | head -1)
+          PUBLISHED=${PUBLISHED:-0}
+          BUILD_NUMBER=$(( ${{ github.run_number }} > PUBLISHED ? ${{ github.run_number }} : PUBLISHED + 1 ))
+
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+          echo "Building Lantern for Mac $VERSION ($BUILD_NUMBER); the published build is $PUBLISHED"
+
+      - name: Install App Store Connect API Key
+        env:
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          mkdir -p ~/.private_keys
+          echo "$ASC_API_KEY_P8_BASE64" | base64 --decode -o ~/.private_keys/AuthKey_${ASC_KEY_ID}.p8
+          echo "ASC_API_KEY_PATH=$HOME/.private_keys/AuthKey_${ASC_KEY_ID}.p8" >> "$GITHUB_ENV"
+
+      - name: Install Developer ID Certificate
+        env:
+          DEVELOPER_ID_CERT_BASE64: ${{ secrets.DEVELOPER_ID_CERT_BASE64 }}
+          DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          echo "$DEVELOPER_ID_CERT_BASE64" | base64 --decode -o "$CERTIFICATE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security import "$CERTIFICATE_PATH" -P "$DEVELOPER_ID_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_NAME"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_NAME"
+          rm -f "$CERTIFICATE_PATH"
+
+          if ! security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep -q "Developer ID Application"; then
+            echo "::error::DEVELOPER_ID_CERT_BASE64 holds no Developer ID Application identity (certificate and private key)."
+            exit 1
+          fi
+          SERIAL=$(security find-certificate -c "Developer ID Application" -p "$KEYCHAIN_NAME" \
+            | openssl x509 -noout -serial | cut -d= -f2)
+          echo "DEVELOPER_ID_CERT_SERIAL=$SERIAL" >> "$GITHUB_ENV"
+
+      # iCloud (the chats' sync) needs a provisioning profile, even outside the App Store.
+      - name: Prepare Developer ID Profile
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          ruby Tools/app_store_connect_signing.rb prepare-mac
+          PROFILE_UUID=$(security cms -D -i "$MAC_PROFILE_PATH" | plutil -extract UUID raw -o - -)
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$MAC_PROFILE_PATH" "$dir/$PROFILE_UUID.provisionprofile"
+          done
+          echo "MAC_PROFILE_UUID=$PROFILE_UUID" >> "$GITHUB_ENV"
+          echo "Profile: $MAC_PROFILE_NAME ($PROFILE_UUID)"
+
+      - name: Resolve Swift Packages
+        run: |
+          xcodebuild -resolvePackageDependencies -project Lantern.xcodeproj -scheme Lantern \
+            -clonedSourcePackagesDirPath "$SPM_CACHE"
+
+      # The app reads its profile's name from LANTERN_MAC_PROFILE (project.yml); MacSupport.bundle
+      # needs none.
+      - name: Archive
+        run: |
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_PATH"
+          xcodebuild archive \
+            -project Lantern.xcodeproj \
+            -scheme Lantern \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=macOS,variant=Mac Catalyst' \
+            -archivePath "$ARCHIVE_PATH" \
+            -clonedSourcePackagesDirPath "$SPM_CACHE" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            LANTERN_MAC_PROFILE="$MAC_PROFILE_NAME" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      - name: Export
+        run: |
+          OPTIONS="$RUNNER_TEMP/ExportOptions.plist"
+          plutil -create xml1 "$OPTIONS"
+          plutil -insert method -string developer-id "$OPTIONS"
+          plutil -insert teamID -string "$APPLE_TEAM_ID" "$OPTIONS"
+          plutil -insert signingStyle -string manual "$OPTIONS"
+          plutil -insert signingCertificate -string "Developer ID Application" "$OPTIONS"
+          plutil -insert provisioningProfiles -dictionary "$OPTIONS"
+          plutil -insert "provisioningProfiles.$BUNDLE_ID" -string "$MAC_PROFILE_NAME" "$OPTIONS"
+          xcodebuild -exportArchive -archivePath "$ARCHIVE_PATH" -exportOptionsPlist "$OPTIONS" -exportPath "$EXPORT_PATH"
+
+          APP="$EXPORT_PATH/Lantern.app"
+          INFO="$APP/Contents/Info.plist"
+          [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO")" = "$BUNDLE_ID" ] \
+            || { echo "::error::Refusing to release a build that isn't $BUNDLE_ID (a Debug build?)"; exit 1; }
+          [ -n "$(/usr/libexec/PlistBuddy -c 'Print :SUFeedURL' "$INFO" 2>/dev/null)" ] \
+            || { echo "::error::Refusing to release a build with no update feed"; exit 1; }
+          [ -x "$APP/Contents/MacOS/lantern-bridge" ] || { echo "::error::The app is missing lantern-bridge"; exit 1; }
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "MIN_MACOS=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$INFO")" >> "$GITHUB_ENV"
+
+      - name: Sign Inside Out
+        run: scripts/mac-sign.sh "$APP" "Developer ID Application"
+
+      - name: Notarize and Staple the App
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/Lantern-notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/Lantern-notarize.zip" \
+            --key "$ASC_API_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait --timeout 45m \
+            | tee "$RUNNER_TEMP/notary-app.log"
+          grep -q "status: Accepted" "$RUNNER_TEMP/notary-app.log" || {
+            ID=$(sed -n 's/^ *id: //p' "$RUNNER_TEMP/notary-app.log" | head -1)
+            [ -n "$ID" ] && xcrun notarytool log "$ID" --key "$ASC_API_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID"
+            exit 1
+          }
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+          spctl --assess --type execute --verbose=2 "$APP"
+
+      - name: Make, Notarize and Staple the DMG
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          rm -rf "$STAGING"
+          mkdir -p "$STAGING"
+          ditto "$APP" "$STAGING/Lantern.app"
+          ln -s /Applications "$STAGING/Applications"
+          DMG="build/Lantern-$VERSION.dmg"
+          hdiutil create -volname "Lantern" -srcfolder "$STAGING" -ov -format UDZO "$DMG"
+          codesign --force --sign "Developer ID Application" --timestamp "$DMG"
+          xcrun notarytool submit "$DMG" \
+            --key "$ASC_API_KEY_PATH" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" --wait --timeout 45m \
+            | tee "$RUNNER_TEMP/notary-dmg.log"
+          grep -q "status: Accepted" "$RUNNER_TEMP/notary-dmg.log"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Make and Sign the Update
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          ZIP="build/Lantern-$VERSION.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          KEY_FILE="$RUNNER_TEMP/sparkle_private_key"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+          SIGN_UPDATE=$(find "$SPM_CACHE/artifacts" -path '*/Sparkle/bin/sign_update' -type f -print -quit)
+          [ -x "$SIGN_UPDATE" ] || { echo "::error::Sparkle's sign_update isn't in the package cache"; exit 1; }
+          SIGN_OUTPUT=$("$SIGN_UPDATE" "$ZIP" --ed-key-file "$KEY_FILE")
+          rm -f "$KEY_FILE"
+          SIGNATURE=$(sed -n 's/.*sparkle:edSignature="\([^"]*\)".*/\1/p' <<< "$SIGN_OUTPUT")
+          [ -n "$SIGNATURE" ] || { echo "::error::sign_update made no signature"; exit 1; }
+          echo "ZIP=$ZIP" >> "$GITHUB_ENV"
+          echo "SIGNATURE=$SIGNATURE" >> "$GITHUB_ENV"
+          echo "ZIP_SIZE=$(stat -f%z "$ZIP")" >> "$GITHUB_ENV"
+
+      - name: Write the Appcast
+        env:
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+        run: |
+          NOTES="${RELEASE_NOTES:-<p>Lantern $VERSION.</p>}"
+          cat > build/appcast.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>Lantern Updates</title>
+              <link>https://github.com/$RELEASES_REPO/releases</link>
+              <description>Lantern for Mac</description>
+              <language>en</language>
+              <item>
+                <title>Lantern $VERSION</title>
+                <sparkle:version>$BUILD_NUMBER</sparkle:version>
+                <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+                <description><![CDATA[$NOTES]]></description>
+                <pubDate>$(date -u +"%a, %d %b %Y %H:%M:%S +0000")</pubDate>
+                <enclosure url="https://github.com/$RELEASES_REPO/releases/download/$TAG/Lantern-$VERSION.zip" sparkle:edSignature="$SIGNATURE" length="$ZIP_SIZE" type="application/octet-stream" />
+                <sparkle:minimumSystemVersion>$MIN_MACOS</sparkle:minimumSystemVersion>
+              </item>
+            </channel>
+          </rss>
+          EOF
+          xmllint --noout build/appcast.xml
+
+      # The release may already exist: the iOS release (release.yml) runs on the same tag.
+      - name: Publish the DMG and Zip
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$TAG" -R "$RELEASES_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" -R "$RELEASES_REPO" --target "$GITHUB_SHA" \
+              --title "Lantern $VERSION" --notes "Lantern $VERSION." \
+              || gh release view "$TAG" -R "$RELEASES_REPO" >/dev/null  # created meanwhile by the iOS release
+          fi
+          gh release upload "$TAG" "$DMG" "$ZIP" -R "$RELEASES_REPO" --clobber
+
+      # A fixed URL no other release can take over: a prerelease, so it's never "Latest" (which the
+      # TestFlight refresh reads).
+      - name: Publish the Appcast
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view appcast -R "$RELEASES_REPO" >/dev/null 2>&1; then
+            gh release create appcast -R "$RELEASES_REPO" --target "$GITHUB_SHA" \
+              --title "Sparkle Appcast (not a release)" \
+              --notes "Where Lantern for Mac looks for updates. The downloads are on the v… releases." \
+              --prerelease --latest=false
+          fi
+          gh release upload appcast build/appcast.xml -R "$RELEASES_REPO" --clobber
+
+      - name: Upload Archive Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LanternMac-${{ env.BUILD_NUMBER }}.xcarchive
+          path: ${{ env.ARCHIVE_PATH }}
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
+          rm -rf ~/.private_keys
+          rm -f "$RUNNER_TEMP/sparkle_private_key" "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/mac.provisionprofile"
+          if [ -n "${MAC_PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$MAC_PROFILE_UUID.provisionprofile"
+            rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$MAC_PROFILE_UUID.provisionprofile"
+          fi

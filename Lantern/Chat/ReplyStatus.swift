@@ -54,9 +54,8 @@ struct PhaseClock {
         case .waiting:
             what = live.mode == .mac ? "Asking the Mac" : "Reading your question"
             intensity = 0.3
-            // Ollama loads the model on the first question after it was unloaded, with no word
-            // back until then: the usual reason for a long wait.
-            if slow, live.mode == .mac { hint = "The Mac may be loading the model" }
+            // Splash keeps Inkling loaded: a long wait is a long chat being read.
+            if slow, live.mode == .mac { hint = "The Mac is reading the chat" }
         case .reading(let p):
             what = "Reading the chat"
             progress = p
@@ -95,17 +94,13 @@ struct PhaseClock {
     }
 }
 
-/// Settings' "Speed and tokens" switch for the line under each answer. Off, the line keeps only
-/// what the answer can't do without: that it was stopped or cut off, or that earlier messages were
-/// left out. The model's name and the speed, timings and route go.
-enum ReplyDetails {
-    static let key = "chat.showMetrics"
-
-    static var shown: Bool { UserDefaults.standard.object(forKey: key) as? Bool ?? true }
-
-    static func essentials(of footnote: String) -> String {
+/// The line under an answer: the model that wrote it, and that it was stopped, cut off or had
+/// earlier messages left out. Footnotes stored by earlier versions also carry speeds, timings
+/// and the route, which are left out when shown.
+enum ReplyFootnote {
+    static func shown(_ footnote: String) -> String {
         footnote.components(separatedBy: " · ")
-            .filter { $0.hasPrefix("Stopped") || $0.hasPrefix("Cut off") || $0.hasPrefix("Earlier messages") }
+            .filter { !$0.contains("tok/s") && !$0.contains("first token") && !$0.hasPrefix("via ") && !$0.hasSuffix(" s") }
             .joined(separator: " · ")
     }
 }

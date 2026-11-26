@@ -1,10 +1,10 @@
 import UIKit
 import UniformTypeIdentifiers
 
-/// The bar under the chat: status strip, attached files, a full-width text view that grows to six
-/// lines, and under it the controls: mode menu and attach menu on the left, dictation and Send/Stop
-/// on the right. While the keyboard is down and there's nothing to send or edit it collapses to one
-/// row: the model's symbol, the field, dictation, and Stop while this chat is answering.
+/// The bar under the chat: attached files, a full-width text view that grows to six lines, and
+/// under it the controls: the model button and attach menu on the left, Send/Stop on the right.
+/// While the keyboard is down and there's nothing to send or edit it collapses to one row: the
+/// model's symbol, the field, and Stop while this chat is answering.
 /// On iOS 26 and later it's a floating Liquid Glass panel at the readable width; before that, a
 /// full-width blurred bar.
 final class ComposerView: UIView, UITextViewDelegate {
@@ -15,8 +15,6 @@ final class ComposerView: UIView, UITextViewDelegate {
     let sendButton = HitButton(configuration: .plain())
     /// Files and photos; its menu is set by the chat, which knows what the mode can read.
     let attachButton = HitButton(configuration: .plain())
-    /// Hidden until the chat knows on-device dictation works for the language.
-    let micButton = HitButton(configuration: .plain())
     private let placeholder = UILabel()
     private let editBanner = UIStackView()
     private let chipScroll = UIScrollView()
@@ -53,7 +51,6 @@ final class ComposerView: UIView, UITextViewDelegate {
     /// Every edit, for drafts and pre-warming.
     var onTextChange: ((String) -> Void)?
     var onCancelEdit: (() -> Void)?
-    var onMic: (() -> Void)?
     /// After a chip's remove button.
     var onAttachmentsChange: (() -> Void)?
     var isRunning = false { didSet { updateButton(); updateCollapsed() } }
@@ -66,7 +63,6 @@ final class ComposerView: UIView, UITextViewDelegate {
             announceAdded(since: oldValue)
         }
     }
-    var isListening = false { didSet { updateMic() } }
     var canSend = true { didSet { updateButton() } }
     /// Shows "Editing message" above the field while a sent message is being edited.
     var isEditingMessage = false {
@@ -89,7 +85,7 @@ final class ComposerView: UIView, UITextViewDelegate {
         set { placeholder.text = newValue }
     }
 
-    init(statusView: UIView) {
+    init() {
         if #available(iOS 26, *) { usesGlass = true } else { usesGlass = false }
         super.init(frame: .zero)
 
@@ -162,19 +158,6 @@ final class ComposerView: UIView, UITextViewDelegate {
         attachButton.setContentHuggingPriority(.required, for: .horizontal)
         attachButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        micButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 2, bottom: 8, trailing: 2)
-        micButton.configuration?.preferredSymbolConfigurationForImage = .init(textStyle: .body)
-        micButton.isPointerInteractionEnabled = true
-        micButton.isHidden = true
-        micButton.setContentHuggingPriority(.required, for: .horizontal)
-        micButton.setContentCompressionResistancePriority(.required, for: .horizontal)
-        micButton.addAction(UIAction { [weak self] _ in
-            guard let self else { return }
-            // Before the microphone starts: haptics are muted while recording.
-            tap.impactOccurred(intensity: 0.6)
-            onMic?()
-        }, for: .primaryActionTriggered)
-        updateMic()
 
         chipStack.spacing = 6
         chipStack.translatesAutoresizingMaskIntoConstraints = false
@@ -198,28 +181,26 @@ final class ComposerView: UIView, UITextViewDelegate {
         modeIconButton.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         // Expanded, the field gets the whole width and the controls sit in a row beneath it;
-        // collapsed, the field shares one row with the model's symbol, dictation and Stop.
+        // collapsed, the field shares one row with the model's symbol and Stop.
         fieldRow = UIStackView(arrangedSubviews: [modeIconButton, textView])
         fieldRow.spacing = 8
         fieldRow.alignment = .center
         let spacer = UIView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        controls = UIStackView(arrangedSubviews: [modeButton, attachButton, spacer, micButton, sendButton])
+        controls = UIStackView(arrangedSubviews: [modeButton, attachButton, spacer, sendButton])
         controls.spacing = 8
         controls.alignment = .center
-        controls.setCustomSpacing(2, after: micButton)
         // At accessibility text sizes the mode button is a bare symbol and the others are small
         // for their text: touch and hold shows each one large, with its name.
         controls.addInteraction(UILargeContentViewerInteraction())
         fieldRow.addInteraction(UILargeContentViewerInteraction())
-        for button in [modeButton, modeIconButton, attachButton, micButton, sendButton] {
+        for button in [modeButton, modeIconButton, attachButton, sendButton] {
             button.showsLargeContentViewer = true
             button.scalesLargeContentImage = true
         }
         attachButton.largeContentTitle = "Attach"
-        let stack = UIStackView(arrangedSubviews: [statusView, editBanner, chipScroll, fieldRow, controls])
+        let stack = UIStackView(arrangedSubviews: [editBanner, chipScroll, fieldRow, controls])
         stack.setCustomSpacing(2, after: fieldRow)
-        stack.setCustomSpacing(0, after: statusView)
         stack.axis = .vertical
         stack.spacing = 6
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -377,11 +358,8 @@ final class ComposerView: UIView, UITextViewDelegate {
         let apply = { [self] in
             modeIconButton.isHidden = !collapse
             controls.isHidden = collapse
-            // Dictation and Send/Stop move to whichever row is showing.
-            let row: UIStackView = collapse ? fieldRow : controls
-            row.addArrangedSubview(micButton)
-            row.addArrangedSubview(sendButton)
-            row.setCustomSpacing(2, after: micButton)
+            // Send/Stop moves to whichever row is showing.
+            (collapse ? fieldRow : controls)!.addArrangedSubview(sendButton)
             sendButton.isHidden = sendHidden
             stackTop.constant = collapse ? 3 : insets.top
             stackBottom.constant = -(collapse ? 3 : insets.bottom)
@@ -426,21 +404,6 @@ final class ComposerView: UIView, UITextViewDelegate {
         sendButton.largeContentTitle = sendButton.accessibilityLabel
         sendButton.largeContentImage = UIImage(systemName: name)
         sendButton.isEnabled = isRunning || (canSend && (hasText || !attachments.isEmpty))
-    }
-
-    private func updateMic() {
-        micButton.configuration?.image = UIImage(systemName: isListening ? "mic.fill" : "mic")
-        micButton.configuration?.baseForegroundColor = isListening ? .systemRed : nil
-        micButton.accessibilityLabel = isListening ? "Stop dictation" : "Dictate"
-        micButton.accessibilityUserInputLabels = isListening ? ["Stop dictation", "Stop listening"] : ["Dictate", "Microphone"]
-        micButton.accessibilityValue = isListening ? "Listening" : nil
-        micButton.largeContentTitle = micButton.accessibilityLabel
-        micButton.largeContentImage = micButton.configuration?.image
-        if isListening {
-            micButton.imageView?.addSymbolEffect(.pulse, options: .repeating)
-        } else {
-            micButton.imageView?.removeAllSymbolEffects()
-        }
     }
 
     private func renderChips() {

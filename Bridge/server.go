@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -8,46 +9,37 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"slices"
 	"strings"
 	"time"
 )
 
-// The bridge's HTTPS API, for paired devices:
+// The bridge's HTTPS API, for paired devices (README has the details):
 //
-//	POST /lantern/v1/pair         {code, device} → {device_id, token, name}   (no token needed)
-//	GET  /lantern/v1/info         the bridge's name, version and backends
-//	GET  /v1/models               every backend's chat models, with `lantern` details
-//	POST /v1/chat/completions     passed to the model's backend, streamed back as it comes
-//	POST /lantern/v1/warm         {model}: load it ahead of a question
+//	POST /lantern/v1/pair         {code, device}: the QR code's one-time code → token   (no token needed)
+//	POST /lantern/v1/pair-code    {nonce, proof, device}: a typed code, proved → token    (no token needed)
+//	GET  /lantern/v1/info         the bridge's name and version, and Splash's state
+//	GET  /v1/models               Splash's model, with `lantern` details
+//	POST /v1/chat/completions     passed to Splash, streamed back as it comes
 //
 // Everything but pairing needs `Authorization: Bearer <token>`.
 type server struct {
-	b        *bridge
-	backends *backends
-	devices  *deviceStore
+	b *bridge
 }
-
-type ctxKey int
-
-const deviceKey ctxKey = 0
 
 func (s *server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /lantern/v1/pair", s.pair)
+	mux.HandleFunc("POST /lantern/v1/pair-code", s.pairCode)
 	mux.Handle("GET /lantern/v1/info", s.authed(s.info))
 	mux.Handle("GET /v1/models", s.authed(s.models))
 	mux.Handle("POST /v1/chat/completions", s.authed(s.complete))
-	mux.Handle("POST /lantern/v1/warm", s.authed(s.warm))
 	return mux
 }
 
-func (s *server) listen(ctx context.Context, addr string) error {
+func (s *server) serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
-		Addr:    addr,
 		Handler: s.handler(),
 		TLSConfig: &tls.Config{
 			MinVersion:   tls.VersionTLS13,
@@ -63,7 +55,7 @@ func (s *server) listen(ctx context.Context, addr string) error {
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	err := srv.ListenAndServeTLS("", "")
+	err := srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -85,13 +77,23 @@ func writeJSON(w http.ResponseWriter, v any) {
 func (s *server) authed(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		d, found := s.devices.authenticate(strings.TrimSpace(token))
+		_, found := s.b.devices.authenticate(strings.TrimSpace(token))
 		if !ok || !found {
 			apiError(w, http.StatusUnauthorized, "This device isn't paired with "+s.b.name()+". Pair it from Lantern on the Mac.")
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), deviceKey, d)))
+		next(w, r)
 	})
+}
+
+// A pairing's answer, by QR code or typed code.
+type paired struct {
+	DeviceID  string       `json:"device_id"`
+	Token     string       `json:"token"`
+	Name      string       `json:"name"`
+	Proof     string       `json:"proof,omitempty"` // typed code only
+	Addresses []string     `json:"addresses"`
+	Tailnet   tailnetOffer `json:"tailnet"`
 }
 
 func (s *server) pair(w http.ResponseWriter, r *http.Request) {
@@ -103,7 +105,7 @@ func (s *server) pair(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "The pairing request couldn't be read.")
 		return
 	}
-	d, token, err := s.devices.pair(body.Code, body.Device)
+	d, token, err := s.b.devices.pair(body.Code, body.Device)
 	if errors.Is(err, errBadCode) {
 		time.Sleep(500 * time.Millisecond) // nothing to gain from guessing quickly
 		apiError(w, http.StatusForbidden, err.Error())
@@ -113,47 +115,139 @@ func (s *server) pair(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	s.finishPairing(w, r, d, paired{DeviceID: d.ID, Token: token})
+}
+
+func (s *server) pairCode(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Nonce  string `json:"nonce"`
+		Proof  string `json:"proof"`
+		Device string `json:"device"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil {
+		apiError(w, http.StatusBadRequest, "The pairing request couldn't be read.")
+		return
+	}
+	d, token, proof, err := s.b.devices.pairWithCode(body.Nonce, body.Proof, body.Device)
+	switch {
+	case errors.Is(err, errCodeMismatch), errors.Is(err, errNoCode):
+		time.Sleep(500 * time.Millisecond)
+		apiError(w, http.StatusForbidden, err.Error())
+		return
+	case errors.Is(err, errCodeTooMany):
+		time.Sleep(500 * time.Millisecond)
+		apiError(w, http.StatusTooManyRequests, err.Error())
+		return
+	case err != nil:
+		apiError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	s.finishPairing(w, r, d, paired{DeviceID: d.ID, Token: token, Proof: proof})
+}
+
+// finishPairing adds what every pairing answer carries: the Mac's name and addresses, and a key
+// to join its tailnet when it has one to give.
+func (s *server) finishPairing(w http.ResponseWriter, r *http.Request, d device, p paired) {
 	log.Printf("paired %q (%s)", d.Name, d.ID)
-	s.b.changed()
-	writeJSON(w, map[string]string{"device_id": d.ID, "token": token, "name": s.b.name()})
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	p.Name = s.b.name()
+	p.Addresses = s.b.addresses()
+	p.Tailnet = s.b.tailscale.offer(ctx, d.Name, s.b.port())
+	if p.Tailnet.Status != "ok" {
+		log.Printf("tailnet for %q: %s", d.Name, p.Tailnet.Message)
+	}
+	writeJSON(w, p)
 }
 
 func (s *server) info(w http.ResponseWriter, r *http.Request) {
-	found, _ := s.backends.snapshot()
-	writeJSON(w, map[string]any{"name": s.b.name(), "version": version, "backends": found})
+	st := s.b.splash.snapshot()
+	writeJSON(w, map[string]any{
+		"name": s.b.name(), "version": version,
+		// Lantern before 2.0 reads the servers behind the bridge here.
+		"backends": []map[string]string{{"id": "splash", "name": "Splash"}},
+		"splash":   map[string]any{"state": st.State, "message": st.Message, "version": st.Version},
+	})
+}
+
+// A model as devices see it: the OpenAI fields, and Lantern's own about it.
+type model struct {
+	ID      string    `json:"id"`
+	Object  string    `json:"object"`
+	OwnedBy string    `json:"owned_by"`
+	Lantern modelInfo `json:"lantern"`
+}
+
+type modelInfo struct {
+	Backend       string   `json:"backend"`      // "splash"
+	BackendName   string   `json:"backend_name"` // "Splash"
+	Name          string   `json:"name"`
+	Vision        bool     `json:"vision"`
+	Tools         bool     `json:"tools"`
+	Thinking      bool     `json:"thinking"`
+	Context       int      `json:"context_length,omitempty"`
+	Efforts       []string `json:"reasoning_efforts,omitempty"` // minimal … xhigh; "none" is taken too
+	DefaultEffort string   `json:"default_reasoning_effort,omitempty"`
+}
+
+// upstreamModels asks Splash for its models, as devices see them.
+func (s *server) upstreamModels(ctx context.Context) ([]model, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.b.splash.url+"/v1/models", nil)
+	resp, err := s.b.splash.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var listing struct {
+		Data []struct {
+			ID        string `json:"id"`
+			Context   int    `json:"context_length"`
+			Vision    bool   `json:"vision"`
+			Reasoning *struct {
+				Thinks  bool     `json:"thinks"`
+				Efforts []string `json:"efforts"`
+				Default string   `json:"default"`
+			} `json:"reasoning"`
+		} `json:"data"`
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, errors.New(resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listing); err != nil {
+		return nil, err
+	}
+	out := []model{}
+	for _, m := range listing.Data {
+		info := modelInfo{Backend: "splash", BackendName: "Splash", Name: m.ID, Vision: m.Vision, Tools: true, Context: m.Context}
+		if r := m.Reasoning; r != nil {
+			info.Thinking, info.Efforts, info.DefaultEffort = r.Thinks, r.Efforts, r.Default
+		}
+		out = append(out, model{ID: m.ID, Object: "model", OwnedBy: "splash", Lantern: info})
+	}
+	return out, nil
 }
 
 func (s *server) models(w http.ResponseWriter, r *http.Request) {
-	_, models := s.backends.snapshot()
-	if models == nil {
-		models = []model{}
+	if ok, why := s.b.splash.ready(); !ok {
+		apiError(w, http.StatusServiceUnavailable, why)
+		return
+	}
+	models, err := s.upstreamModels(r.Context())
+	if err != nil {
+		apiError(w, http.StatusBadGateway, "Splash on "+s.b.name()+" didn't answer.")
+		return
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": models})
 }
 
-func (s *server) warm(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Model string `json:"model"`
-	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body); err != nil || body.Model == "" {
-		apiError(w, http.StatusBadRequest, "Say which model to load.")
+// complete passes a chat completion to Splash and streams the answer back as it comes, keeping
+// the drafter's numbers from the last chunk. A client that goes away cancels the request, which
+// stops Splash generating.
+func (s *server) complete(w http.ResponseWriter, r *http.Request) {
+	if ok, why := s.b.splash.ready(); !ok {
+		apiError(w, http.StatusServiceUnavailable, why)
 		return
 	}
-	// The caller doesn't wait for a big model to load.
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
-		if err := s.backends.warm(ctx, body.Model, s.b.keepAlive(body.Model)); err != nil {
-			log.Printf("warming %s: %v", body.Model, err)
-		}
-	}()
-	w.WriteHeader(http.StatusAccepted)
-}
-
-// complete passes a chat completion to its model's backend under the backend's own name for the
-// model, and streams the answer back as it comes. A client that goes away cancels the request,
-// which stops the backend generating.
-func (s *server) complete(w http.ResponseWriter, r *http.Request) {
 	data, err := io.ReadAll(io.LimitReader(r.Body, 128<<20)) // images make big requests
 	if err != nil {
 		apiError(w, http.StatusBadRequest, "The request couldn't be read.")
@@ -164,49 +258,62 @@ func (s *server) complete(w http.ResponseWriter, r *http.Request) {
 		apiError(w, http.StatusBadRequest, "The request isn't JSON.")
 		return
 	}
-	var id string
-	_ = json.Unmarshal(request["model"], &id)
-	be, name, ok := s.backends.route(id)
-	if !ok {
-		apiError(w, http.StatusNotFound, "There's no model "+id+" on "+s.b.name()+" now.")
+	// "none" is what Lantern asks for with thinking off. Splash takes it, but Inkling thinks
+	// anyway, and longer than at its least effort: minimal.
+	var effort string
+	if json.Unmarshal(request["reasoning_effort"], &effort) == nil && effort == "none" {
+		request["reasoning_effort"], _ = json.Marshal("minimal")
+		data, _ = json.Marshal(request)
+	}
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, s.b.splash.url+"/v1/chat/completions", bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	if a := r.Header.Get("Accept"); a != "" {
+		req.Header.Set("Accept", a)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		if r.Context().Err() == nil {
+			apiError(w, http.StatusBadGateway, "Splash on "+s.b.name()+" didn't answer.")
+		}
 		return
 	}
-	request["model"], _ = json.Marshal(name)
-	data, _ = json.Marshal(request)
-
-	target, _ := url.Parse(be.URL)
-	proxy := &httputil.ReverseProxy{
-		Rewrite: func(p *httputil.ProxyRequest) {
-			p.SetURL(target)
-			p.Out.Header.Del("Authorization") // the device's token stays with the bridge
-			p.Out.Body = io.NopCloser(bytes.NewReader(data))
-			p.Out.ContentLength = int64(len(data))
-		},
-		FlushInterval: -1, // each token as it comes
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if r.Context().Err() == nil {
-				apiError(w, http.StatusBadGateway, be.Name+" on "+s.b.name()+" didn't answer.")
-			}
-		},
+	defer resp.Body.Close()
+	for _, h := range []string{"Content-Type", "Cache-Control"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
 	}
-	proxy.ServeHTTP(w, r)
+	w.WriteHeader(resp.StatusCode)
+	flusher, _ := w.(http.Flusher)
 
-	// A request through Ollama's OpenAI API sets how long the model stays loaded back to the
-	// server's default: a model kept loaded for good is told so again.
-	if be.ID == "ollama" && s.b.keepAlive(id) != nil {
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-			defer cancel()
-			_ = s.backends.warm(ctx, id, -1)
-		}()
+	// Line by line, flushed at each event's end: an event is a `data:` line and a blank one.
+	reader := bufio.NewReaderSize(resp.Body, 64<<10)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			if _, werr := w.Write(line); werr != nil {
+				return
+			}
+			if payload, ok := bytes.CutPrefix(line, []byte("data: ")); ok && hasDrafterNumbers(payload) {
+				s.b.splash.noteTimings(payload)
+			} else if !ok && resp.StatusCode == http.StatusOK && hasDrafterNumbers(line) {
+				s.b.splash.noteTimings(line) // a reply that wasn't streamed
+			}
+			if flusher != nil && (len(bytes.TrimSpace(line)) == 0 || !bytes.HasPrefix(line, []byte("data: "))) {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
 	}
 }
 
-// keepAlive is how long Ollama keeps a model after a request: -1 (for good) for the models the
-// settings keep loaded, else the server's own default (nil).
-func (b *bridge) keepAlive(id string) any {
-	if slices.Contains(b.settings().KeepLoaded, id) {
-		return -1
-	}
-	return nil
+// hasDrafterNumbers spots the chunks worth decoding: `timings` (draft_n…) and `metrics.speculation`.
+func hasDrafterNumbers(chunk []byte) bool {
+	return bytes.Contains(chunk, []byte(`"draft_n"`)) || bytes.Contains(chunk, []byte(`"speculation"`))
 }

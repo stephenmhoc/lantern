@@ -1,309 +1,196 @@
 # Lantern
 
-An LLM that keeps working in an internet or power outage. iPhone and iPad, iOS 18.1+, Swift 6 with
-MainActor default isolation, SwiftData. Five modes behind one chat:
+An assistant that keeps working in an internet or power outage. iPhone and iPad, iOS 18.1+, and the
+Mac through Mac Catalyst (the same target; see The Mac). Swift 6 with MainActor default isolation, SwiftData. Lantern 2.0 is deliberately small: few features, each
+finished. When in doubt, delete.
 
-- **Gemma 4 E2B** (`Mode.fast`): on device, 2.6 GB, for 6 GB devices.
-- **Gemma 4 E4B** (`Mode.smart`): on device, 4.2 GB, for 8 GB devices. Both use `lazy_mode`, so
-  their per-layer embedding tables (most of the file) are read row by row from the mmapped file.
-  Each drafts with its MTP head (`mtp-gemma-4-*-it.gguf`, ~60 MB, `CatalogModel.drafter`), downloaded
-  with it and fetched quietly for a Gemma already here: 30–80% faster replies, same greedy output.
-- **Qwen 3.5 4B** (`Mode.qwen`): on device, 2.9 GB (`Qwen3.5-4B-UD-Q4_K_XL`), for 8 GB devices. A
-  hybrid (Gated DeltaNet): its cache is append-only. No drafter, no images. Sampling follows
-  thinking (`Sampling.qwen35(thinking:)`, presence penalty 1.5).
-- **Apple Intelligence** (`Mode.apple`): the system's Foundation Models model (iOS 26+,
-  `Lantern/Engine/AppleModel.swift`). One `LanguageModelSession` per chat, rebuilt from stored history
-  when it differs; no thinking; images on iOS 27. Its status (`AppleStatus`) replaces a download.
-  Siri/App Intents call it "Built-in Model" (Apple trademarks are rejected there, ITMS-90626).
-- **Your computers** (`Mode.mac`): every model the Mac Studio serves (Ollama's Inkling 2 Mini, Gemma 4 31B,
-  Muse Glimmer; LM Studio and others too) through Lantern for Mac's bridge (see Bridge), home network first (works with the internet down), tailnet second. A chat keeps
-  its model in `Conversation.macModel` (fixed by its first reply); the picker lists each by
-  `MacLink.displayName` under "On Your <computer name>" with `desktopcomputer`, on-device ones with
-  a chip. Never call them "cloud". One computer for now (`mac.lan`, `mac.tailnet`, `mac.name`).
+A chat is answered by one of two models:
 
-The `Mode` raw values (`fast`, `smart`, `qwen`, `mac`, `apple`) are stored in chats and used by links,
-widgets and intents, so they never change; `smart` was Inkling on device until it was dropped as too
-big and slow for a phone (old chats in it now open with E4B; the Models page offers to delete the old
-files). Shortcuts: ⌘1 E2B, ⌘2 E4B, ⌘3 Qwen, ⌘4 computers, ⌘5 Apple (from `Mode.allCases`).
+- **This device's model** (`Mode.device`): the best Gemma 4 its memory runs, picked by
+  `CatalogModel.device` and never by the user. 12B (6.7 GB) on 12 GB devices, E4B (4.2 GB) on 8 GB,
+  E2B (2.6 GB) on 6 GB. Each comes with its MTP drafter (faster, same output) and vision projector,
+  as one download. The model belongs to the device, not the chat: a chat stores only "this device
+  or the Mac", so any device continues any chat with its own model (the chats sync through iCloud:
+  `ChatStore`), and every reply records the model that wrote it (`ReplyMetrics.modelTitle`).
+- **The Mac** (`Mode.mac`): Inkling 2 Mini, which Splash serves on the serving Mac, through
+  Lantern's bridge (`Bridge/README.md`): home network first, tailnet second. Never call it "cloud".
+  It serves one model; a chat on a model it no longer serves (from before 2.0) moves to it.
+  Thinking follows the model's listed `thinking` flag ("high", or "none", which the bridge makes
+  "minimal"). The bridge's 503 means Splash is starting or failed: shown as such, rechecked.
+  Pairing (`MacPairing`) is by the QR code's link or by the code it shows, typed and proved to a
+  Mac found by Bonjour; a pair response with `tailnet.status == "ok"` carries a one-time key the
+  iPhone and iPad join with (`Tailnet.join`, TailscaleKit). A Mac has no TailscaleKit: the Tailscale app.
+
+`Mode`'s raw values (`fast`, `smart`, `qwen`, `mac`, `apple`) are stored, so all still decode:
+everything but `mac` means this device (`Mode.device` is `fast`), and `Conversation.repairModes`
+moves old chats over at launch. Apple Intelligence only names chats (`ChatTitler`).
 
 ## Layout
 
-- `Packages/LlamaKit`: the llama.cpp wrapper (`LlamaModel` with the MTP drafter, hand-written
-  `ChatTemplate`s for `gemma4` and `qwen35`) and the `lantern-smoke` Mac CLI.
-- `Lantern/Engine`: `Engine` owns the one generation that can run at a time (send, stop, retry,
-  `prepare`, saved state, backgrounding, unloading, model self-test); `ModelStore` downloads;
-  `MacLink` talks to the computer's bridge (`BridgeAPI`: the OpenAI API plus `/lantern/v1/…`);
-  `MacPairing` holds the pairing (pinned certificate, token in the Keychain) and pairs from a link.
-- `Lantern/Chat`: the chat screen, in UIKit. `ChatScreen` at the bottom of `ChatViewController.swift`
-  is its SwiftUI wrapper: editable title and title menu (Rename, Export as Markdown), the inspector,
-  and the banner shown while another chat or a model test holds the engine. `Attachments.swift`
-  reads files into `Attachment`s (PDFKit for PDFs, images downscaled to a 1024 px JPEG) and draws
-  their chips; files come from the composer's paperclip menu, a drop anywhere on the chat, or paste.
-  `Dictation.swift` is the composer's mic: on-device only, `SpeechAnalyzer`/`SpeechTranscriber` on
-  iOS 26+, `SFSpeechRecognizer` with `requiresOnDeviceRecognition` otherwise; the button is hidden
-  when neither works for the language.
-- `Lantern/Views`: everything else, in SwiftUI. `RootView` is one window that opens on a new chat (keyboard down, rotating
-  prompt ideas from `Starter.all` in `EmptyChatView`), with past chats and Settings in a side
-  panel: a sidebar column on iPad (with the inspector as a third column), a drawer sliding over the
-  chat on iPhone (top-left button or edge swipe). The panel is custom (no navigation bar): Lantern and a
-  search field at the top, plain rows (title on two lines, model and time) with the open chat
-  highlighted, pin, rename and immediate delete (no undo, no in-app toasts) by swipe (`SwipeRow`: round buttons inside the row, not the list's swipe actions; never a full swipe) or the context menu; it lists only chats
-  with messages. A chat's title starts as its first question; after an answer `ChatTitler` asks
-  Apple Intelligence (when on) for a few words, and only ever replaces a title still equal to the
-  question, so a rename sticks; deleting the chat on screen goes to a new chat. Only a window opened for a chat
-  restores its selection;
-  `LanternCommands` is the iPad menu bar, reaching the key window through `focusedSceneValue`
-  (`SceneActions`, `ChatFocus`); `ChatList` holds the sidebar's grouping and the default mode for new
-  chats; `ModelImport` copies a `.gguf` the user already has into Documents (the Models page's file
-  picker and drop target). Settings has "On This iPhone" (the Models page: `ReadinessView`, pushed as
-  `SettingsPage.readiness`; rows in `ModelRows.swift`, details behind a tap) and "On Your Computers"
-  (`Views/Computers/`: `ComputersView`; Add a Computer explains pairing from the Mac's QR code,
-  pastes a pairing link, lists bridges found by Bonjour `_lantern._tcp` (`BridgeBrowser`) and signs
-  in to the tailnet; `PairingSheet` pairs from a `lantern://pair` link). A computer counts as set
-  up only once paired. The Models page just lists models: no
-  "ready"/"offline" summary. The sidebar's bottom bar has Settings on the left (badged only when no
-  model can answer or the build expires soon, `Readiness.needsAttention`) and New chat on the right.
-  The composer collapses to one row (model, field, mic or Stop) while the keyboard is down; its
-  model button opens `ModelPicker` (a sheet on iPhone, a popover on iPad: a Think First switch, since
-  `Thinking.low` and `.high` do the same, then every model), not a UIMenu; a tap
-  on the transcript puts the keyboard away. Settings' "Speed and Tokens" (`ReplyDetails`) trims
-  the line under each answer to only stop and cut-off notes. Settings' Personalization (`PersonalizationView`) holds
-  the user's own instructions (`Engine.customPromptKey`), which replace the default text of new
-  chats' prompts; "This conversation began on …" always follows them. Unset (or the default as it
-  was), the prompt is exactly the default. Existing chats keep theirs (frozen, see Rules).
-- `Lantern/System`: the ways in from outside the app. `LanternLink` is the `lantern://` scheme
-  (`new?mode=fast`, `ask?text=…&mode=`, `chat/<id>`), shared with the widgets. App Intents
-  (`LanternIntents`: Ask Lantern, Open Chat and the App Shortcuts phrases; `NewChatIntent`, shared
-  with the widgets for the control) all open the app and hand off to `SystemRouter`, which the key
-  window's `RootView` claims; URLs arrive through `onOpenURL` and Spotlight taps through
-  `onContinueUserActivity`, both in `RootView.handle`. `ChatEntity` is a chat for intents, Siri and
-  Spotlight; `SpotlightIndex` indexes title plus the first lines after every store save and removes
-  deleted chats, diffing against what it last indexed.
-- `LanternWidgets`: the widget extension (`com.merimerimeri.Lantern.Widgets`): Ask Lantern
-  (small/medium, mode buttons), a Lock Screen accessory and a Control Center control. Deep links
-  and static content only; the build expiry comes from the app's Info.plist (`../../Info.plist`).
-- Windows: one `WindowGroup(for: PersistentIdentifier.self)`. A plain window opens with no value;
-  "Open in New Window" opens one with a chat's identifier. Each window restores its own selection
-  with `@SceneStorage`; all share the app's one `Engine`, so a second chat can't send while one
-  answers anywhere (`BusyBanner` says so).
+- `Packages/LlamaKit`: the llama.cpp wrapper (`LlamaModel` with the drafter, hand-written
+  `ChatTemplate`s) and the `lantern-smoke` Mac CLI. Its Qwen template and non-rewinding paths stay:
+  the 12B's windowed cache uses the same append-only path.
+- `Lantern/Engine`: `Engine` owns the one generation (send, stop, retry, compare, `prepare`, saved
+  state, leaving the app); `ModelCatalog` the three Gemmas and their options; `ModelStore` the
+  download; `MacLink`/`BridgeAPI`/`MacPairing`/`Tailnet` the Mac; `WebSearcher` Tavily;
+  `ChatTitler` titles.
+- `Lantern/Chat`: the chat screen, in UIKit (`ChatViewController`; `ChatScreen` at its end is the
+  SwiftUI wrapper with the title and `ChatBanner`). `ComposerView`, `MessageCells`, `Markdown`,
+  `Attachments`, `ModelPicker` (the two models, Think First, Search the Web), `EmptyChatView`.
+- `Lantern/Data`: `Conversation` (the one stored model) and `ChatStore` (its container).
+- `Lantern/Compare`: `CompareView`, two answers side by side with Continue With.
+- `Lantern/Views`: `RootView` (one window: sidebar column on iPad, drawer on iPhone; chats with
+  search, Rename and Delete by swipe or menu), `ModelSetupView` (the welcome and the model's
+  page: the only place the model is downloaded, upgraded or removed), `SettingsView` (the model, the Mac, the
+  Tavily key, Instructions, the build's expiry), `PersonalizationView`, `Computers/` (Settings › Mac: the paired Mac, or pairing),
+  `LanternCommands` (the iPad menu bar, `BuildExpiry`), `DebugLaunch` (launch arguments, the e2e).
+- `Lantern/Mac` (Catalyst only): `MacRole`, `MacServer`, `MacSettings`, `SettingsWindow`,
+  `MacWelcomeView`, `MacUpdater`. `MacSupport/` is a bundle loaded at launch for AppKit and Sparkle (`MacSupportAPI`).
+- `Bridge/` (Go): runs Splash (Inkling 2 Mini + DFlash2 drafter, loopback only) and serves it to
+  paired devices on :11443. `scripts/mac-bundle.sh` builds it into the Mac app with its LaunchAgent.
 
 ## Commands
 
 ```sh
 scripts/fetch-llama.sh      # pinned llama.cpp xcframework into Vendor/ (gitignored)
+scripts/fetch-tailscale.sh  # TailscaleKit (needs Go)
 xcodegen generate           # after changing project.yml or adding files
-cd Packages/LlamaKit && swift build -c release && .build/release/lantern-smoke ../../Models/<file>.gguf [--think] [--stop] [--state] [--lazy] [--f16] [--draft <mtp>.gguf]
-                            # two-turn check of a GGUF on the Mac through the app's own wrapper;
-                            # --state checks saved state (reopen, retry, stop, new chat) and that a
-                            # restored cache answers byte for byte like the live one.
-                            # Gemma runs with --lazy --f16 --draft in the app; Qwen with --qwen-sampling.
-                            # --render compares a template with the GGUF's Jinja; --bench times prompt
-                            # reading and generation; --search answers web search calls with Tavily.
 ```
 
-In a Debug build, `simctl launch --console <device> com.merimerimeri.Lantern -selftest` tests each
-downloaded model, `-enginetest [-smart|-qwen|-apple]` drives a short chat through `Engine`, and
-`-featuretest [-smart] [-image <path>]` checks that a date note, an attached file and an image keep
-the cache append-only (the follow-up must reuse everything; in-memory store, no chats touched).
-`lantern-smoke <gemma>.gguf --lazy --f16 --mmproj <mmproj>.gguf --image <file>` checks images on
-the Mac: the image is encoded once and reused by the follow-up and a retry.
+The simulator needs llama.cpp's own `build-xcframework.sh` output in `Vendor/build-apple/` (the
+official xcframework has no simulator slice) and runs it on the CPU: use `-model e2b` there.
 
-The official xcframework has no simulator slice. For the simulator, build llama.cpp's
-`build-xcframework.sh` at the pinned tag (needs CMake) into `Vendor/build-apple/`; in the
-simulator llama.cpp runs on the CPU, since the simulator's Metal driver can't map its buffers.
-Debug builds take launch arguments for checking the UI without tapping (`DebugLaunch.swift`):
-`-seedChats`, `-ui readiness|settings|personalization|inspector|search:<text>|search|delete|newchat|sidebar|swipe|swipepin|next|window`,
-`-testflight` (show the expiry and reminders), `-importModel <path>`, `-markdownSample full|partial`
-(every answer shows a Markdown sample, `partial` cut off mid code fence), and `-selftest`.
-For the system integration: `-openURL <lantern://…>` (the app opens the link through the system
-itself; `simctl openurl` stops at an "Open in Lantern?" prompt that needs a tap),
-`-intent ask:<text>|new:<mode>|open:<title>` (runs that intent's `perform()`) and
-`-spotlightQuery <text>` (searches Lantern's own Spotlight items after indexing).
+There are no unit tests. Two end-to-end checks (and `scripts/bridge-e2e.sh [--spawn]` for the
+bridge: pairing both ways, streaming, tools, an image and Tailscale keys against a running Splash):
 
-`scripts/mac-ollama-setup.sh install` (run on the Mac Studio) installs a login agent that gives
-Ollama.app `OLLAMA_KEEP_ALIVE=30m`, `OLLAMA_MAX_LOADED_MODELS=3`, `OLLAMA_CONTEXT_LENGTH=16384` and
-`OLLAMA_HOST=127.0.0.1:11434` (this Mac only: devices go through the bridge) (the app only passes
-launchd's environment to `ollama serve` when it starts after it, and ignores a polite quit, so the
-script kills and reopens it), and removes the old `_ollama._tcp` Bonjour agent. Lantern for Mac
-(installed in /Applications, Open at Login) runs the bridge, keeps Inkling loaded and advertises
-`_lantern._tcp`. Build it with `xcodebuild -scheme LanternMac -configuration Release`.
+```sh
+# 1. The models, through the app's wrapper (Mac CLI). Greedy; prints PASS/FAIL.
+cd Packages/LlamaKit && swift build -c release
+.build/release/lantern-smoke <model.gguf> [load flags] [--think] [--stop] [--draft <mtp.gguf>]
+.build/release/lantern-smoke <model.gguf> [load flags] --state [--retry-first]
+.build/release/lantern-smoke <model.gguf> [load flags] --mmproj <mmproj.gguf> --image <file>
+.build/release/lantern-smoke <model.gguf> [load flags] --search [--think]   # TAVILY_API_KEY
+.build/release/lantern-smoke <model.gguf> --render    # template renders, to compare with the Jinja
+# Load flags, as CatalogModel.options: E2B/E4B `--lazy --f16`, 12B `--f16` (or `--swa-window`).
 
-`scripts/fetch-tailscale.sh` builds TailscaleKit (needs Go) for signing into the tailnet; without it
-`Tailnet` compiles out.
+# 2. The app, in the booted simulator: ask, answer, retry, reopen, follow up. Prints E2E PASS/FAIL.
+scripts/e2e.sh          # this device's model (E2B files cloned from Models/)
+scripts/e2e.sh --mac    # the Mac, if the simulator is paired
+```
+
+Debug launch arguments (`DebugLaunch.swift`): `-model e2b|e4b|12b`, `-seedChats`,
+`-ui welcome|model|modelpage|settings|mac|personalization|sidebar|search:<text>|chat|picker|compare|comparepicker`,
+`-testflight`, `-e2e [-mac]`, `-pairCode <code> [-pairAt host:port@fingerprint]`. The Mac also takes
+`-role serve|client|none`, `-ui role|pair`, `-light`/`-dark` and `-snapshot <path> [-snapshotDelay s]`
+(saves the windows and any sheet as PNGs, then quits). Launch the Mac app with
+`open -n --stdout <log> <Lantern.app> --args …` (e.g. `-role serve -e2e -mac`), not its binary: run
+from a shell, the CloudKit store's setup waits forever on RunningBoard.
+
+The Mac release: `.github/workflows/release-mac.yml` (tags `v*`, beside the iOS `release.yml`):
+Developer ID archive with the profile from `Tools/app_store_connect_signing.rb prepare-mac`,
+`scripts/mac-sign.sh` (inside-out re-sign and checks), notarized with the ASC key, DMG and zip on
+`v<version>`, `appcast.xml` on the `appcast` prerelease. Needs the secrets DEVELOPER_ID_CERT_BASE64,
+DEVELOPER_ID_CERT_PASSWORD and SPARKLE_PRIVATE_KEY.
+
+## The Mac
+
+- **The same app through Mac Catalyst** with the Mac idiom: NavigationSplitView sidebar with
+  `.searchable`, toolbar in the titlebar, Settings in the app menu (⌘,), the chat's title as the
+  window's, Mac-sized type, hover on the answer's controls. Mac-only code is under
+  `#if targetEnvironment(macCatalyst)` (Catalyst is `os(iOS)`).
+- **No model of its own.** The Mac never shows or offers an on-device model (`ModelStore` does
+  nothing there); every chat answers through `Mode.mac`. Old on-device replies stay as history.
+- **One role, chosen on first run** (`MacRole`, `mac.role`): **serve** (Apple silicon M3+, macOS
+  26.4+) registers the bridge's LaunchAgent with `SMAppService` (`MacServer`), talks to the
+  bridge over `admin.sock`, and pairs the app with its own bridge on 127.0.0.1. **client** works
+  like an iPhone and never installs, starts or registers the bridge, Splash or the agent; switching
+  to it unregisters the agent. Settings (a window of its own, `SettingsWindow`; the Mac build allows a second scene for it)
+  shows the role's sections: Splash's status, Pair a Device (QR code and typed code), paired
+  devices, the Tailscale OAuth client; or the paired Mac.
+- **Secrets are in the Keychain on the Mac too** (the data protection keychain, which works because
+  iCloud gives the app a provisioning profile, Developer ID included). Without one (-34018) they
+  fall back to 0600 files in `Secrets/`, which move into the Keychain once it works.
+- **A Debug build is another app** (`com.merimerimeri.Lantern.dev`, folder `Lantern Dev`, bridge
+  "Lantern Dev" on 11444, using the Splash already on :8000), so it never touches the installed
+  Lantern. A Release build uses `~/Library/Application Support/Lantern` (the old Mac app's
+  `Chats.store` opens as is and syncs). **2.0 replaces Lantern for Mac 1.x** in place (same
+  bundle ID, folder and port): a bridge already on its port that's a `lantern-bridge` (1.x's
+  child process) is stopped by the new one (`Bridge/port.go`), which keeps its certificate and
+  `devices.json`, so paired devices carry on; a Mac that served carries on serving, and 1.x's
+  open-at-login is undone (`MacRole.tidyOldApp`).
+- **Sparkle**: Check for Updates… in the app menu, automatic checks, `LANTERN_FEED_URL` and
+  `LANTERN_UPDATE_KEY` in project.yml; a Debug build has no feed and never checks.
 
 ## Rules
 
-- **SwiftUI where it can be, UIKit for the important pieces.** The chat transcript and message box
-  are UIKit (`ChatViewController`): streaming into a cell without reloading it, selectable answers
-  with data detectors, following the bottom only while the user is there, hardware-keyboard
-  commands. Sidebar, sheets, the status strip and settings stay SwiftUI.
-- **Never update UI per token.** `Engine.live` (a plain `LiveReply`) collects tokens; the chat screen
+- **SwiftUI where it can be, UIKit for the chat.** The transcript and message box are UIKit:
+  streaming into a cell without reloading it, selectable answers, following the bottom only while
+  the user is there, hardware-keyboard Send and Stop.
+- **Never update UI per token.** `Engine.live` (a plain `LiveReply`) collects tokens; the chat
   reads it on a ~15 Hz display link. SwiftData is written when a turn starts and ends and every ~5 s.
-- **One generation at a time, owned by `Engine`.** Views never hold the task. Stop cancels the task;
-  the stream's termination is what stops llama.cpp or the Ollama request.
-- **llama.cpp is pinned** in `scripts/fetch-llama.sh`. Run the smoke test on both Gemmas (with
-  `--think`, `--stop`, `--state` and `--draft`) and on Qwen (`--think --state`) before moving the pin.
-- **Chat templates are hand-written** in `ChatTemplate.swift` because llama.cpp's C helper has no
-  Jinja. Check them against `lantern-smoke <file> --template` when adding a model.
-- **Never rewind the KV cache of a hybrid model** (Qwen 3.5; `canRewind` from
-  `llama_model_is_hybrid`): its cache is only ever appended to, restored or cleared, and history
-  passed back must be byte-identical to what was streamed. Its replies stay in the cache as streamed,
-  thinking included, even though its template drops old thinking. Gemma rewinds; with thinking on it
-  re-renders. Only a model that can rewind gets an MTP drafter: rejected drafts are removed with
-  `llama_memory_seq_rm`.
+- **One generation at a time, owned by `Engine`.** Views never hold the task. Stop cancels it.
+- **One model, no choice.** The UI never lists on-device models. `ModelStore.best` is
+  `CatalogModel.device`, the only one downloaded; `ModelStore.model` is the one answering.
+- **A model already here keeps answering.** If it isn't the best (an upgrade from an older
+  version), the best is offered once and in Settings ("A better model is available"), never
+  forced. `model` only becomes `best` when all three of its files are here at their exact size
+  with a GGUF header; only then are the other sizes' and retired models' files deleted. Nothing
+  is deleted in a `-model` or `-e2e` run.
+- **An unpaired Mac is never selected.** `Conversation.answeringMode` is what answers: a chat
+  stored as `mac` answers on this device while no Mac is paired, and the picker's Mac row then
+  leads to Settings (on a Mac, always `mac`, with a banner until it can answer). Use `answeringMode`, not `mode`, to decide where a reply goes.
+- **Per-model settings live in `CatalogModel`.** E2B/E4B: lazy embeddings, F16 cache. 12B: batch
+  512, no lazy embeddings, and its cache in `Gemma12BCache.chosen` (`.f16`, `.q8` or `.windowed`),
+  to be settled on a real iPhone; saved states are keyed by cache type, so switching is safe.
+- **llama.cpp is pinned** in `scripts/fetch-llama.sh`. Before moving the pin or touching
+  `LlamaModel.run`/`reuse`, run the smoke test on each Gemma (`--state`, `--think --stop`, with
+  `--draft`).
+- **Chat templates are hand-written** (`ChatTemplate.swift`); check with `--render`.
+- **A model that can't rewind is only appended to, restored or cleared** (`canRewind`: hybrids, and
+  the 12B with a windowed cache); history passed back must be byte-identical to what was streamed.
 - **Going back means restoring.** Each clean turn end is saved to
-  `Caches/kv/<Conversation.stateID>/<model id>` (each model its own, so a comparison or Retry With
-  never overwrites another's; states from before sat in the chat's folder and are moved by
-  `LlamaModel.adoptLegacyState`) (`llama_state_seq_save_file` plus the transcript it holds,
-  keyed by model file, context length and KV type); a model that can't rewind also keeps the turn
-  before, and an in-memory snapshot taken right after the system prompt. Reopening a chat, Retry, a message
-  after Stop and a new chat start from one of those instead of reading everything again. All of
-  it is in `LlamaModel.run`/`reuse`; `Engine` only passes the directory. Run
-  `lantern-smoke --state` on both Gemmas after touching it.
-- **The system prompt is frozen per chat** (`Conversation.systemPrompt`, set at creation, date
-  included). It's the start of every cache and saved state: anything in it that changes between
-  turns makes the model read the whole chat again. When a question is sent on a later day than the
-  model last heard (the prompt's date or the last note), `Engine.send` stores a `dateNote`
-  ("(Today is …)") on that message, which goes before its text.
+  `Caches/kv/<Conversation.stateID>/<model id>`; reopening, Retry, a message after Stop and a new
+  chat start from a saved state. All of it is in `LlamaModel`; `Engine` only passes the directory.
+  Model ids name these folders, so they never change.
+- **The system prompt is frozen per chat** (`Conversation.systemPrompt`, date included): it's the
+  start of every cache. A question sent on a later day gets a stored `dateNote` instead.
+  Personalization's instructions apply to new chats only.
 - **A user turn is rendered from stored fields only** (`StoredMessage.chatMessage`): date note,
-  then each text file as `<file name="…">…</file>`, then the typed text, joined by blank lines;
-  images go in `ChatMessage.images`. Never derive any of it from the current date, settings or
-  file contents at send time again: history passed back must be byte-identical.
-- **Images**: each Gemma sees them through its own vision projector (`CatalogModel.gemmaVision`,
-  `gemmaE4BVision`: optional extras on each Gemma's Models detail page, ~1 GB, loaded beside it only when a chat has an image;
-  `LlamaModel.loadVision`). A prompt with images is tokenized by mtmd and always rendered in full;
-  each image position gets a stand-in token from its bytes, so the shared prefix is reused and an
-  image is encoded once. Only models that can rewind have a projector here. Mac sends them as `image_url` data URLs if the
-  bridge's `/v1/models` lists `vision` for the model, else fails a question about an image with `MacError.noVision`.
-- **Leaving the app mid-reply (iOS 26+)**: `Engine` submits a `BGContinuedProcessingTaskRequest`
-  (`com.merimerimeri.Lantern.reply.<uuid>`, registered just before, strategy `.fail`) as a reply
-  starts: always for Mac, for on-device only if `BGTaskScheduler.supportedResources` has `.gpu`
-  (needs the `com.apple.developer.background-tasks.continued-processing.gpu` entitlement, not yet
-  added) or in the simulator (CPU). Progress is pieces against an estimate; expiry stops and saves.
-  Without a started task it's the old behaviour: on-device stops ("Stopped when you left
-  Lantern"), Mac gets the usual few seconds. A reply that finishes in the background posts a
-  local notification (provisional authorization, never a prompt).
-- **Mac latency.** The bridge keeps the models pinned in Lantern for Mac ("Keep loaded", Inkling)
-  in memory: the OpenAI API has no `keep_alive`, so after each request for one it warms it again
-  with `keep_alive: -1`; the others get the server's 30 minutes (all three resident held ~60 GB).
-  `Engine.prepare` calls `MacLink.warm()` (`POST /lantern/v1/warm`, which loads the model and
-  answers at once) when a Mac chat opens or typing starts. `resolve()` races the home network and the tailnet; a network change
-  (`NWPathMonitor`) marks the route stale so a send re-checks instead of hanging on a dead route.
-  The tailnet probe races Lantern's own node against the Tailscale app's VPN and the route
-  remembers which answered. The footnote breaks down the wait (found the Mac, connected;
-  `MacLink.Timings`): the OpenAI API reports no load or reading time, so the time to the first
-  token stands for both. Thinking is `reasoning_effort` ("none" off, only for a model listed as
-  thinking) and streams as `delta.reasoning` (Ollama) or `reasoning_content`. Inkling thinks even
-  when told not to (Ollama just hides it, so nothing showed for seconds); `MacLink.alwaysThinks`
-  models are always asked for thinking.
-- **Bridge** (`Bridge/`, Go, `lantern-bridge`, built into Lantern for Mac by its pre-build script).
-  Serves every local model server it finds (Ollama 11434, LM Studio 1234, llama.cpp 8080, vLLM 8000,
-  Jan 1337) as one OpenAI API on :11443: TLS 1.3 with its own self-signed certificate, which
-  devices pin by SHA-256, and a token per device (stored hashed, `devices.json`). Pairing: "Pair a
-  Device" shows `lantern://pair?v=1&name=…&fp=…&code=…&addr=…` as a QR code; the device POSTs the
-  one-time code (10 minutes) to `/lantern/v1/pair` and gets its token. It advertises
-  `_lantern._tcp` (TXT `fp=`). The Mac app (`LanternMac/`) runs it as a child
-  process, or adopts one already running, and talks to it over `admin.sock` in
-  `~/Library/Application Support/Lantern/Bridge`; it warns when Ollama itself listens on the
-  network and can make it local-only. `cd Bridge && go test ./...`; `lantern-bridge pair` prints a
-  QR code in the terminal. Debug Lantern for Mac takes `-panel`, `-pair`, `-snapshot <folder>
-  [-snapshotDelay s] [-dark]`, `-settings <general|personalization|models|search|devices>` and
-  `-ask <text> [-mode fast|smart|qwen|mac|apple] [-quit]` (sends in a new chat, logs `ASK done`).
-- **Lantern for Mac is a full chat app** (`LanternMac/`): a Dock app with windows (`MacRootView`:
-  sidebar of chats with `ChatSection`/`ChatSearch`, `ChatPane`: SwiftUI transcript read at 15 Hz
-  with answers in an AppKit `AnswerNSTextView` on `BlockLayoutManager`, message box with model,
-  Think First and Send), Settings (General, Personalization, Models, Web Search, Devices: pairing
-  and the bridge) and the menu bar extra; closing the last window keeps the bridge running. It
-  shares `Lantern/Engine`, `Lantern/Data` and the platform-neutral chat files (`Markdown` through
-  `PlatformText.swift`, `AttachmentReader`, `ReplyStatus`, `Speaker`, `EmptyChatView`); iOS-only
-  code there is behind `#if os(iOS)`, availability checks name both (`iOS 26, macOS 26, *`).
-  `ThisMac` pairs the app with its own bridge over the admin socket ("Lantern on This Mac", hidden
-  from device lists) and points `MacLink` at 127.0.0.1, so `Mode.mac` is "This Mac's models".
-  Chats are in `~/Library/Application Support/Lantern/Chats.store`, GGUFs in `…/Lantern/Models`
-  (`Folders`), saved states in `Caches/com.merimerimeri.Lantern`. Quit waits for
-  `Engine.shutDown()` (`AppDelegate`): llama.cpp aborts in `exit` if a model still holds Metal
-  buffers. `Engine` and `BridgeController` are static singletons there, not `@State` (an `App`'s
-  state read in `init` can be another instance).
-- **Web search**, for every model. Settings' "Search the Web" (`Engine.webSearchKey`,
-  off by default) plus the user's own Tavily API key (Keychain, `WebSearcher`; Ollama's own web
-  search needs paid credits). This device runs every search (`WebSearcher.search`), at most
-  `MacLink.searchRounds` / `LlamaModel.searchLimit` (3) per reply; a failed search never fails the
-  reply: the model is told why and answers anyway. Each search (`WebSearch`, in LlamaKit: query,
-  trimmed results, or the error) is kept on the reply (`StoredMessage.searches`,
-  `ChatMessage.searches`) and sent back with the history as the call and `WebSearch.modelText`,
-  rendered from those fields only. The tool has an optional `topic` (`general` or `news`): the
-  model picks `news` for anything recent, which searches Tavily's news index. Its default index
-  answered "today's sports news" with archived pages years old. A forced time range doesn't
-  help either: it ruins ordinary questions. `WebSearch.topic` is kept exactly as the model wrote it,
-  so the call renders back byte for byte. Results carry `published` ("Nov 25, 2026"), shown to the
-  model and in the sources menu; older stored searches have neither and render as before.
-  The cell shows "Searched for “…”" with the sources in its menu.
-  - Computer: models listed with `tools` are offered `web_search` per request
-    (`MacLink.stream(search:)`); a call goes back as an assistant `tool_calls` turn and a `tool`
-    message with its `tool_call_id` (stored searches get ids `call_1`… in order). Five results of 1,500 characters.
-  - Gemma and Qwen: the tool is declared in the system turn (`ChatMessage.tools` on the system
-    message, set by `Engine.systemMessage`), so switching search changes the prompt and the next
-    reply reads the chat again. `LlamaModel.run` collects a call between `toolCallStart` and
-    `toolCallEnd` (never shown), runs the search and appends `renderToolResult` to the cache: Gemma
-    continues its turn, Qwen gets a `<tool_response>` user turn and a new reply. Append-only, so
-    Qwen's cache and saved states work as for any turn. Three results of 700 characters (8K context).
-    Check with `lantern-smoke <file> --search [--think]` (TAVILY_API_KEY) and `--render`, whose tool
-    cases must match the GGUF's Jinja.
-  - Apple Intelligence: a Foundation Models `Tool` (`WebSearchTool`, same name and description) on
-    the chat's session, there only when the system message declares search, so switching rebuilds
-    the session. Each reply points the session's `SearchSink` at its own stream, which collects that
-    reply's searches. A rebuilt session gets them back as tool call and tool output entries. Three
-    results of 500 characters.
-  - Debug builds take the key from `TAVILY_API_KEY` in the environment (`SIMCTL_CHILD_TAVILY_API_KEY=…
-    simctl launch … -searchtest [-model <name> | -apple]` for the computer or Apple Intelligence); `-ui search` shows a reply that searched.
-- **One on-device model loaded at a time.** `Engine.load` frees the old one first. It stays
-  loaded while Lantern is in front and is unloaded on a memory warning or on leaving the app,
-  after its state is saved; `Engine.prepare` (called when a chat opens) loads it again.
-- **Per-model settings live in `CatalogModel.options`.** Gemma: F16 KV cache (faster, small),
-  `lazy_mode` (halves cold load) and its drafter. Batch 1024 for all, cheap because logits outputs are
-  capped (`n_outputs_max`). `swa_full` is off for any model that can't rewind.
-- **Apple Intelligence runs out of process.** On devices under 7 GB the loaded llama model is saved
-  and unloaded before an Apple request. In the background it's treated like the Mac (no GPU needed).
-  A chat too long for its context fails with `.contextFull` like the others (or trims when asked).
-- **The system prompt is neutral.** Outages are why Lantern exists, not something the models should
-  assume: no disaster or emergency framing in the prompt, starters or copy.
+  files as `<file name="…">…</file>`, then the text; images in `ChatMessage.images`. Never derive
+  it again from the date, settings or files.
+- **Think First and Search the Web are per chat** (`Conversation.thinking`, `.webSearch`), set in
+  the model picker; new chats start with the last choices (`ChatDefaults`). Settings holds only
+  the Tavily key (Keychain). Without a key the picker's search row leads to Settings.
+- **Web search** (`WebSearcher`, at most 3 per reply; a failed search never fails the reply). For
+  Gemma the tool is declared in the system turn (`Engine.systemMessage`, from the chat's flag and
+  the key), so flipping it makes the next reply read the chat again; the Mac is offered it per
+  request. Searches are stored on the reply (`StoredMessage.searches`) and rendered back from
+  those fields byte for byte, `topic` exactly as the model wrote it (`news` for anything recent).
+- **Images** go through the model's projector, loaded only when a chat has one; each is encoded
+  once. The Mac gets `image_url` data URLs if its model lists `vision`.
+- **Leaving the app** stops an on-device reply ("Stopped when you left Lantern") and unloads the
+  model after saving its state; a Mac reply gets the few seconds iOS allows. No notifications.
+- **Comparing** is a second answer to the last question (`Engine.compare`): A stays, only B runs;
+  both sit in the reply's `versions` with a shared `compareID`. B may be the same model with
+  thinking the other way. A B with nothing to show undoes the pair.
+- **The chats sync through iCloud** (`ChatStore`: SwiftData's CloudKit mirror, private database,
+  `iCloud.com.merimerimeri.Lantern`, the same on iOS and the Mac). The store is each platform's
+  existing one, so chats already in it upload on the first sync. CloudKit's rules hold: every
+  property defaulted, no unique constraints, no relationships. Without an iCloud account it's a
+  local store and Settings says so; a build without the entitlement opens it without CloudKit.
+  Saved model states stay in Caches. Streaming replies sync with the ~5 s saves (accepted).
+- **Stored data changes are additive** (`Conversation`, `StoredMessage`, `ReplyMetrics`: new
+  properties with defaults; unused ones stay, like `pinned` and the old timings). Never name a
+  stored property after an NSManagedObject key (`updated`, `deleted`…).
+- **`Conversation.stateID` never changes** once set.
+- **The system prompt is neutral**: no disaster framing in the prompt, starters or copy.
 - **Offline first.** Nothing may need the network to launch or to open an existing chat.
-- **Conversation changes are additive** (new stored properties with defaults, like `pinned`), so
-  SwiftData migrates existing chats without a schema version. The same goes for `StoredMessage`
-  and `ChatMessage` (optional `attachments`, `dateNote`, `images`), which are also in saved states.
-- **Never name a stored property after an NSManagedObject key** (`updated`, `deleted`, `inserted`,
-  `faulted`…). SwiftData sits on Core Data, which read `Conversation.updated` as `isUpdated`, so
-  every save stored 0. `lastActive` replaced it (`Conversation.repairActivity` fills old chats).
-- **A chat's outside identity is `Conversation.stateID`** (`externalID`): deep links, Spotlight
-  items and `ChatEntity` all use it, so it must never change once set.
-- **No App Group.** It would have to be registered in the developer portal by hand. The widgets only
-  deep-link; there is no share extension, because one can't open the app without an unsupported
-  responder-chain trick. From the share sheet, a user's own Shortcut ("Show in Share Sheet",
-  Shortcut Input → Ask Lantern) does it.
-- **Menu bar shortcuts are idempotent.** ⌘1–5 and ⌘. exist both in `LanternCommands` and as
-  `UIKeyCommand`s on `ChatViewController`; whichever UIKit routes the key to, it sets the same mode
-  or cancels the same task.
-- Distributed by TestFlight with a monthly rebuild, like Quill. A build stops launching 90 days after
-  upload; the Models page shows the date from `LanternBuildDate`, stamped into Info.plist at build time,
-  and offers local reminders 14 and 3 days before (permission is asked from that button, never at
-  launch).
-- **CI signs two targets.** `Tools/app_store_connect_signing.rb prepare` finds or creates an App Store
-  profile per bundle ID, named after the certificate: `Lantern App Store <cert id>` for
-  `com.merimerimeri.Lantern` and `Lantern Widgets App Store <cert id>` for
-  `com.merimerimeri.Lantern.Widgets`. The archive passes their names as `LANTERN_APP_PROFILE` and
-  `LANTERN_WIDGETS_PROFILE`, which each target's `PROVISIONING_PROFILE_SPECIFIER` reads (empty
-  locally, where signing is automatic). Never pass `PROVISIONING_PROFILE_SPECIFIER` itself: it would
-  apply to both targets. A new extension needs the same: bundle ID, profile, specifier variable and
-  an ExportOptions entry.
-- **Comparing two models** is a second answer to the last question, not a mode: the answer menu's
-  "Compare With" (`Engine.compare`) keeps the current answer as A and runs only B; both sit in the
-  reply's `versions` with a shared `ReplyMetrics.compareID` (`StoredMessage.comparison`). A B that
-  fails or is stopped before any text shows A again and undoes the pair. The footer's Compare
-  button opens `CompareView` (`Lantern/Compare`, a sheet of `ChatScreen`: columns on iPad, A | B on
-  iPhone, the metrics table, Prefer and Continue With). Only speed and the time to answer after
-  reading (first answer word less reading, finding the Mac and connecting) are ranked; load,
-  reading, first token and answer time depend on memory, the network or the answer's length.
-  B may be A's own model with thinking the other way:
-  Compare With opens `ComparePicker` (the model picker with a Think First switch for B), and
-  `ReplyMetrics.labeledTitle` adds "· Thinking" to tell the sides apart; Continue With takes the
-  answer's thinking too. `-ui compare[:b][:metrics]` seeds and shows one, `-ui compare:picker` the picker.
+- **The only `lantern://` link is `pair`** (`PairOffer`), from the Mac's QR code.
+- **The amber accent takes black text** (`ProminentLabel`): white on it is about 2.3:1.
+- Distributed by TestFlight with a monthly rebuild; a build stops launching 90 days after upload
+  and Settings shows the date (`LanternBuildDate`, stamped at build time). CI signs the one target
+  with `Lantern App Store <cert id>`, passed as `LANTERN_APP_PROFILE`; the Mac with `Lantern
+  Developer ID <cert id>` (`MAC_CATALYST_APP_DIRECT`) as `LANTERN_MAC_PROFILE`. Both need the
+  bundle ID's iCloud container, which the ASC API can't assign (the portal or Xcode does, once);
+  a profile without it is deleted and made again. MARKETING_VERSION is 2.0.0; CI sets it from
+  the tag and the build number from the run (the Mac's above the published appcast's).

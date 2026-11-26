@@ -103,6 +103,7 @@ private final class AnswerTextView: UITextView {
     private func makeCopyButton(index: Int) -> HitButton {
         let button = HitButton(configuration: .plain())
         button.isPointerInteractionEnabled = true
+        button.showsHover()
         style(button, copied: false)
         button.addAction(UIAction { [weak self] _ in self?.copyCode(index) }, for: .primaryActionTriggered)
         addSubview(button)
@@ -233,8 +234,7 @@ struct AssistantContent {
     var live: LiveReply?
     var status: ReplyStatus?
     var thinkingExpanded = false
-    var isSpeaking = false
-    /// Buttons under an error: Retry, Open Readiness, Check the Mac.
+    /// Buttons under an error: Retry, Download, Check the Mac.
     var errorActions: [UIAction] = []
 }
 
@@ -257,13 +257,12 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     private let previousButton = HitButton(configuration: .plain())
     private let nextButton = HitButton(configuration: .plain())
     private let versionLabel = UILabel()
-    private let stopSpeakingButton = HitButton(configuration: .plain())
     private let moreButton = HitButton(configuration: .plain())
     /// Opens the comparison, on an answer that has one.
     private let compareButton = HitButton(configuration: .plain())
     private lazy var statusRow = UIStackView(arrangedSubviews: [glow, status])
     private lazy var versionRow = HitStackView(arrangedSubviews: [previousButton, versionLabel, nextButton])
-    private lazy var footerButtons = HitStackView(arrangedSubviews: [compareButton, stopSpeakingButton, moreButton])
+    private lazy var footerButtons = HitStackView(arrangedSubviews: [compareButton, moreButton])
     /// Keeps the buttons at the trailing edge while the footnote is on its own line below.
     private let footerSpacer = UIView()
     /// One row, or at accessibility text sizes a column (pager, then footnote, then buttons), so the
@@ -278,7 +277,6 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     var onToggleThinking: (() -> Void)?
     /// -1 for the previous answer to this question, +1 for the next.
     var onSwitchVersion: ((Int) -> Void)?
-    var onStopSpeaking: (() -> Void)?
     var onCompare: (() -> Void)?
     /// The message's actions, built when a menu opens so they're never stale.
     var menuItems: (() -> [UIMenuElement])?
@@ -320,6 +318,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         thinkingButton.configuration = config
         thinkingButton.contentHorizontalAlignment = .leading
         thinkingButton.isPointerInteractionEnabled = true
+        thinkingButton.showsHover()
         thinkingButton.addAction(UIAction { [weak self] _ in self?.onToggleThinking?() }, for: .primaryActionTriggered)
 
         var search = config
@@ -330,6 +329,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         searchButton.configuration = search
         searchButton.contentHorizontalAlignment = .leading
         searchButton.isPointerInteractionEnabled = true
+        searchButton.showsHover()
         searchButton.showsMenuAsPrimaryAction = true
         searchButton.isHidden = true
 
@@ -359,7 +359,6 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         footnote.numberOfLines = 0
 
         for (button, symbol, label) in [(moreButton, "ellipsis.circle", "More"),
-                                        (stopSpeakingButton, "stop.circle", "Stop reading"),
                                         (previousButton, "chevron.left", "Previous answer"),
                                         (nextButton, "chevron.right", "Next answer")] {
             button.configuration?.image = UIImage(systemName: symbol)
@@ -370,21 +369,20 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
             button.setContentHuggingPriority(.required, for: .horizontal)
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: minimumTarget).isActive = true
+            button.showsHover()
         }
         // Narrow frames so the pager and ⋯ sit compactly, each with a 44 × 44 pt touch area that
         // reaches into the space beside it but never into a neighbour's: ‹ covers 0–44 (over the
         // start of "1/2"), › starts after the label and reaches into the gap before the footnote,
-        // ⋯ and stop reach back into the 12 pt gap before them.
+        // ⋯ reaches back into the 12 pt gap before it.
         for button in [previousButton, nextButton] {
             button.widthAnchor.constraint(equalToConstant: 24).isActive = true
         }
         previousButton.hitOutsets = UIEdgeInsets(top: 0, left: 0, bottom: 0, right: 20)
         nextButton.hitOutsets = UIEdgeInsets(top: 0, left: 4, bottom: 0, right: 16)
-        for button in [stopSpeakingButton, moreButton] {
-            button.widthAnchor.constraint(equalToConstant: 32).isActive = true
-            button.hitOutsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 0)
-        }
+        moreButton.widthAnchor.constraint(equalToConstant: 32).isActive = true
+        moreButton.hitOutsets = UIEdgeInsets(top: 0, left: 12, bottom: 0, right: 0)
         moreButton.showsMenuAsPrimaryAction = true
         moreButton.menu = UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] done in
             done(self?.menuItems?() ?? [])
@@ -403,17 +401,17 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         }
         compareButton.configuration = compare
         compareButton.isPointerInteractionEnabled = true
+        if Device.isMac { compareButton.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 6, bottom: 4, trailing: 6) }
+        compareButton.showsHover()
         compareButton.accessibilityLabel = "Compare answers"
         compareButton.setContentHuggingPriority(.required, for: .horizontal)
         compareButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         compareButton.addAction(UIAction { [weak self] _ in self?.onCompare?() }, for: .primaryActionTriggered)
         compareButton.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            compareButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
-            compareButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            compareButton.widthAnchor.constraint(greaterThanOrEqualToConstant: minimumTarget),
+            compareButton.heightAnchor.constraint(greaterThanOrEqualToConstant: minimumTarget),
         ])
-        stopSpeakingButton.configuration?.baseForegroundColor = GlowView.amber
-        stopSpeakingButton.addAction(UIAction { [weak self] _ in self?.onStopSpeaking?() }, for: .primaryActionTriggered)
         previousButton.addAction(UIAction { [weak self] _ in self?.onSwitchVersion?(-1) }, for: .primaryActionTriggered)
         nextButton.addAction(UIAction { [weak self] _ in self?.onSwitchVersion?(1) }, for: .primaryActionTriggered)
         versionLabel.font = .monospacedDigitSystemFont(
@@ -531,7 +529,6 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         let thinking = live?.thinking ?? message.thinking
         text = live?.text ?? message.content
         #if DEBUG
-        if let sample = MarkdownSample.override { text = sample }
         #endif
 
         // While it's being written: the glow, what it's doing and for how long, and progress.
@@ -584,15 +581,14 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
             config.imagePadding = 4
             let button = UIButton(configuration: config, primaryAction: action)
             button.isPointerInteractionEnabled = true
-            button.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            button.heightAnchor.constraint(greaterThanOrEqualToConstant: minimumTarget).isActive = true
             errorRow.addArrangedSubview(button)
         }
         errorRow.addArrangedSubview(UIView())  // keeps the buttons at their natural width
         errorRow.isHidden = errorRow.arrangedSubviews.count == 1
 
         var notes: [String] = []
-        if ReplyDetails.shown, let seconds = message.thoughtSeconds, !thinking.isEmpty { notes.append("Thought \(PhaseClock.format(Int(seconds.rounded())))") }
-        if let f = message.footnote { notes.append(ReplyDetails.shown ? f : ReplyDetails.essentials(of: f)) }
+        if let f = message.footnote { notes.append(ReplyFootnote.shown(f)) }
         notes.removeAll(where: \.isEmpty)
         footnote.text = notes.joined(separator: " · ")
 
@@ -606,7 +602,6 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
         nextButton.accessibilityValue = previousButton.accessibilityValue
 
         compareButton.isHidden = message.comparison == nil || live != nil
-        stopSpeakingButton.isHidden = !content.isSpeaking
         moreButton.isHidden = live != nil
         footerRow.isHidden = live != nil
         footnote.isHidden = live != nil  // also when it's below the row
@@ -674,9 +669,36 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
     }
 }
 
-/// A button whose touch and pointer target is at least 44 points square, however small it looks.
+/// The smallest a control's target gets: 44 pt for a finger, 28 for the Mac's pointer.
+let minimumTarget: CGFloat = Device.isMac ? 28 : 44
+
+extension UIView {
+    /// The Mac: a faint rounded fill while the pointer is over the control, as a Mac's borderless
+    /// buttons have. Nothing elsewhere, where the pointer effect does it.
+    func showsHover(radius: CGFloat = 6) {
+        #if targetEnvironment(macCatalyst)
+        addGestureRecognizer(UIHoverGestureRecognizer(target: HoverFill.shared, action: #selector(HoverFill.hover(_:))))
+        layer.cornerRadius = radius
+        layer.cornerCurve = .continuous
+        #endif
+    }
+}
+
+#if targetEnvironment(macCatalyst)
+private final class HoverFill: NSObject {
+    static let shared = HoverFill()
+
+    @objc func hover(_ recognizer: UIHoverGestureRecognizer) {
+        let inside = recognizer.state == .began || recognizer.state == .changed
+        recognizer.view?.backgroundColor = inside ? .quaternarySystemFill : .clear
+    }
+}
+#endif
+
+/// A button whose touch and pointer target is at least 44 points square (28 on the Mac), however
+/// small it looks.
 final class HitButton: UIButton {
-    var minimumHitSize: CGFloat = 44
+    var minimumHitSize: CGFloat = minimumTarget
     /// How far the touch area reaches past each edge, instead of growing evenly to `minimumHitSize`.
     var hitOutsets: UIEdgeInsets?
 

@@ -6,7 +6,8 @@ import FoundationModels
 /// A chat's title. It starts as the first question (`provisional`); after the first answer, Apple
 /// Intelligence's on-device model, when it's on, sums the chat up in a few words. A title the user
 /// typed is never replaced: only one still equal to the question (as this or an older version set
-/// it) counts as automatic. Without Apple Intelligence the title stays the question.
+/// it) counts as automatic. Without Apple Intelligence the title stays the question. This is the
+/// only thing Lantern asks Apple Intelligence: it never answers a chat.
 @MainActor
 final class ChatTitler {
     static let shared = ChatTitler()
@@ -14,6 +15,17 @@ final class ChatTitler {
     private var queue: [Conversation] = []
     private var working = false
     private var backfilled = false
+
+    /// Whether Apple Intelligence's model can be asked: iOS 26, turned on, and ready. The
+    /// system's own flag; nothing here waits or needs the network.
+    static var isAvailable: Bool {
+        #if canImport(FoundationModels)
+        guard #available(iOS 26, macOS 26, *) else { return false }
+        return SystemLanguageModel.default.availability == .available
+        #else
+        return false
+        #endif
+    }
 
     /// The title a chat gets when its first question is sent.
     static func provisional(text: String, attachments: [Attachment]) -> String {
@@ -33,14 +45,14 @@ final class ChatTitler {
 
     /// After an answer: titles the chat if it still has its automatic title.
     func titleIfNeeded(_ c: Conversation) {
-        guard AppleStatus.current.isAvailable, Self.hasAutomaticTitle(c),
+        guard Self.isAvailable, Self.hasAutomaticTitle(c),
               c.messages.contains(where: { !$0.isUser && !$0.content.isEmpty }) else { return }
         enqueue(c)
     }
 
     /// Once a launch: titles the recent chats that still have their question as the title.
     func backfill(_ chats: [Conversation]) {
-        guard !backfilled, AppleStatus.current.isAvailable else { return }
+        guard !backfilled, Self.isAvailable else { return }
         backfilled = true
         for c in chats.prefix(40) where Self.hasAutomaticTitle(c) && c.messages.contains(where: { !$0.isUser && !$0.content.isEmpty }) {
             enqueue(c)

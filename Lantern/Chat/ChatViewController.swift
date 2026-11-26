@@ -9,24 +9,23 @@ import UniformTypeIdentifiers
 /// The chat: a UIKit transcript and message box, hosted in SwiftUI's split view. UIKit because this
 /// is where the work is: streaming text into a cell without reloading it, selectable answers with
 /// tappable phone numbers, keeping to the bottom only while you're there, and hardware-keyboard
-/// commands. The status strip and the empty-chat view are SwiftUI views hosted inside it.
+/// commands. The empty-chat view is a SwiftUI view hosted inside it.
 final class ChatViewController: UIViewController, UICollectionViewDelegate {
     let conversation: Conversation
     private let engine: Engine
 
     // Hooks for the app around the chat. Each does nothing until set.
-    /// Opens Readiness, to download a model. The error "Open Readiness" button and the mode menu's
-    /// "Get Models" item only appear once this is set.
-    var onOpenReadiness: (() -> Void)?
-    /// Opens Settings, where the Mac's address is. "Check the Mac" opens it if the Mac still can't be reached.
+    /// Opens the page that downloads this device's model.
+    var onGetModel: (() -> Void)?
+    /// Opens Settings: the Mac's pairing, the web search key.
     var onOpenSettings: (() -> Void)?
     /// Shows another chat in this window ("Continue in New Chat").
     var onOpenChat: ((Conversation) -> Void)?
     /// Called when typing starts in a chat whose model isn't loaded (or whose Mac route isn't known),
     /// to get it ready before Send. Must return at once (e.g. start `Engine.prepare` in a Task).
     var onBeginTyping: (() -> Void)?
-    /// Opens `CompareView` for a reply (its id, and whether to start on B).
-    var onShowComparison: ((UUID, Bool) -> Void)?
+    /// Opens `CompareView` for a reply.
+    var onShowComparison: ((UUID) -> Void)?
 
     private var collectionView: UICollectionView!
     private var dataSource: UICollectionViewDiffableDataSource<Int, UUID>!
@@ -46,9 +45,6 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     private var editingID: UUID?
     private var draftBeforeEdit = ""
     private var attachmentsBeforeEdit: [Attachment] = []
-    private let dictation = Dictation()
-    /// What was in the field when dictation started; what's heard goes after it.
-    private var dictationPrefix = ""
     private var draftSave: Task<Void, Never>?
     private var wasTyping = false
 
@@ -108,14 +104,12 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
                 : view.dequeueConfiguredReusableCell(using: assistant, for: indexPath, item: id)
         }
 
-        let status = host(StatusStrip(conversation: conversation))
-        composer = ComposerView(statusView: status.view)
+        composer = ComposerView()
         composer.translatesAutoresizingMaskIntoConstraints = false
         composer.onSend = { [unowned self] in send(composer.text) }
         composer.onStop = { [unowned self] in engine.stop() }
         composer.onTextChange = { [unowned self] text in textChanged(text) }
         composer.onCancelEdit = { [unowned self] in cancelEditing() }
-        composer.onMic = { [unowned self] in toggleDictation() }
         composer.textView.onPasteFiles = { [unowned self] providers in attach(providers) }
         for button in [composer.modeButton, composer.modeIconButton] {
             button.addAction(UIAction { [unowned self, unowned button] _ in showModelPicker(from: button) }, for: .primaryActionTriggered)
@@ -160,23 +154,12 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             jumpButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
         ])
 
-        Speaker.shared.onChange = { [weak self] in self?.reconfigureVisibleAnswers() }
-        // Settings' "Speed and tokens" switch: redraw the answers' footnotes when it changes.
-        showsMetrics = ReplyDetails.shown
-        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, self.showsMetrics != ReplyDetails.shown else { return }
-                self.showsMetrics = ReplyDetails.shown
-                self.reconfigureVisibleAnswers()
-            }
-        }
         // A tap on the transcript (or the new chat's page) away from the message box puts the keyboard away.
         let tapAway = UITapGestureRecognizer(target: self, action: #selector(tappedTranscript))
         tapAway.cancelsTouchesInView = false
         collectionView.addGestureRecognizer(tapAway)
         // Files dropped anywhere on the chat are attached (text dropped on the field is typed).
         view.addInteraction(UIDropInteraction(delegate: self))
-        setUpDictation()
         refresh()
     }
 
@@ -187,40 +170,24 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         observeJump()
         // Ready to type on iPad and Mac; on iPhone the keyboard would cover a chat you came to read.
         // A new chat is the page the app opens on, with its prompt ideas: there the on-screen
-        // keyboard stays down, so only with a hardware keyboard. Not behind a sheet (Settings,
-        // Readiness), whose keyboard-covered content would be hidden.
+        // keyboard stays down, so only with a hardware keyboard. Not behind a sheet (Settings),
+        // whose keyboard-covered content would be hidden.
         let keyboardOK = !conversation.messages.isEmpty || GCKeyboard.coalesced != nil
         if traitCollection.userInterfaceIdiom != .phone, keyboardOK,
            view.window?.rootViewController?.presentedViewController == nil {
             composer.textView.becomeFirstResponder()
         }
-        engine.prepare(mode: conversation.mode, for: conversation)  // load the model before the first message
+        engine.prepare(conversation)  // load the model before the first message
         #if DEBUG
-        // -ui compare (or compare:b, with :metrics to scroll to the table): the seeded comparison, once the chat has settled.
-        // -ui compare:chat: the seeded comparison's chat, without opening the sheet; compare:picker:
-        // its Compare With picker.
-        if let ui = DebugLaunch.ui, ui.hasPrefix("compare"), ui != "compare:chat",
-           let reply = conversation.messages.last, reply.comparison != nil {
+        // -ui picker | compare | comparepicker: that sheet, once the chat has settled.
+        if let ui = DebugLaunch.ui, ["picker", "compare", "comparepicker"].contains(ui) {
             Task { [weak self] in
                 try? await Task.sleep(for: .seconds(1))
-                if ui == "compare:picker" { self?.showComparePicker(for: reply.id); return }
-                self?.showComparison(reply.id, startOnB: ui.hasPrefix("compare:b"))
-            }
-        }
-        // -ui composer:focus|composer:text|modelmenu|modelmenu:collapsed: the message box expanded
-        // (focused, or holding a draft without the keyboard) or the model menu open.
-        if let ui = DebugLaunch.ui, ui.hasPrefix("composer") || ui.hasPrefix("modelmenu") {
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(1))
-                guard let self else { return }
+                guard let self, let reply = conversation.messages.last else { return }
                 switch ui {
-                case "composer:focus": composer.textView.becomeFirstResponder()
-                case "composer:text": composer.text = "What should I plant next to tomatoes?"
-                case "modelmenu":
-                    composer.text = " "
-                    try? await Task.sleep(for: .milliseconds(500))
-                    showModelPicker(from: composer.modeButton)
-                case "modelmenu:collapsed": showModelPicker(from: composer.modeIconButton)
+                case "picker": showModelPicker(from: composer.modeIconButton)
+                case "compare" where reply.comparison != nil: showComparison(reply.id)
+                case "comparepicker" where !reply.isUser: showComparePicker(for: reply.id)
                 default: break
                 }
             }
@@ -230,7 +197,6 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        dictation.stop()
         saveDraft()
     }
 
@@ -291,8 +257,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         composer.isRunning = runningHere
         composer.canSend = !engine.isBusy
         composer.isEditingMessage = editingID != nil
-        composer.placeholderText = dictation.isRunning ? "Listening…"
-            : engine.isBusy && !runningHere ? "Another chat is answering…" : "Ask \(conversation.modelTitle)"
+        composer.placeholderText = engine.isBusy && !runningHere ? "Another chat is answering…"
+            : MacLink.isConfigured ? "Ask \(conversation.modelTitle)" : "Message"  // who answers, once there's a choice
         updateModeButton()
         updateAttachMenu()
 
@@ -355,10 +321,9 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         var content = AssistantContent(message: m, live: live)
         if let live {
             clock.observe(live)
-            content.status = clock.status(for: live, modelName: modelName(for: live.mode))
+            content.status = clock.status(for: live, modelName: conversation.modelTitle)
         }
         content.thinkingExpanded = expanded.contains(id)
-        content.isSpeaking = Speaker.shared.speaking == id
         content.errorActions = errorActions(for: m)
         cell.configure(content)
         cell.menuItems = { [unowned self] in answerMenuItems(id) }
@@ -369,25 +334,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             dataSource.apply(snapshot, animatingDifferences: true)
         }
         cell.onSwitchVersion = { [unowned self] delta in switchVersion(id, by: delta) }
-        cell.onStopSpeaking = { Speaker.shared.stop() }
         cell.onCompare = { [unowned self] in showComparison(id) }
     }
 
-    private func modelName(for mode: Mode) -> String? {
-        mode == .mac ? conversation.modelTitle : mode == .apple ? mode.title : engine.model(for: mode)?.name
-    }
-
-    private var showsMetrics = true
-
     @objc private func tappedTranscript() {
         if composer.textView.isFirstResponder { composer.textView.resignFirstResponder() }
-    }
-
-    private func reconfigureVisibleAnswers() {
-        var snapshot = dataSource.snapshot()
-        let ids = collectionView.indexPathsForVisibleItems.compactMap { dataSource.itemIdentifier(for: $0) }
-        snapshot.reconfigureItems(ids.filter { message($0)?.isUser == false })
-        dataSource.apply(snapshot, animatingDifferences: false)
     }
 
     // MARK: - Actions
@@ -396,12 +347,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = composer.attachments
         guard !text.isEmpty || !attachments.isEmpty, !engine.isBusy else { return }
-        dictation.stop()
         // Edit & Resend: the conversation goes back to just before the edited message.
-        if let id = editingID, let i = conversation.index(of: id) {
-            Speaker.shared.stop()
-            conversation.messages.removeSubrange(i...)
-        }
+        if let id = editingID, let i = conversation.index(of: id) { conversation.messages.removeSubrange(i...) }
         editingID = nil
         composer.text = ""
         composer.attachments = []
@@ -409,24 +356,23 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         wasTyping = false
         saveDraft()
         isPinned = true
+        ChatDefaults.remember(conversation)
         engine.send(text, attachments: attachments, in: conversation)
         refresh()
     }
 
     /// Retry keeps the answer it replaces: the new one gets the old ones as its other versions
     /// (`Engine.retry` does that).
-    private func retry(_ mode: Mode, macModel: String? = nil) {
+    private func retry() {
         guard let old = conversation.messages.last, !old.isUser, !engine.isBusy else { return }
-        if Speaker.shared.speaking == old.id { Speaker.shared.stop() }
         isPinned = true
-        engine.retry(in: conversation, mode: mode, macModel: macModel)
+        engine.retry(in: conversation)
         refresh()
     }
 
     /// Answers the last question again with `other`, keeping both answers as a pair to compare.
     private func compare(with other: ModelChoice, thinking: Thinking) {
         guard let old = conversation.messages.last, !old.isUser, !engine.isBusy else { return }
-        if Speaker.shared.speaking == old.id { Speaker.shared.stop() }
         isPinned = true
         engine.compare(in: conversation, with: other, thinking: thinking)
         refresh()
@@ -434,9 +380,7 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     /// The two answers side by side, with how each was made. Presented by `ChatScreen` in
     /// SwiftUI, so the sheet goes away with this chat when another one is selected or opened.
-    func showComparison(_ id: UUID, startOnB: Bool = false) {
-        onShowComparison?(id, startOnB)
-    }
+    func showComparison(_ id: UUID) { onShowComparison?(id) }
 
     private func switchVersion(_ id: UUID, by delta: Int) {
         guard live?.id != id, let i = conversation.index(of: id) else { return }
@@ -477,54 +421,68 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         dataSource.apply(snapshot, animatingDifferences: false)
     }
 
-    /// `macModel`: for `.mac`, which of the Mac's models. Picking one also makes it the one new
-    /// Mac chats start with.
-    private func setMode(_ mode: Mode, macModel: String? = nil) {
+    private func setMode(_ mode: Mode) {
         guard live == nil else { return }
         conversation.mode = mode
-        if let macModel {
-            conversation.macModel = macModel
-            UserDefaults.standard.set(macModel, forKey: MacLink.modelKey)
-        }
+        ChatDefaults.remember(conversation)
+        engine.prepare(conversation)
         refresh()
     }
 
-    private func isAvailable(_ mode: Mode) -> Bool {
-        guard mode.isOnDevice else { return true }  // the Mac may come back; it's badged, not disabled
-        if mode == .apple { return engine.apple.status.isAvailable }
-        return engine.model(for: mode).map { engine.store.states[$0.id] == .ready } ?? false
-    }
-
-    /// One entry per model: the Gemmas, Qwen and Apple Intelligence on this device, then each of
-    /// Ollama's models on the Mac.
-    private var choices: (device: [ModelChoice], mac: [ModelChoice]) {
-        let device = Mode.allCases.filter(\.isOnDevice).map { ModelChoice(mode: $0, macModel: nil) }
-        var names = engine.mac.models
-        // The chat's own model even if the Mac hasn't been checked yet (or no longer lists it).
-        let current = conversation.resolvedMacModel
-        if !current.isEmpty, !names.contains(current) { names.insert(current, at: 0) }
-        let mac = names.isEmpty ? [ModelChoice(mode: .mac, macModel: nil)] : names.map { ModelChoice(mode: .mac, macModel: $0) }
-        return (device, mac)
-    }
-
-    private func isCurrent(_ choice: ModelChoice) -> Bool {
-        guard choice.mode == conversation.mode else { return false }
-        return choice.mode != .mac || choice.macModel == nil || choice.macModel == conversation.resolvedMacModel
-    }
-
     private func updateModeButton() {
-        let mode = conversation.mode
+        let mode = conversation.answeringMode
         let title = conversation.modelTitle
         composer.setMode(title: title, symbol: mode.symbol)
         composer.modeButton.accessibilityLabel = "Model"
-        composer.modeButton.accessibilityValue = mode == .apple ? "\(title), on this device"
-            : "\(title), \(mode.isOnDevice ? "on this device" : "on your \(engine.mac.computerName)"), thinking \(conversation.thinking == .off ? "off" : "on")"
+        var value = "\(title), on \(mode == .mac ? (Device.isMac ? engine.mac.computerName : "your Mac") : "this \(Device.name)")"
+        if conversation.thinking != .off { value += ", thinks first" }
+        if conversation.webSearch, WebSearcher.hasKey { value += ", searches the web" }
+        composer.modeButton.accessibilityValue = value
         composer.modeButton.isEnabled = live == nil
-
         composer.syncModeIcon()
     }
 
     // MARK: - Model picker
+
+    /// The two models, as the picker's rows (on a Mac, only the Mac's). `current`: which one is
+    /// checked, if any.
+    private func modelRows(current: Mode?) -> [ModelPicker.Row] {
+        if Device.isMac { return [macRow(current: current)] }
+        let store = engine.store
+        let deviceNote: String = if store.isReady {
+            "On this \(Device.name)"
+        } else if case .downloading(let p) = store.state {
+            "Downloading · \(Int(p * 100))%"
+        } else {
+            "Not downloaded yet"
+        }
+        let device = ModelPicker.Row(choice: .device, title: store.model.name, symbol: Mode.device.symbol, note: deviceNote,
+                                     enabled: true, current: current == .device)
+        return [device, macRow(current: current)]
+    }
+
+    /// The Mac's model. An unpaired Mac is never the selected model: its row leads to where it's
+    /// paired (on a Mac that serves, it's on its way).
+    private func macRow(current: Mode?) -> ModelPicker.Row {
+        let choice = ModelChoice(mode: .mac, macModel: nil)
+        guard MacLink.isConfigured else {
+            #if targetEnvironment(macCatalyst)
+            if MacRole.current == .serve {
+                return ModelPicker.Row(choice: choice, title: "Inkling", symbol: "desktopcomputer",
+                                       note: "Starting on this Mac", enabled: false, current: false)
+            }
+            #endif
+            return ModelPicker.Row(choice: choice, title: Device.isMac ? "Inkling" : "Mac", symbol: "desktopcomputer",
+                                   note: "Pair in Settings", enabled: true, current: false, opens: true)
+        }
+        let model = conversation.resolvedMacModel
+        let reachable = engine.mac.route != .unreachable
+        let place = MacLink.lanHost.hasPrefix("127.0.0.1") ? "On this Mac" : "On \(engine.mac.computerName)"
+        return ModelPicker.Row(
+            choice: choice, title: model.isEmpty ? "Mac" : MacLink.displayName(model),
+            symbol: "desktopcomputer", note: place + (reachable ? "" : " · Not reachable"),
+            enabled: true, current: current == .mac)
+    }
 
     /// The model button's picker (`ModelPicker`). On iPhone the keyboard goes down while it's up,
     /// or it would sit over the sheet, and comes back after.
@@ -539,41 +497,54 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             guard let host else { return then() }
             host.dismiss(animated: true, completion: then)
         }
-        let thinking: Binding<Bool>? = conversation.mode == .apple ? nil : Binding(
+        let thinking = Binding(
             get: { [unowned self] in conversation.thinking != .off },
             set: { [unowned self] on in
                 conversation.thinking = on ? .high : .off
+                ChatDefaults.remember(conversation)
                 refresh()
             })
-        var getModels: (() -> Void)?
-        if let open = onOpenReadiness, Mode.allCases.contains(where: { $0.usesLlama && !isAvailable($0) }) {
-            getModels = { close(open) }
-        }
+        let search = Binding(
+            get: { [unowned self] in conversation.webSearch },
+            set: { [unowned self] on in
+                conversation.webSearch = on
+                ChatDefaults.remember(conversation)
+                engine.prepare(conversation)  // the system turn changed: read it while the question is typed
+                refresh()
+            })
+        let openSettings = { [unowned self] in close { self.onOpenSettings?() } }
         let picker = ModelPicker(
-            groups: { [unowned self] _ in pickerGroups() },
+            rows: { [unowned self] _ in modelRows(current: conversation.answeringMode) },
             thinking: thinking,
+            search: search,
+            setUpSearch: openSettings,
             select: { [unowned self] choice in
-                setMode(choice.mode, macModel: choice.macModel)
+                // An unpaired Mac can't answer: its row leads to where it's paired.
+                if choice.mode == .mac, !MacLink.isConfigured { return openSettings() }
+                setMode(choice.mode)
                 close {}
             },
-            getModels: getModels,
             close: { close {} })
-        let controller = PickerHost(rootView: AnyView(picker.environment(engine)))
+        let controller = PickerHost(rootView: AnyView(picker.environment(engine).environment(engine.store).environment(engine.mac)))
         controller.onClose = { [weak self] in if refocus { self?.composer.textView.becomeFirstResponder() } }
         host = controller
         presentPicker(controller, from: source)
     }
 
-    /// A sheet on iPhone (half height, pulls up to full), a popover from `source` on iPad.
+    /// A sheet on iPhone (half height, pulls up to full), a popover from `source` on iPad. Opaque:
+    /// as glass over a dark transcript the grouped list turned a muddy grey.
     private func presentPicker(_ controller: UIViewController, from source: UIView, rect: CGRect? = nil) {
+        controller.view.backgroundColor = .systemGroupedBackground
         controller.modalPresentationStyle = .popover
-        controller.preferredContentSize = CGSize(width: 360, height: 520)
+        // The Mac lists one model, so less height.
+        controller.preferredContentSize = CGSize(width: 360, height: Device.isMac ? 400 : 520)
         if let popover = controller.popoverPresentationController {
             popover.sourceView = source
             popover.sourceRect = rect ?? source.bounds
             popover.permittedArrowDirections = [.down, .up]
             let sheet = popover.adaptiveSheetPresentationController
-            sheet.detents = [.medium(), .large()]
+            // Tall enough for both models and both switches without scrolling at the default text size.
+            sheet.detents = [.custom { context in min(540, context.maximumDetentValue) }, .large()]
             sheet.prefersGrabberVisible = true
             sheet.prefersScrollingExpandsWhenScrolledToEdge = true
         }
@@ -584,83 +555,35 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     /// offered only with the thinking switched the other way.
     private func showComparePicker(for id: UUID) {
         guard let m = message(id), presentedViewController == nil else { return }
-        let own = answeredBy(m)
+        let ownTitle = m.metrics?.modelTitle ?? conversation.modelTitle
         let thought = m.metrics?.thinking ?? (conversation.thinking != .off)
         weak var host: UIViewController?
         let picker = ComparePicker(
             answerThought: thought,
-            groups: { [unowned self] thinking in compareGroups(own: own, ownThought: thought, thinking: thinking) },
+            rows: { [unowned self] thinking in
+                modelRows(current: nil).map { row in
+                    var row = row
+                    let available = row.choice.mode == .mac ? MacLink.isConfigured : engine.store.isReady
+                    if available, row.title == ownTitle {
+                        row.enabled = thinking != thought
+                        row.note = row.enabled ? "This answer's model, thinking \(thinking ? "on" : "off")"
+                            : "This answer's model: switch thinking to compare"
+                    } else {
+                        row.enabled = available
+                    }
+                    return row
+                }
+            },
             select: { [unowned self] choice, thinking in
                 host?.dismiss(animated: true)
                 compare(with: choice, thinking: thinking ? .high : .off)
             },
             close: { host?.dismiss(animated: true) })
-        let controller = PickerHost(rootView: AnyView(picker.environment(engine)))
+        let controller = PickerHost(rootView: AnyView(picker.environment(engine).environment(engine.store).environment(engine.mac)))
         host = controller
         // From the answer's bubble on iPad.
         let cell = dataSource.indexPath(for: id).flatMap { collectionView.cellForItem(at: $0) }
         presentPicker(controller, from: cell ?? composer.modeButton)
-    }
-
-    private func compareGroups(own: ModelChoice, ownThought: Bool, thinking: Bool) -> [ModelPicker.Group] {
-        let unreachable = engine.mac.route == .unreachable
-        let (device, mac) = choices
-        func row(_ c: ModelChoice) -> ModelPicker.Row {
-            var note: String?
-            var enabled = isAvailable(c.mode)
-            if isSame(c, own) {
-                let flipped = c.mode != .apple && thinking != ownThought
-                enabled = enabled && flipped
-                note = c.mode == .apple ? "This answer's model"
-                    : flipped ? "This answer's model, thinking \(thinking ? "on" : "off")"
-                    : "This answer's model: switch thinking to compare"
-            } else if !enabled {
-                note = availability(c.mode)
-            } else if c.mode == .apple, thinking {
-                note = "Doesn't think"
-            }
-            let symbol = c.mode == .mac && unreachable ? "exclamationmark.triangle" : c.mode.symbol
-            return ModelPicker.Row(choice: c, title: c.title, symbol: symbol, note: note, enabled: enabled, current: false)
-        }
-        return [
-            .init(title: "On This \(UIDevice.current.model)", rows: device.map(row)),
-            .init(title: availability(.mac), rows: mac.map(row)),
-        ]
-    }
-
-    private func pickerGroups() -> [ModelPicker.Group] {
-        let unreachable = engine.mac.route == .unreachable
-        let (device, mac) = choices
-        let onDevice = device.map { c in
-            let available = isAvailable(c.mode)
-            return ModelPicker.Row(choice: c, title: c.title, symbol: c.mode.symbol,
-                                   note: available ? nil : availability(c.mode), enabled: available, current: isCurrent(c))
-        }
-        let computer = mac.map { c in
-            ModelPicker.Row(choice: c, title: c.title, symbol: unreachable ? "exclamationmark.triangle" : c.mode.symbol,
-                            note: nil, enabled: true, current: isCurrent(c))
-        }
-        return [
-            .init(title: "On This \(UIDevice.current.model)", rows: onDevice),
-            .init(title: availability(.mac), rows: computer),
-        ]
-    }
-
-    private func availability(_ mode: Mode) -> String {
-        if mode == .mac {
-            let name = engine.mac.computerName
-            return switch engine.mac.route {
-            case .unknown, .checking: "On Your \(name)"
-            case .unreachable: "On Your \(name) · Not reachable"
-            default: "On Your \(name) · \(engine.mac.route.label)"
-            }
-        }
-        if mode == .apple {
-            let status = engine.apple.status
-            return status.isAvailable ? "Built into this device" : status.short
-        }
-        guard let model = engine.model(for: mode) else { return "" }
-        return engine.store.states[model.id] == .ready ? "On this device" : "Not on this device"
     }
 
     // MARK: - Drafts and warming up
@@ -676,14 +599,8 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         }
     }
 
-    /// Whether Send would have to wait for a model to load or the Mac to be found.
-    private var needsWarmUp: Bool {
-        guard !engine.isBusy else { return false }
-        let mode = conversation.mode
-        if mode == .mac { return engine.mac.route.host == nil }
-        if mode == .apple { return false }  // `prepare` already warmed it when the chat opened
-        return engine.loadedModel == nil || engine.loadedModel != engine.model(for: mode)
-    }
+    /// Whether there's anything to get ready before Send. `Engine.prepare` is cheap when there isn't.
+    private var needsWarmUp: Bool { !engine.isBusy }
 
     private func saveDraft() {
         draftSave?.cancel()
@@ -698,30 +615,19 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
 
     private func isLast(_ id: UUID) -> Bool { conversation.messages.last?.id == id }
 
-    /// Copy, Share, Read Aloud, Retry and Retry with another mode. For the context menu, the More
-    /// button and the answer's text menu.
+    /// Copy, Share, Retry and Compare With. For the context menu and the More button.
     private func answerMenuItems(_ id: UUID) -> [UIMenuElement] {
         guard let m = message(id), !m.isUser, live?.id != id else { return [] }
         var items: [UIMenuElement] = []
         if !m.content.isEmpty {
-            var basics: [UIMenuElement] = [
+            items.append(UIMenu(options: .displayInline, children: [
                 UIAction(title: "Copy", image: UIImage(systemName: "doc.on.doc")) { _ in
                     UIPasteboard.general.string = m.content
                 },
                 UIAction(title: "Share…", image: UIImage(systemName: "square.and.arrow.up")) { [unowned self] _ in
                     share(m.content, from: id)
                 },
-            ]
-            if Speaker.shared.speaking == id {
-                basics.append(UIAction(title: "Stop Reading", image: UIImage(systemName: "stop.circle")) { _ in
-                    Speaker.shared.stop()
-                })
-            } else {
-                basics.append(UIAction(title: "Read Aloud", image: UIImage(systemName: "speaker.wave.2")) { _ in
-                    Speaker.shared.speak(m.content, id: id)
-                })
-            }
-            items.append(UIMenu(options: .displayInline, children: basics))
+            ]))
         }
         if m.comparison != nil {
             items.append(UIAction(title: "Compare Answers", image: UIImage(systemName: "rectangle.split.2x1")) {
@@ -729,19 +635,10 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             })
         }
         if isLast(id), !engine.isBusy {
-            let current = conversation.mode
-            let (device, mac) = choices
-            let others = (device + mac).filter { !isCurrent($0) }.map { c in
-                UIAction(title: c.title, subtitle: c.mode.isOnDevice ? availability(c.mode) : "On Your \(engine.mac.computerName)",
-                         image: UIImage(systemName: c.mode.symbol),
-                         attributes: isAvailable(c.mode) ? [] : .disabled) { [unowned self] _ in retry(c.mode, macModel: c.macModel) }
-            }
             var retries: [UIMenuElement] = [
-                UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise"),
-                         attributes: isAvailable(current) ? [] : .disabled) { [unowned self] _ in retry(current) },
-                UIMenu(title: "Retry With", image: UIImage(systemName: "arrow.triangle.branch"), children: others),
+                UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise")) { [unowned self] _ in retry() },
             ]
-            // A second answer, from another model or the same one with thinking the other way,
+            // A second answer, from the other model or the same one with thinking the other way,
             // kept beside this one (see CompareView). In a sheet: a menu has no room for the switch.
             if m.finished, m.error == nil, !m.content.isEmpty {
                 retries.append(UIAction(title: "Compare With…", image: UIImage(systemName: "rectangle.split.2x1")) {
@@ -751,19 +648,6 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             items.append(UIMenu(options: .displayInline, children: retries))
         }
         return items
-    }
-
-    /// The model that wrote an answer: from its metrics, else its footnote, else the chat's.
-    private func answeredBy(_ m: StoredMessage) -> ModelChoice {
-        conversation.model(of: m.metrics, footnote: m.footnote, macModels: engine.mac.models)
-    }
-
-    /// Whether two choices name the same model. A Mac choice without a model means the chat's.
-    private func isSame(_ a: ModelChoice, _ b: ModelChoice) -> Bool {
-        guard a.mode == b.mode else { return false }
-        guard a.mode == .mac else { return true }
-        let resolve = { (c: ModelChoice) in c.macModel ?? self.conversation.resolvedMacModel }
-        return resolve(a) == resolve(b)
     }
 
     /// Copy, and Edit & Resend.
@@ -783,22 +667,22 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
         present(share, animated: true)
     }
 
-    /// Retry, plus a way to fix the cause: Readiness for a missing model, a fresh look for the Mac.
+    /// Retry, plus a way to fix the cause: the download for a missing model, a fresh look for the Mac.
     private func errorActions(for m: StoredMessage) -> [UIAction] {
         guard m.error != nil, !m.isUser else { return [] }
         var actions: [UIAction] = []
         if isLast(m.id) {
             actions.append(UIAction(title: "Retry", image: UIImage(systemName: "arrow.clockwise"),
                                     attributes: engine.isBusy ? .disabled : []) { [unowned self] _ in
-                retry(conversation.mode)
+                retry()
             })
         }
         // Replies saved before errors had a kind fall back to the mode.
-        let kind = m.errorKind ?? (conversation.mode == .mac ? .macUnreachable : .other)
+        let kind = m.errorKind ?? (conversation.answeringMode == .mac ? .macUnreachable : .other)
         switch kind {
         case .notDownloaded:
-            if let open = onOpenReadiness {
-                actions.append(UIAction(title: "Open Models", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
+            if let open = onGetModel {
+                actions.append(UIAction(title: "Download \(engine.store.best.name)", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
             }
         case .macUnreachable, .macNoModel, .macFailed:
             actions.append(UIAction(title: "Check the Mac", image: UIImage(systemName: "desktopcomputer")) {
@@ -944,15 +828,11 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
     private var isComposing: Bool { composer.textView.markedTextRange != nil }
 
     override var keyCommands: [UIKeyCommand]? {
-        let modes = Mode.allCases.enumerated().map { i, m in
-            UIKeyCommand(title: m.title, action: #selector(modeKey(_:)), input: "\(i + 1)", modifierFlags: .command,
-                         propertyList: m.rawValue)
-        }
         var commands = [
             UIKeyCommand(title: "Send", action: #selector(sendKey), input: "\r", modifierFlags: .command),
             UIKeyCommand(title: "Stop", action: #selector(stopKey), input: UIKeyCommand.inputEscape),
             UIKeyCommand(title: "Stop", action: #selector(stopKey), input: ".", modifierFlags: .command),
-        ] + modes
+        ]
         if !isComposing {
             let returnKey = UIKeyCommand(input: "\r", modifierFlags: [], action: #selector(sendKey))
             returnKey.wantsPriorityOverSystemBehavior = true  // hardware Return sends; the on-screen one adds a line
@@ -983,35 +863,25 @@ final class ChatViewController: UIViewController, UICollectionViewDelegate {
             cancelEditing()
         }
     }
-
-    @objc private func modeKey(_ command: UIKeyCommand) {
-        if let raw = command.propertyList as? String, let mode = Mode(rawValue: raw) { setMode(mode) }
-    }
 }
 
 // MARK: - Attachments
 
 extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDelegate, UIDropInteractionDelegate {
-    /// Choose File, Choose Photo; Photo is off in a mode that can't see images, with the reason.
+    /// Choose File, Choose Photo. Photo is off until the model's image support has downloaded.
     fileprivate func updateAttachMenu() {
-        let mode = conversation.mode
-        let seesImages = engine.canSeeImages(mode)
-        var photoNote: String?
-        let projector = engine.model(for: mode)?.projector
-        if !seesImages { photoNote = projector == nil ? "\(mode.title) can't see images" : "Needs Image reading for \(mode.title)" }
-        var items: [UIMenuElement] = [
+        let seesImages = engine.canSeeImages(conversation.answeringMode)
+        composer.attachButton.menu = UIMenu(children: [
             UIAction(title: "Choose File…", subtitle: "Text or PDF", image: UIImage(systemName: "doc")) { [unowned self] _ in
                 chooseFile()
             },
-            UIAction(title: "Choose Photo…", subtitle: photoNote, image: UIImage(systemName: "photo"),
+            UIAction(title: "Choose Photo…", subtitle: seesImages ? nil : Self.noImages, image: UIImage(systemName: "photo"),
                      attributes: seesImages ? [] : .disabled) { [unowned self] _ in choosePhoto() },
-        ]
-        if mode.isOnDevice, !seesImages, projector != nil, let open = onOpenReadiness {
-            items.append(UIAction(title: "Get Image Reading…", image: UIImage(systemName: "arrow.down.circle")) { _ in open() })
-        }
-        composer.attachButton.menu = UIMenu(children: items)
+        ])
         composer.attachButton.isEnabled = live == nil
     }
+
+    private static let noImages = "Image support is still downloading"
 
     private func chooseFile() {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: AttachmentReader.types, asCopy: true)
@@ -1092,13 +962,9 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
     /// use of (over half its context), or is an image the mode can't see.
     private func add(_ new: [Attachment]) {
         guard !new.isEmpty else { return }
-        let mode = conversation.mode
+        let mode = conversation.answeringMode
         let seen = engine.canSeeImages(mode) ? new : new.filter { !$0.isImage }
-        if seen.count < new.count {
-            showProblem(engine.model(for: mode)?.projector == nil
-                        ? "\(mode.title) can't see photos. Gemma 4 E2B and E4B can, with Image reading."
-                        : "\(mode.title) needs Image reading, in Settings > Models, to see photos.")
-        }
+        if seen.count < new.count { showProblem("\(Self.noImages). Photos can be attached once it's here.") }
         guard !seen.isEmpty else { return }
         let limit = engine.contextLimit(for: mode)
         let big = seen.filter { AttachmentReader.estimatedTokens($0) > limit / 2 }
@@ -1118,17 +984,14 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
 
     private func append(_ attachments: [Attachment]) {
         composer.attachments += attachments
-        // Not behind a sheet (Settings, Readiness), whose keyboard-covered content would be hidden.
+        // Not behind a sheet (Settings), whose keyboard-covered content would be hidden.
         if traitCollection.userInterfaceIdiom != .phone, view.window?.rootViewController?.presentedViewController == nil {
             composer.textView.becomeFirstResponder()
         }
     }
 
-    fileprivate func showProblem(_ message: String, settings: Bool = false) {
+    fileprivate func showProblem(_ message: String) {
         let alert = UIAlertController(title: nil, message: message, preferredStyle: .alert)
-        if settings, let url = URL(string: UIApplication.openSettingsURLString) {
-            alert.addAction(UIAlertAction(title: "Open Settings", style: .default) { _ in UIApplication.shared.open(url) })
-        }
         alert.addAction(UIAlertAction(title: "OK", style: .cancel))
         if presentedViewController == nil { present(alert, animated: true) }
     }
@@ -1146,122 +1009,38 @@ extension ChatViewController: UIDocumentPickerDelegate, PHPickerViewControllerDe
     }
 }
 
-// MARK: - Dictation
-
-extension ChatViewController {
-    fileprivate func setUpDictation() {
-        dictation.onTranscript = { [unowned self] heard in
-            composer.text = dictationPrefix + heard
-            textChanged(composer.text)
-        }
-        dictation.onEnd = { [unowned self] error in
-            composer.isListening = false
-            refresh()
-            if let error { showProblem(error.localizedDescription) }
-        }
-        Task { [weak self] in
-            let available = await Dictation.isAvailable()
-            self?.composer.micButton.isHidden = !available
-        }
-    }
-
-    /// Tap to listen, tap again to stop. What's heard goes after what's already typed.
-    fileprivate func toggleDictation() {
-        if dictation.isRunning {
-            dictation.stop()
-            composer.isListening = false
-            refresh()
-            return
-        }
-        Speaker.shared.stop()
-        let typed = composer.text
-        dictationPrefix = typed.isEmpty || typed.hasSuffix(" ") || typed.hasSuffix("\n") ? typed : typed + " "
-        composer.isListening = true
-        Task {
-            do {
-                try await dictation.start()
-                refresh()
-            } catch {
-                composer.isListening = false
-                let failure = error as? Dictation.Failure
-                showProblem(error.localizedDescription, settings: failure?.opensSettings == true)
-            }
-        }
-    }
-}
-
 /// The chat screen as SwiftUI sees it. `revision` changes whenever something the UIKit side shows
 /// (other than streaming text) changes, which is what makes SwiftUI call `refresh()`. Around the
-/// UIKit controller: the editable title and its menu (Rename, Export), the inspector,
-/// a banner when another chat or a model test holds the engine, and the menu bar's view of the chat.
+/// UIKit controller: the editable title, and a banner when this chat can't answer yet (another
+/// chat is answering, or this device's model isn't here).
 struct ChatScreen: View {
     @Bindable var conversation: Conversation
     @Environment(Engine.self) private var engine
-    @AppStorage(DefaultMode.key) private var lastMode = ""
-    @SceneStorage("inspector") private var showInspector = false
-    @Environment(\.showReadiness) private var showReadiness
+    @Environment(\.showModel) private var showModel
     @Environment(\.showSettings) private var showSettings
     @Environment(\.openChat) private var openChat
     @State private var comparing: ComparisonRequest?
-    @Environment(\.horizontalSizeClass) private var sizeClass
 
-    /// The reply `CompareView` shows, and which side it starts on.
+    /// The reply `CompareView` shows.
     struct ComparisonRequest: Identifiable {
         let reply: UUID
-        let startOnB: Bool
         var id: UUID { reply }
     }
 
     var body: some View {
-        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showReadiness: showReadiness,
+        ChatControllerView(conversation: conversation, engine: engine, revision: revision, showModel: showModel,
                            showSettings: showSettings, openChat: openChat,
-                           showComparison: { comparing = ComparisonRequest(reply: $0, startOnB: $1) })
+                           showComparison: { comparing = ComparisonRequest(reply: $0) })
             .ignoresSafeArea(.keyboard)  // the UIKit side follows the keyboard itself
-            .safeAreaInset(edge: .top, spacing: 0) { BusyBanner(conversation: conversation) }
+            .safeAreaInset(edge: .top, spacing: 0) { ChatBanner(conversation: conversation) }
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
-            .toolbarTitleMenu {
-                RenameButton()
-                ShareLink(item: ChatExport(conversation), preview: SharePreview(conversation.title)) {
-                    Label("Export Chat", systemImage: "square.and.arrow.up")
-                }
-                .disabled(conversation.messages.isEmpty)
-                // iPhone: here rather than in the bar, which keeps to the side panel and New chat.
-                if sizeClass == .compact {
-                    Button("Chat Info", systemImage: "info.circle") { showInspector = true }
-                }
-            }
-            .toolbar {
-                if sizeClass != .compact {
-                    ToolbarItem(placement: .primaryAction) {
-                        Button(showInspector ? "Hide Info" : "Show Info", systemImage: "info.circle") {
-                            withAnimation { showInspector.toggle() }
-                        }
-                        .keyboardShortcut("i", modifiers: [.command, .option])
-                    }
-                }
-            }
+            .toolbarTitleMenu { RenameButton() }
             // Here rather than presented from UIKit: the screen is rebuilt per chat (`.id`), so the
             // sheet can't outlive it and act on the chat it came from.
             .sheet(item: $comparing) { request in
-                CompareView(conversation: conversation, replyID: request.reply, startOnB: request.startOnB)
+                CompareView(conversation: conversation, replyID: request.reply)
                     .presentationDetents([.large])
-            }
-            .inspector(isPresented: $showInspector) {
-                ChatInspector(conversation: conversation) { withAnimation { showInspector = false } }
-                    .inspectorColumnWidth(min: 260, ideal: 300, max: 420)
-            }
-            #if DEBUG
-            // After the push settles: on iPhone a sheet asked for mid-push never shows.
-            .task { if DebugLaunch.ui == "inspector" { try? await Task.sleep(for: .seconds(1)); showInspector = true } }
-            #endif
-            .focusedSceneValue(\.chat, ChatFocus(
-                conversation: conversation, mode: conversation.mode,
-                canChangeMode: engine.running != conversation.persistentModelID))
-            // The mode a new chat starts in follows the one last chosen or sent with.
-            .onChange(of: conversation.mode) { _, mode in lastMode = mode.rawValue }
-            .onChange(of: conversation.messages.count) { old, new in
-                if new > old { lastMode = conversation.mode.rawValue }
             }
     }
 
@@ -1280,43 +1059,124 @@ struct ChatScreen: View {
         h.combine(conversation.messages)
         h.combine(conversation.mode)
         h.combine(conversation.thinking)
+        h.combine(conversation.webSearch)
+        h.combine(conversation.macModel)
         h.combine(engine.running)
         h.combine(engine.live?.id)
         h.combine(engine.isBusy)
-        h.combine(engine.store.downloaded)
+        h.combine(engine.store.isReady)
+        h.combine(engine.store.model)
+        h.combine(MacLink.isConfigured)
+        h.combine(engine.store.hasProjector)
         h.combine(engine.mac.route)
         return h.finalize()
     }
 }
 
-/// When another chat (maybe in another window) is answering, or Readiness is testing a model, this
-/// chat can't send. Says so above the transcript, with a way to stop it.
-private struct BusyBanner: View {
+/// Above the transcript, when this chat can't answer yet: another chat is answering (with a way to
+/// stop it), or this device's model isn't downloaded (with its progress, or a way to get it).
+private struct ChatBanner: View {
     let conversation: Conversation
     @Environment(Engine.self) private var engine
+    @Environment(ModelStore.self) private var store
     @Environment(\.modelContext) private var context
+    @Environment(\.showModel) private var showModel
+    @Environment(\.showMacSettings) private var showMacSettings
+    @Environment(\.showSettings) private var showSettings
 
     var body: some View {
-        if let text {
-            HStack(spacing: 10) {
+        if let busy {
+            row {
                 ProgressView().controlSize(.small)
-                Text(text).lineLimit(2)
+                Text(busy).lineLimit(2)
                 Spacer(minLength: 8)
-                if engine.running != nil {
-                    Button("Stop") { engine.stop() }.buttonStyle(.bordered).controlSize(.small)
-                }
+                Button("Stop") { engine.stop() }.buttonStyle(.bordered).controlSize(.small)
             }
-            .font(.footnote)
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-            .background(.bar)
-            .accessibilityElement(children: .combine)
+        } else if let mac = macProblem {
+            Button { mac.action?() } label: {
+                row {
+                    if mac.action == nil {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "desktopcomputer").foregroundStyle(.tint)
+                    }
+                    Text(mac.text)
+                    Spacer(minLength: 8)
+                    if mac.action != nil {
+                        Image(systemName: "chevron.forward").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                    }
+                }
+                .foregroundStyle(.primary)
+            }
+            .buttonStyle(.plain)
+            .disabled(mac.action == nil)
+        } else if conversation.answeringMode.isOnDevice, !store.isReady {
+            Button { showModel() } label: {
+                row {
+                    if case .downloading(let p) = store.state {
+                        ProgressView(value: p).progressViewStyle(.circular).controlSize(.small)
+                        Text("Downloading \(store.best.name) · \(Int(p * 100))%").monospacedDigit()
+                    } else {
+                        Image(systemName: "arrow.down.circle.fill").foregroundStyle(.tint)
+                        Text("Download \(store.best.name) to chat on this \(Device.name)")
+                    }
+                    Spacer(minLength: 8)
+                    Image(systemName: "chevron.forward").font(.caption.weight(.semibold)).foregroundStyle(.tertiary)
+                }
+                .foregroundStyle(.primary)
+            }
+            .buttonStyle(.plain)
         }
     }
 
-    private var text: String? {
-        if let model = engine.testing { return "Testing \(model.name). Chats can send when it's done." }
-        if engine.testingApple { return "Testing \(Mode.apple.title). Chats can send when it's done." }
+    /// Why the Mac can't answer yet, and the way on: Splash starting or failed there (the bridge's
+    /// 503), and on a Mac, no Mac to reach yet (pairing, or Login Items for a Mac that serves).
+    private var macProblem: (text: String, action: (() -> Void)?)? {
+        if conversation.answeringMode == .mac, MacLink.isConfigured, let why = engine.mac.notServing {
+            #if targetEnvironment(macCatalyst)
+            let here = MacRole.current == .serve
+            #else
+            let here = false
+            #endif
+            if MacError.isStarting(why) { return (here ? "Starting Inkling on this Mac…" : "The Mac is starting Inkling…", nil) }
+            return ("Inkling isn't running\(here ? "" : " on the Mac"): \(why)",
+                    here ? { showSettings() } : { Task { await engine.mac.resolve() } })
+        }
+        #if targetEnvironment(macCatalyst)
+        _ = engine.mac.route  // observed: it changes once this Mac's own bridge is connected
+        guard !MacLink.isConfigured else { return nil }
+        switch MacRole.current {
+        case .client:
+            return ("Pair with a Mac to chat with Inkling", { showMacSettings() })
+        case .serve:
+            switch MacServer.shared.state {
+            case .needsApproval:
+                return ("Turn Lantern on in Login Items to serve Inkling", { MacServer.shared.openLoginItems() })
+            case .failed(let message):
+                return (message, { showSettings() })
+            default:
+                return ("Starting Inkling on this Mac…", nil)
+            }
+        case nil:
+            return nil
+        }
+        #else
+        return nil
+        #endif
+    }
+
+    private func row(@ViewBuilder _ content: () -> some View) -> some View {
+        HStack(spacing: 10, content: content)
+            .font(.footnote)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .frame(minHeight: 44)
+            .background(.bar)
+            .contentShape(.rect)
+            .accessibilityElement(children: .combine)
+    }
+
+    private var busy: String? {
         guard let running = engine.running, running != conversation.persistentModelID else { return nil }
         if let other: Conversation = context.registeredModel(for: running) {
             return "“\(other.title)” is answering. This chat can send when it's done."
@@ -1329,18 +1189,18 @@ private struct ChatControllerView: UIViewControllerRepresentable {
     let conversation: Conversation
     let engine: Engine
     let revision: Int
-    let showReadiness: OpenSheetAction
+    let showModel: OpenSheetAction
     let showSettings: OpenSheetAction
     let openChat: OpenChatAction
-    let showComparison: (UUID, Bool) -> Void
+    let showComparison: (UUID) -> Void
 
     func makeUIViewController(context: Context) -> ChatViewController {
         let controller = ChatViewController(conversation: conversation, engine: engine)
-        controller.onOpenReadiness = { showReadiness() }
+        controller.onGetModel = { showModel() }
         controller.onOpenSettings = { showSettings() }
         controller.onOpenChat = { openChat($0) }
-        controller.onShowComparison = { showComparison($0, $1) }
-        controller.onBeginTyping = { [conversation, engine] in engine.prepare(mode: conversation.mode, for: conversation) }
+        controller.onShowComparison = { showComparison($0) }
+        controller.onBeginTyping = { [conversation, engine] in engine.prepare(conversation) }
         return controller
     }
 

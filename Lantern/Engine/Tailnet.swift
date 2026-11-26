@@ -44,7 +44,7 @@ final class Tailnet {
     }
     /// Other devices on the tailnet, by MagicDNS name, for picking the Mac.
     private(set) var peers: [String] = []
-    /// The peers the tailnet says are online now: the ones worth probing for Ollama.
+    /// The peers the tailnet says are online now: the ones worth probing for the Mac.
     private(set) var onlinePeers: Set<String> = []
     /// Who the node is signed in as (the tailnet's login name), once connected.
     private(set) var account: String?
@@ -85,6 +85,20 @@ final class Tailnet {
         await start()
     }
 
+    /// Whether this build can join a tailnet itself (TailscaleKit has no Mac Catalyst slice: a
+    /// Mac uses the Tailscale app).
+    var canJoin: Bool { state != .unavailable }
+
+    /// Joins with the one-time key the Mac handed over when pairing (pre-authorized, tagged
+    /// `tag:lantern`): no browser sign-in. A node already connected stays as it is.
+    func join(authKey: String) async {
+        guard canJoin, state != .connected else { return }
+        UserDefaults.standard.set(true, forKey: Self.signedInKey)
+        await stop()
+        try? FileManager.default.removeItem(at: stateDirectory)
+        await start(authKey: authKey)
+    }
+
     /// Forgets this device's tailnet identity. Its entry in the Tailscale admin console stays until
     /// removed there or it expires.
     func signOut() async {
@@ -95,14 +109,14 @@ final class Tailnet {
     }
 
     #if canImport(TailscaleKit)
-    private func start() async {
+    private func start(authKey: String? = nil) async {
         guard node == nil else { return }
         state = .starting
         do {
             try FileManager.default.createDirectory(at: stateDirectory, withIntermediateDirectories: true)
             let config = Configuration(
                 hostName: "lantern-\(UIDevice.current.model.lowercased())",
-                path: stateDirectory.path(), authKey: nil, controlURL: kDefaultControlURL, ephemeral: false)
+                path: stateDirectory.path(), authKey: authKey, controlURL: kDefaultControlURL, ephemeral: false)
             let node = try TailscaleNode(config: config, logger: nil)
             self.node = node
             let client = LocalAPIClient(localNode: node, logger: nil)
@@ -151,7 +165,7 @@ final class Tailnet {
         magicDNSSuffix = suffix.isEmpty ? nil : suffix
     }
     #else
-    private func start() async {}
+    private func start(authKey: String? = nil) async {}
     private func stop() async {}
     func refreshPeers() async {}
     #endif

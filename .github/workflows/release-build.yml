@@ -30,8 +30,6 @@ env:
   KEYCHAIN_PASSWORD: temporary-ci-password
   APPLE_TEAM_ID: 8G4H6268W7
   IOS_BUNDLE_ID: com.merimerimeri.Lantern
-  # The widget extension embedded in the app, signed with its own App Store profile.
-  WIDGETS_BUNDLE_ID: com.merimerimeri.Lantern.Widgets
 
 jobs:
   release:
@@ -148,21 +146,13 @@ jobs:
           echo "IOS_PROFILE_UUID=$IOS_PROFILE_UUID" >> "$GITHUB_ENV"
           echo "IOS_PROFILE_NAME=$IOS_PROFILE_NAME" >> "$GITHUB_ENV"
 
-          WIDGETS_PROFILE_PLIST=$(security cms -D -i "$WIDGETS_PROVISIONING_PROFILE_PATH")
-          WIDGETS_PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$WIDGETS_PROFILE_PLIST")
-          WIDGETS_PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$WIDGETS_PROFILE_PLIST")
-          cp "$WIDGETS_PROVISIONING_PROFILE_PATH" "$PROFILES_DIR/$WIDGETS_PROFILE_UUID.mobileprovision"
-
-          echo "WIDGETS_PROFILE_UUID=$WIDGETS_PROFILE_UUID" >> "$GITHUB_ENV"
-          echo "WIDGETS_PROFILE_NAME=$WIDGETS_PROFILE_NAME" >> "$GITHUB_ENV"
-          echo "Profiles: $IOS_PROFILE_NAME ($IOS_PROFILE_UUID), $WIDGETS_PROFILE_NAME ($WIDGETS_PROFILE_UUID)"
+          echo "Profile: $IOS_PROFILE_NAME ($IOS_PROFILE_UUID)"
 
           security find-identity -v -p codesigning "$KEYCHAIN_NAME"
 
-      # The project signs automatically for local builds; CI signs with the assets above. Each target
-      # reads its own profile name (project.yml: PROVISIONING_PROFILE_SPECIFIER is
-      # $(LANTERN_APP_PROFILE) for Lantern, $(LANTERN_WIDGETS_PROFILE) for LanternWidgets), because
-      # a PROVISIONING_PROFILE_SPECIFIER given here would apply to both.
+      # The project signs automatically for local builds; CI signs with the assets above. The target
+      # reads its profile's name from LANTERN_APP_PROFILE (project.yml), so an extension added later
+      # can have its own: a PROVISIONING_PROFILE_SPECIFIER given here would apply to every target.
       - name: Archive
         run: |
           rm -rf "$ARCHIVE_PATH" "$EXPORT_PATH"
@@ -177,7 +167,6 @@ jobs:
             CODE_SIGN_IDENTITY="Apple Distribution" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             LANTERN_APP_PROFILE="$IOS_PROFILE_NAME" \
-            LANTERN_WIDGETS_PROFILE="$WIDGETS_PROFILE_NAME" \
             MARKETING_VERSION="$VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
@@ -204,8 +193,6 @@ jobs:
             <dict>
               <key>${IOS_BUNDLE_ID}</key>
               <string>${IOS_PROFILE_NAME}</string>
-              <key>${WIDGETS_BUNDLE_ID}</key>
-              <string>${WIDGETS_PROFILE_NAME}</string>
             </dict>
           </dict>
           </plist>
@@ -306,12 +293,8 @@ jobs:
           security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/certificate.p12"
           rm -f "$RUNNER_TEMP/ios.mobileprovision"
-          rm -f "$RUNNER_TEMP/widgets.mobileprovision"
           rm -f "$RUNNER_TEMP/ExportOptions.plist"
           rm -rf ~/.private_keys
           if [ -n "${IOS_PROFILE_UUID:-}" ]; then
             rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$IOS_PROFILE_UUID.mobileprovision"
-          fi
-          if [ -n "${WIDGETS_PROFILE_UUID:-}" ]; then
-            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$WIDGETS_PROFILE_UUID.mobileprovision"
           fi

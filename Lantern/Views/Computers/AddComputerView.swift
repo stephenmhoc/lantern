@@ -1,53 +1,79 @@
 import SwiftUI
 import UIKit
 
-/// Add a Computer: pairing with Lantern on a Mac, whose bridge serves its local models (Ollama,
-/// LM Studio…) to paired devices, encrypted. Pairing takes the one-time code its "Pair a Device"
-/// shows, as a QR code for the camera or a link sent by AirDrop or pasted here; computers running
-/// the bridge on this network are listed so it's clear which to pair with. It's the sheet from Your
-/// Computers and, with no computer yet, that page itself (`inline`).
+/// Pairing with Lantern on a Mac, whose bridge serves Inkling to paired devices, encrypted.
+/// "Pair a Device" on the Mac shows a QR code for the camera (or a link to paste) and a code to
+/// type here, which is tried with the Macs found on this network. It's Settings › Mac until a Mac
+/// is paired.
 struct AddComputerView: View {
-    enum Presentation { case sheet, inline }
-    let presentation: Presentation
-    /// Paired (or the sheet was cancelled).
-    let done: () -> Void
-
     @Environment(MacLink.self) private var mac
     @Environment(\.openURL) private var openURL
+    @Environment(\.colorScheme) private var colorScheme
     @State private var browser = BridgeBrowser()
-    @State private var pairing: LanternLink.PairOffer?
+    @State private var pairing: PairingSheet.Request?
     @State private var pasteProblem: String?
+    @State private var code = ""
+    @FocusState private var codeFocused: Bool
 
     var body: some View {
         List {
-            if presentation == .inline {
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Image(systemName: "desktopcomputer")
-                            .font(.system(size: 28, weight: .medium))
-                            .foregroundStyle(.black)
-                            .frame(width: 56, height: 56)
-                            .background(Color.accentColor, in: .rect(cornerRadius: 14))
-                            .accessibilityHidden(true)
-                        Text("Add a Computer").font(.title2.bold())
-                        Text("Use the models on your Mac (Ollama, LM Studio and others), over your home network or your tailnet, encrypted all the way.")
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 6)
+            Section {
+                VStack(spacing: 12) {
+                    Image(systemName: "desktopcomputer")
+                        .font(.system(size: 36, weight: .medium))
+                        .foregroundStyle(.tint)
+                        .frame(width: 88, height: 88)
+                        .background(.tint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: .circle)
+                        .accessibilityHidden(true)
+                    Text(Device.isMac ? "Pair with a Mac" : "Pair Your Mac").font(.title.bold())
+                    Text(Device.isMac
+                         ? "Use Inkling on the Mac that serves it: at home on your own network, or anywhere over your tailnet. Encrypted all the way."
+                         : "Use your Mac's larger model from this \(Device.name): at home on your own network, or anywhere over your tailnet. Encrypted all the way.")
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
                 }
+                .frame(maxWidth: .infinity)
+                .accessibilityElement(children: .combine)
+                .listRowBackground(Color.clear)
+                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 0, trailing: 16))
             }
 
             Section {
-                step(1, "Open Lantern on your Mac. It lives in the menu bar.")
-                step(2, "Choose \u{201C}Pair a Device…\u{201D}")
-                step(3, "Point this \(UIDevice.current.localizedModel)'s camera at the code and open the link in Lantern.")
-                Button("Paste a Pairing Link", systemImage: "doc.on.clipboard", action: paste)
-                    .frame(minHeight: 44)
-                    .tint(.primary)
-            } header: {
-                Text("Pair With Your Mac")
+                step(1, Device.isMac ? "Open Lantern on the Mac that serves Inkling." : "Open Lantern on your Mac.")
+                step(2, "In its Settings, choose \u{201C}Pair a Device…\u{201D}")
+                step(3, Device.isMac ? "Type the code it shows below."
+                     : "Point this \(Device.name)'s camera at the QR code, or type the code below.")
             } footer: {
-                Text(pasteProblem ?? "Or send the link from the Mac with \u{201C}Send to a Device…\u{201D}, and paste it here.")
+                Text("Pairing is one time. The code only works for ten minutes.")
+            }
+
+            Section {
+                HStack(spacing: 12) {
+                    TextField("Code", text: $code, prompt: Text(verbatim: "ABCD-EFGH"))
+                        .font(.title3.monospaced())
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .focused($codeFocused)
+                        .submitLabel(.go)
+                        .onSubmit(pairWithCode)
+                    Button("Pair", action: pairWithCode)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(MacPairing.normalizedCode(code) == nil)
+                }
+            } header: {
+                Text("Enter Code")
+            } footer: {
+                Text("Works on your home network, with the Mac listed below.")
+            }
+
+            Section {
+                Button("Paste a Pairing Link", systemImage: "doc.on.clipboard", action: paste)
+            } footer: {
+                if let pasteProblem {
+                    Label(pasteProblem, systemImage: "exclamationmark.triangle.fill").symbolRenderingMode(.multicolor)
+                } else {
+                    Text("The link comes from \u{201C}Copy Link\u{201D} or \u{201C}Send…\u{201D} under the QR code on the Mac.")
+                }
             }
 
             Section {
@@ -55,12 +81,12 @@ struct AddComputerView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(found.name)
-                            Text("Ready to pair: scan its code").font(.subheadline).foregroundStyle(.secondary)
+                            Text(found.fingerprint == nil ? "Running an older Lantern: pair with its QR code."
+                                 : "Serving Inkling. Enter the code it shows to pair.").font(.subheadline).foregroundStyle(.secondary)
                         }
                     } icon: {
-                        Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
+                        Image(systemName: "desktopcomputer")
                     }
-                    .frame(minHeight: 44)
                 }
                 if browser.found.isEmpty {
                     if let problem = browser.problem {
@@ -68,9 +94,8 @@ struct AddComputerView: View {
                     } else {
                         HStack(spacing: 10) {
                             ProgressView()
-                            Text("Looking on this network…").foregroundStyle(.secondary)
+                            Text("Looking for Macs running Lantern…").foregroundStyle(.secondary)
                         }
-                        .frame(minHeight: 44)
                     }
                 }
             } header: {
@@ -79,47 +104,51 @@ struct AddComputerView: View {
 
             tailnetSection
         }
-        .navigationTitle(presentation == .sheet ? "Add a Computer" : "Your Computers")
-        .navigationBarTitleDisplayMode(presentation == .sheet ? .inline : .automatic)
-        .toolbar {
-            if presentation == .sheet {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel", action: done) }
-            }
-        }
         .onAppear { browser.start() }
         .onDisappear { browser.stop() }
         .onChange(of: mac.tailnet.state) { _, state in
             if case .needsLogin(let url) = state { openURL(url) }
         }
-        .sheet(item: $pairing, onDismiss: { if MacPairing.isPaired, MacLink.isConfigured { done() } }) {
-            PairingSheet(offer: $0)
+        .sheet(item: $pairing) { request in
+            switch request {
+            case .link(let offer): PairingSheet(offer: offer)
+            case .code(let code, let bridges): PairingSheet(code: code, bridges: bridges)
+            }
         }
     }
 
     /// Lantern's own tailnet node, for reaching the Mac away from home without the Tailscale app.
+    /// Pairing joins it with the Mac's key when the Mac has Tailscale set up; signing in here is
+    /// the way otherwise.
     @ViewBuilder private var tailnetSection: some View {
         Section {
             switch mac.tailnet.state {
             case .connected:
-                Label("Signed in", systemImage: "checkmark.circle.fill").frame(minHeight: 44)
+                Label {
+                    Text("Signed In to Tailscale")
+                } icon: {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
             case .signedOut, .failed:
                 Button("Sign In with Tailscale") { Task { await mac.tailnet.signIn() } }
-                    .frame(minHeight: 44).tint(.primary)
             case .needsLogin(let url):
-                Button("Open Tailscale Sign-In") { openURL(url) }.frame(minHeight: 44).tint(.primary)
+                Button("Open Tailscale Sign-In") { openURL(url) }
             case .starting:
                 HStack(spacing: 10) { ProgressView(); Text("Connecting to your tailnet…").foregroundStyle(.secondary) }
-                    .frame(minHeight: 44)
             case .unavailable:
                 EmptyView()
             }
         } header: {
-            if mac.tailnet.state != .unavailable { Text("Away From Home") }
+            Text("Away From Home")
         } footer: {
-            if mac.tailnet.state != .unavailable {
-                Text(mac.tailnet.state == .connected
-                     ? "Lantern is on your tailnet as its own device, so your Mac answers away from home too."
-                     : "With Tailscale, your Mac answers away from home too. Sign in here, or use the Tailscale app.")
+            switch mac.tailnet.state {
+            case .unavailable:
+                // A Mac can't be a tailnet node of its own (TailscaleKit has no Mac Catalyst build).
+                Text("Away from home, Lantern reaches the serving Mac through the Tailscale app, signed in to the same tailnet. Without it, Lantern works on your home network only.")
+            case .connected:
+                Text("Lantern is on your tailnet as its own device, so your Mac answers away from home too.")
+            default:
+                Text("If the Mac has Tailscale set up, pairing joins its tailnet by itself. Otherwise sign in here, or use the Tailscale app.")
             }
         }
     }
@@ -128,8 +157,9 @@ struct AddComputerView: View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             Text("\(number)")
                 .font(.subheadline.weight(.semibold).monospacedDigit())
-                .frame(width: 24, height: 24)
-                .background(.quaternary, in: .circle)
+                .foregroundStyle(.tint)
+                .frame(width: 26, height: 26)
+                .background(.tint.opacity(0.15), in: .circle)
             Text(text)
         }
         .padding(.vertical, 4)
@@ -138,11 +168,17 @@ struct AddComputerView: View {
 
     private func paste() {
         guard let text = UIPasteboard.general.string?.trimmingCharacters(in: .whitespacesAndNewlines),
-              let url = URL(string: text), case .pair(let offer)? = LanternLink(url: url) else {
-            pasteProblem = "There's no pairing link to paste. On the Mac, choose \u{201C}Send to a Device…\u{201D} or copy the link first."
+              let url = URL(string: text), let offer = PairOffer(url: url) else {
+            pasteProblem = "There's no pairing link on the clipboard. Copy it on the Mac first."
             return
         }
         pasteProblem = nil
-        pairing = offer
+        pairing = .link(offer)
+    }
+
+    private func pairWithCode() {
+        guard let normalized = MacPairing.normalizedCode(code) else { return }
+        codeFocused = false
+        pairing = .code(normalized, browser.advertised)
     }
 }

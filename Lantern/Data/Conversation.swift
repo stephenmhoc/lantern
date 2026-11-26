@@ -12,12 +12,18 @@ final class Conversation {
     /// When the chat last changed (a turn started or ended): the sidebar's order and dates.
     /// Set to the reference date in chats from before it existed until `repairActivity` fills it.
     var lastActive: Date = Date(timeIntervalSinceReferenceDate: 0)
-    var mode: Mode = Mode.fast
-    /// In `.mac` mode, which of Ollama's models answers ("gemma4:31b-mlx"). Empty means the one
-    /// last picked (`MacLink.modelKey`); the first reply fixes it, so the chat keeps its model.
+    /// This device's model or the Mac. Which on-device model is never the chat's business: it's
+    /// whatever the device it's open on runs (`CatalogModel.device`), so a chat can be continued
+    /// on any device. Each reply records the model that wrote it (`ReplyMetrics`).
+    var mode: Mode = Mode.device
+    /// For the Mac, which of its models answers ("inkling2:mini"). Empty means the Mac's usual
+    /// one (`MacLink.modelKey`); the first reply fixes it.
     var macModel: String = ""
     var thinking: Thinking = Thinking.off
-    /// Kept at the top of the sidebar.
+    /// Whether the model may search the web while answering in this chat (the picker's switch,
+    /// beside Think First). It only happens with a Tavily key in Settings.
+    var webSearch: Bool = false
+    /// Never used any more (chats could be pinned). Kept so existing stores open.
     var pinned: Bool = false
     /// In order. Written when a turn starts and ends (and every few seconds while streaming), never
     /// per token: the live reply lives in `Engine.live` until then.
@@ -46,8 +52,30 @@ final class Conversation {
         try? context.save()
     }
 
+    /// Chats from when there were several on-device models (`fast`, `smart`, `qwen`, `apple`) now
+    /// use this device's. And searching the web was one switch in Settings before each chat had
+    /// its own: if it was on, existing chats keep searching (their system turns declared the tool,
+    /// so their saved states stay valid) and new chats start with it on. Run at launch.
+    static func repairModes(in context: ModelContext) {
+        let chats = (try? context.fetch(FetchDescriptor<Conversation>())) ?? []
+        let defaults = UserDefaults.standard
+        let searched = defaults.bool(forKey: ChatDefaults.oldSearchKey)
+        var changed = false
+        for c in chats {
+            if c.mode != c.mode.current { c.mode = c.mode.current; changed = true }
+            if searched, !c.webSearch { c.webSearch = true; changed = true }
+        }
+        if searched {
+            defaults.set(true, forKey: ChatDefaults.searchKey)
+            defaults.removeObject(forKey: ChatDefaults.oldSearchKey)
+        }
+        if changed { try? context.save() }
+    }
+
     init(mode: Mode) {
         self.mode = mode
+        self.thinking = ChatDefaults.thinking
+        self.webSearch = ChatDefaults.webSearch
         self.systemPrompt = Engine.systemPrompt()
         self.stateID = UUID().uuidString
     }
@@ -70,13 +98,22 @@ final class Conversation {
 
     func index(of id: UUID) -> Int? { messages.firstIndex { $0.id == id } }
 
-    /// The Ollama model this chat uses on the Mac.
+    /// The model this chat uses on the Mac (its id, as the bridge lists it).
     var resolvedMacModel: String {
         macModel.isEmpty ? UserDefaults.standard.string(forKey: MacLink.modelKey) ?? "" : macModel
     }
 
-    /// What answers, for the picker, the sidebar and the inspector: "Gemma 4 E2B", "Gemma 4 31B".
-    var modelTitle: String { mode == .mac ? MacLink.displayName(resolvedMacModel) : mode.title }
+    /// Where the next answer comes from. A chat set to the Mac answers on this device while no
+    /// Mac is paired (it was unpaired, or the chat came from another device): an unpaired Mac is
+    /// never what's selected. On a Mac every chat is answered by a Mac's model: it has none of
+    /// its own (`Device.isMac`).
+    @MainActor var answeringMode: Mode { Device.isMac || (mode == .mac && MacLink.isConfigured) ? .mac : .device }
+
+    /// What answers next, by name: "Gemma 4 E4B", "Inkling 2 Mini" ("Mac" until the Mac has named its model).
+    @MainActor var modelTitle: String {
+        guard answeringMode == .mac else { return ModelStore.shared.model.name }
+        return resolvedMacModel.isEmpty ? "Mac" : MacLink.displayName(resolvedMacModel)
+    }
 }
 
 struct StoredMessage: Codable, Hashable, Identifiable {
@@ -216,44 +253,24 @@ extension StoredMessage {
     }
 }
 
-extension Conversation {
-    /// The model that wrote an answer: from its metrics; for one from before them, from the model
-    /// named in its footnote ("Gemma 4 E2B", "Inkling 2 Mini on your Mac"), matched against the
-    /// on-device models and `macModels` (Ollama's names); else the chat's own model.
-    func model(of metrics: ReplyMetrics?, footnote: String?, macModels: [String]) -> ModelChoice {
-        if let metrics, let mode = Mode(rawValue: metrics.modeRaw) {
-            return ModelChoice(mode: mode, macModel: mode == .mac ? metrics.macModel : nil)
-        }
-        if let name = ChatSearch.modelName(footnote) {
-            if let mode = Mode.allCases.first(where: { $0.isOnDevice && $0.title == name }) {
-                return ModelChoice(mode: mode, macModel: nil)
-            }
-            let suffix = [" on your Mac", " on this Mac"].first { name.hasSuffix($0) }
-            let macName = suffix.map { String(name.dropLast($0.count)) } ?? name
-            if let model = ([resolvedMacModel] + macModels).first(where: { !$0.isEmpty && MacLink.displayName($0) == macName }) {
-                return ModelChoice(mode: .mac, macModel: model)
-            }
-        }
-        return ModelChoice(mode: mode, macModel: mode == .mac ? resolvedMacModel : nil)
-    }
-}
-
-/// A model to answer with: an on-device mode, or the Mac with one of its Ollama models.
+/// A model to answer with: this device's, or the Mac with one of its models.
 struct ModelChoice: Hashable, Sendable {
     let mode: Mode
-    /// For `.mac`, which Ollama model; nil means the chat's (or the Mac's default).
+    /// For `.mac`, which of its models; nil means the chat's (or the Mac's usual one).
     let macModel: String?
 
-    nonisolated var title: String { macModel.map(MacLink.displayName) ?? mode.title }
+    static let device = ModelChoice(mode: .device, macModel: nil)
+
+    @MainActor var title: String { macModel.map(MacLink.displayName) ?? (mode == .mac ? "Mac" : ModelStore.shared.model.name) }
 }
 
-/// How one reply was made and how fast, kept on the reply (and its versions) for the info panel,
-/// comparisons and per-model averages. Everything is optional: what a route can't measure is nil.
-/// Times are seconds. Codable and additive: saved with the messages, never renamed.
+/// Which model wrote a reply and how, kept on the reply (and its versions). Codable and additive:
+/// saved with the messages, never renamed. The timings and token counts below "No longer
+/// recorded" were shown by earlier versions; they stay so stored replies decode as they are.
 nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
-    /// `Mode` raw value of the model that answered.
+    /// `Mode` raw value of where it ran: `mac`, or anything else for the device it was sent from.
     var modeRaw: String
-    /// For the Mac: the Ollama model name.
+    /// For the Mac: the model's id, as the bridge lists it.
     var macModel: String?
     /// The display name, as shown then ("Gemma 4 E4B", "Inkling 2 Mini").
     var modelTitle: String
@@ -261,6 +278,20 @@ nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
     var compareID: UUID?
     /// The user's vote in a comparison: true for this answer.
     var preferred: Bool?
+
+    /// Asked to think (or the model always thinks).
+    var thinking: Bool?
+    /// The oldest turns were left out to fit the context.
+    var trimmed: Bool?
+    /// Cut off by a limit (`StopReason` raw value) or stopped by the user.
+    var cutOff: String?
+    var stopped: Bool?
+
+    /// The model, with "· Thinking" when it thought: what tells apart the two answers of a
+    /// comparison of one model with thinking on and off.
+    var labeledTitle: String { thinking == true ? "\(modelTitle) · Thinking" : modelTitle }
+
+    // MARK: No longer recorded
 
     /// Loading the model before the reply could start (on device, or Ollama's load on the Mac).
     /// About 0 when it was already loaded. Never included in the first-token times or tokens/s.
@@ -295,25 +326,11 @@ nonisolated struct ReplyMetrics: Codable, Hashable, Sendable {
     var route: String?
     /// Mac only: Ollama's own `total_duration` (load, read and generate on the Mac, no network).
     var serverSeconds: Double?
-
-    /// Asked to think (or the model always thinks).
-    var thinking: Bool?
-
-    /// The model, with "· Thinking" when it thought: what tells apart the two answers of a
-    /// comparison of one model with thinking on and off.
-    var labeledTitle: String {
-        thinking == true && modeRaw != Mode.apple.rawValue ? "\(modelTitle) · Thinking" : modelTitle
-    }
-    /// The oldest turns were left out to fit the context.
-    var trimmed: Bool?
-    /// Cut off by a limit (`StopReason` raw value) or stopped by the user.
-    var cutOff: String?
-    var stopped: Bool?
 }
 
 /// What went wrong with a reply, so the chat can offer something better than the message alone.
 nonisolated enum ReplyErrorKind: String, Codable, Sendable {
-    /// The mode's model isn't on this device: offer Readiness.
+    /// This device's model isn't downloaded: offer to get it.
     case notDownloaded
     /// The model file was being converted (Inkling, in earlier builds). Kept so saved replies decode.
     case modelBusy
@@ -322,11 +339,11 @@ nonisolated enum ReplyErrorKind: String, Codable, Sendable {
     /// The chat no longer fits the model's context: offer `Engine.continueTrimmed(in:)` or
     /// `Engine.continueInNewChat(from:)`.
     case contextFull
-    /// Ollama on the Mac didn't answer on either route: offer the on-device models.
+    /// The Mac didn't answer on either route: offer this device's model.
     case macUnreachable
-    /// Ollama answered but has no usable model (none at all, or the chosen one is gone).
+    /// The Mac answered but has no usable model (none at all, or the chosen one is gone).
     case macNoModel
-    /// Ollama answered with an error.
+    /// The Mac answered with an error.
     case macFailed
     case other
 }

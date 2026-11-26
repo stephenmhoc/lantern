@@ -8,34 +8,47 @@ options:
 packages:
   LlamaKit:
     path: Packages/LlamaKit
+  Sparkle:  # the Mac app's updates (MacSupport)
+    url: https://github.com/sparkle-project/Sparkle
+    from: 2.8.0
 
 settings:
   base:
     DEVELOPMENT_TEAM: 8G4H6268W7
     CODE_SIGN_STYLE: Automatic
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: 0.1.0
+    MARKETING_VERSION: 2.0.0
     CURRENT_PROJECT_VERSION: 1
 
 targets:
   Lantern:
     type: application
     platform: iOS
-    # llama.xcframework ships no simulator slice, so Lantern builds for devices only.
-    supportedDestinations: [iOS]
+    # The Mac app is this same target through Mac Catalyst (see CLAUDE.md, "The Mac").
+    supportedDestinations: [iOS, macCatalyst]
     sources:
       - Lantern
     dependencies:
-      - package: LlamaKit
-      - framework: Vendor/TailscaleKit.xcframework  # scripts/fetch-tailscale.sh
+      - package: LlamaKit  # on the Mac its llama binary is left out by the package itself
+      - framework: Vendor/TailscaleKit.xcframework  # scripts/fetch-tailscale.sh; iOS only
         embed: true
-      - target: LanternWidgets  # embedded in PlugIns
+        platformFilter: iOS
+      - target: MacSupport  # AppKit and Sparkle, loaded at launch (MacSupport.swift)
+        platformFilter: macOS
+        embed: true
+        copy:
+          destination: plugins
     entitlements:
       path: Lantern/Lantern.entitlements
       properties:
         # Raise the per-app memory ceiling (and address space for mapping a 9-12 GB model).
         com.apple.developer.kernel.increased-memory-limit: true
         com.apple.developer.kernel.extended-virtual-addressing: true
+        # The chats sync through the user's iCloud (SwiftData's CloudKit mirror): the same
+        # container on every device and the Mac. Xcode's export sets the push environment.
+        com.apple.developer.icloud-container-identifiers: [iCloud.com.merimerimeri.Lantern]
+        com.apple.developer.icloud-services: [CloudKit]
+        aps-environment: development
     info:
       path: Lantern/Info.plist
       properties:
@@ -50,149 +63,108 @@ targets:
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UIRequiresFullScreen: false
-        # iPad: a chat can open in its own window. All windows share the one Engine.
         UIApplicationSceneManifest:
-          UIApplicationSupportsMultipleScenes: true
+          UIApplicationSupportsMultipleScenes: false
         UIApplicationSupportsIndirectInputEvents: true
         ITSAppUsesNonExemptEncryption: false
-        # lantern://new?mode=fast, lantern://ask?text=…, lantern://chat/<id> (LanternLink).
+        # iCloud tells Lantern when the chats changed on another device (ChatStore).
+        UIBackgroundModes: [remote-notification]
+        # lantern://pair?…: the Mac's pairing code, scanned with the camera (PairOffer).
         CFBundleURLTypes:
           - CFBundleURLName: com.merimerimeri.Lantern
-            CFBundleURLSchemes: [lantern]
-        # Models can be dropped in from Finder (cable) or the Files app.
-        UIFileSharingEnabled: true
-        LSSupportsOpeningDocumentsInPlace: true
-        # Readiness imports .gguf files (file picker or drag and drop); chats export as Markdown.
-        UTImportedTypeDeclarations:
-          - UTTypeIdentifier: org.ggml.gguf
-            UTTypeDescription: GGUF model
-            UTTypeConformsTo: [public.data]
-            UTTypeTagSpecification:
-              public.filename-extension: [gguf]
-          - UTTypeIdentifier: net.daringfireball.markdown
-            UTTypeDescription: Markdown text
-            UTTypeConformsTo: [public.plain-text]
-            UTTypeTagSpecification:
-              public.filename-extension: [md, markdown]
+            CFBundleURLSchemes: [$(LANTERN_URL_SCHEME)]
+        # The Mac: Sparkle reads these from the app's own Info.plist.
+        LSApplicationCategoryType: public.app-category.productivity
+        SUFeedURL: $(LANTERN_FEED_URL)
+        SUPublicEDKey: $(LANTERN_UPDATE_KEY)
+        SUEnableAutomaticChecks: $(LANTERN_AUTO_UPDATE)
         NSLocalNetworkUsageDescription: Lantern finds your Mac on your home network and talks to its models there, encrypted.
-        # Add a Computer browses for Ollama, which scripts/mac-ollama-setup.sh advertises over Bonjour.
+        # Pairing lists Macs running Lantern's bridge on this network.
         NSBonjourServices: [_lantern._tcp]
-        # Dictation in the message box, recognized on this device only.
-        NSMicrophoneUsageDescription: Lantern listens when you tap the microphone, to type what you say.
-        NSSpeechRecognitionUsageDescription: Lantern turns what you say into text on this device. Nothing is sent anywhere.
-        # iOS 26: a reply keeps going after you leave the app (BGContinuedProcessingTask, Engine).
-        BGTaskSchedulerPermittedIdentifiers:
-          - com.merimerimeri.Lantern.reply.*
         NSAppTransportSecurity:
-          # Ollama speaks plain HTTP: allowed for .local names and IPs, and for tailnet names.
+          # The bridge has its own certificate, pinned by each device (MacPairing), on .local names,
+          # IP addresses and tailnet names: ATS stays out of the way there.
           NSAllowsLocalNetworking: true
           NSExceptionDomains:
             ts.net:
               NSIncludesSubdomains: true
               NSExceptionAllowsInsecureHTTPLoads: true
+    preBuildScripts:
+      # The Mac: lantern-bridge (Bridge/, Go) and the LaunchAgent that runs it for a Mac that
+      # serves, both signed here, before the app's own signature seals them.
+      - name: Mac bridge and LaunchAgent
+        basedOnDependencyAnalysis: false
+        script: |
+          [ "${IS_MACCATALYST:-NO}" = YES ] || exit 0
+          exec "$SRCROOT/scripts/mac-bundle.sh"
     postBuildScripts:
-      # Readiness shows when a TestFlight build stops launching: 90 days after this date.
+      # Settings shows when a TestFlight build stops launching: 90 days after this date.
       - name: Stamp build date
         basedOnDependencyAnalysis: false
         inputFiles:
           - $(TARGET_BUILD_DIR)/$(INFOPLIST_PATH)  # so it runs after Xcode writes Info.plist
         script: |
           plutil -replace LanternBuildDate -date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          # The Mac: Settings is a window of its own (SettingsWindow), so it takes a second scene.
+          # iPhone and iPad keep one window.
+          if [ "${IS_MACCATALYST:-NO}" = YES ]; then
+            plutil -replace UIApplicationSceneManifest.UIApplicationSupportsMultipleScenes -bool YES "${TARGET_BUILD_DIR}/${INFOPLIST_PATH}"
+          fi
     settings:
       base:
         ENABLE_USER_SCRIPT_SANDBOXING: NO
         PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern
-        # Empty locally (automatic signing). CI passes the App Store profile's name for each target,
-        # since one PROVISIONING_PROFILE_SPECIFIER on the command line would apply to both.
+        # Empty locally (automatic signing). CI passes the App Store profile's name.
         PROVISIONING_PROFILE_SPECIFIER: $(LANTERN_APP_PROFILE)
-        TARGETED_DEVICE_FAMILY: "1,2"
+        # 6: the Mac idiom ("Optimize Interface for Mac"), not a scaled iPad.
+        TARGETED_DEVICE_FAMILY: "1,2,6"
+        # The Mac app: the same bundle ID as on iOS, not sandboxed, hardened, updated by Sparkle.
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: NO
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": Lantern/Mac/LanternMac.entitlements
+        # Empty locally (automatic signing). The Mac release passes its Developer ID profile's name.
+        "PROVISIONING_PROFILE_SPECIFIER[sdk=macosx*]": $(LANTERN_MAC_PROFILE)
+        ENABLE_HARDENED_RUNTIME: YES
+        LANTERN_URL_SCHEME: lantern
+        LANTERN_AUTO_UPDATE: YES
+        # The Mac's updates: the appcast on the repo's fixed `appcast` release, and the EdDSA
+        # public key they're signed with (the private half is in CI's secrets).
+        LANTERN_FEED_URL: https://github.com/stephenmhoc/lantern/releases/download/appcast/appcast.xml
+        LANTERN_UPDATE_KEY: DXwBwnvacDMi5HE2af4ZQCdglMbA4qRT2XyMjo2ZuWw=
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
         SWIFT_APPROACHABLE_CONCURRENCY: YES
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+      configs:
+        Debug:
+          # A Debug build on the Mac is another app: its own bundle ID, files ("Lantern Dev" in
+          # Application Support), link scheme, bridge port and LaunchAgent, so it never meets
+          # the installed Lantern.
+          "PRODUCT_BUNDLE_IDENTIFIER[sdk=macosx*]": com.merimerimeri.Lantern.dev
+          "LANTERN_URL_SCHEME[sdk=macosx*]": lantern-dev
+          # Dev runs never update themselves: no feed, and no automatic checks (MacUpdater too).
+          LANTERN_FEED_URL: ""
+          LANTERN_AUTO_UPDATE: NO
 
-  # Home screen and Lock Screen widgets and a Control Center control. Deep links and static
-  # content only, so it needs no App Group.
-  # Lantern on the Mac: a menu bar app that serves this Mac's models (Ollama, LM Studio…) to paired
-  # iPhones and iPads through lantern-bridge (Bridge/, Go, built into the app). Same bundle ID as
-  # the iOS app, so a Mac app later can be the same purchase.
-  LanternMac:
-    type: application
+  # The Mac-only half of the Mac app: a plain macOS bundle (AppKit, Sparkle) that the Catalyst app
+  # loads from PlugIns and reaches through one protocol, MacSupportAPI.
+  MacSupport:
+    type: bundle
     platform: macOS
     deploymentTarget: "15.0"
     sources:
-      - LanternMac
-      # Shared with iOS: the engine, stored chats and links. iOS-only parts are behind `#if os(iOS)`.
-      - path: Lantern/Engine
-        excludes: [FeatureTest.swift]
-      - Lantern/Data
-      - Lantern/System/LanternLink.swift
-      - Lantern/Views/ChatSearch.swift
-      - Lantern/Views/ChatList.swift
-      - Lantern/Chat/Markdown.swift
-      - Lantern/Chat/PlatformText.swift
-      - Lantern/Chat/AttachmentReader.swift
-      - Lantern/Chat/ReplyStatus.swift
-      - Lantern/Chat/Speaker.swift
-      - Lantern/Chat/MarkdownSample.swift
-      - Lantern/Chat/EmptyChatView.swift
+      - MacSupport
+      - Lantern/Mac/MacSupportAPI.swift
     dependencies:
-      - package: LlamaKit
+      - package: Sparkle
     info:
-      path: LanternMac/Info.plist
+      path: MacSupport/Info.plist
       properties:
-        CFBundleName: Lantern
-        CFBundleDisplayName: Lantern
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        LSApplicationCategoryType: public.app-category.productivity
-        NSHumanReadableCopyright: ""
+        NSPrincipalClass: LanternMacSupport
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern
-        PRODUCT_NAME: Lantern
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
-        ENABLE_HARDENED_RUNTIME: YES
-        ENABLE_USER_SCRIPT_SANDBOXING: NO  # the bridge's build reads Bridge/ and runs Go
+        PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern.MacSupport
         SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
         SWIFT_APPROACHABLE_CONCURRENCY: YES
-    preBuildScripts:
-      - name: Build lantern-bridge
-        basedOnDependencyAnalysis: false
-        script: |
-          set -e
-          export PATH="/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:$PATH"
-          out="$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/lantern-bridge"
-          mkdir -p "$(dirname "$out")"
-          cd "$SRCROOT/Bridge"
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$out" .
-          # Signed like the app, before the app's own signature seals it.
-          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]; then
-            codesign --force --options runtime --timestamp=none --sign "$EXPANDED_CODE_SIGN_IDENTITY" "$out"
-          fi
-
-  LanternWidgets:
-    type: app-extension
-    platform: iOS
-    supportedDestinations: [iOS]
-    sources:
-      - LanternWidgets
-      - Lantern/System/LanternLink.swift
-      - Lantern/System/NewChatIntent.swift  # the control's intent; performed by the app
-    info:
-      path: LanternWidgets/Info.plist
-      properties:
-        CFBundleDisplayName: Lantern
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.widgetkit-extension
-    settings:
-      base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.merimerimeri.Lantern.Widgets
-        PROVISIONING_PROFILE_SPECIFIER: $(LANTERN_WIDGETS_PROFILE)
-        TARGETED_DEVICE_FAMILY: "1,2"
-        SWIFT_APPROACHABLE_CONCURRENCY: YES
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) LANTERN_WIDGETS
+        ENABLE_HARDENED_RUNTIME: YES
         SKIP_INSTALL: YES
+        LD_RUNPATH_SEARCH_PATHS: "@loader_path/../Frameworks"

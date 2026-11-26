@@ -2,15 +2,21 @@ import Foundation
 import Network
 import Observation
 
-/// Finds computers running Lantern's bridge on this network (Bonjour `_lantern._tcp`, which
-/// `lantern-bridge` advertises with its certificate's fingerprint), while Add a Computer is on
-/// screen. They can't be added from here: pairing takes the one-time code the computer shows.
+/// Finds Macs running Lantern's bridge on this network (Bonjour `_lantern._tcp`, which
+/// `lantern-bridge` advertises with its certificate's fingerprint), while pairing is on screen:
+/// they're where a typed code is tried (`MacPairing.pair(code:device:bridges:)`).
 @Observable
 final class BridgeBrowser {
     struct Found: Identifiable, Hashable {
         var id: String { name }
         let name: String
         let fingerprint: String?
+        let endpoint: NWEndpoint
+    }
+
+    /// The ones a typed code can be tried with.
+    var advertised: [MacPairing.Advertised] {
+        found.compactMap { f in f.fingerprint.map { .init(name: f.name, fingerprint: $0, endpoint: f.endpoint) } }
     }
 
     private(set) var found: [Found] = []
@@ -24,6 +30,9 @@ final class BridgeBrowser {
         parameters.includePeerToPeer = false
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_lantern._tcp", domain: nil), using: parameters)
         browser.stateUpdateHandler = { [weak self] state in
+            #if DEBUG
+            print("BONJOUR \(state)")
+            #endif
             let problem: String? = switch state {
             case .failed(let error), .waiting(let error):
                 if case .dns(let code) = error, code == -65570 {  // kDNSServiceErr_PolicyDenied
@@ -40,7 +49,7 @@ final class BridgeBrowser {
                 guard case .service(let name, _, _, _) = result.endpoint else { return nil }
                 var fp: String?
                 if case .bonjour(let txt) = result.metadata { fp = txt["fp"] }
-                return Found(name: name, fingerprint: fp)
+                return Found(name: name, fingerprint: fp, endpoint: result.endpoint)
             }
             Task { @MainActor in self?.found = Array(Set(found)).sorted { $0.name < $1.name } }
         }

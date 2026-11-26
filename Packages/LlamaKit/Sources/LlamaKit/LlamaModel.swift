@@ -1,7 +1,9 @@
 import Accelerate
 import Foundation
 import os
+#if canImport(llama)
 import llama
+#endif
 
 public struct ChatMessage: Sendable, Hashable, Codable {
     public enum Role: String, Sendable, Codable { case system, user, assistant }
@@ -94,6 +96,11 @@ public struct ModelOptions: Sendable, Hashable {
     /// Tokens per batch when reading a prompt (`n_batch` and `n_ubatch`). Bigger reads long prompts
     /// faster but takes more compute memory.
     public var batchSize: Int
+    /// A draft stops at a token the drafter is less sure of than this (llama.cpp's `p_min`).
+    public var draftMinProbability: Float = 0.5
+    /// Whether sliding-window layers keep the whole context (needed to rewind anywhere) or only
+    /// their window plus a batch. Nil: full for a model that can rewind.
+    public var fullWindowCache: Bool?
 
     public init(
         contextLength: UInt32 = 8192, lazyEmbeddings: Bool = false, f16Cache: Bool = false,
@@ -163,6 +170,7 @@ public enum LlamaError: Error, LocalizedError {
     }
 }
 
+#if canImport(llama)
 /// One loaded GGUF and its context. Every llama call happens on `queue`, so the C pointers are
 /// never touched from two threads at once; that's what makes the `@unchecked Sendable` sound.
 /// To stop a generation, stop iterating its stream (cancel the task reading it).
@@ -266,7 +274,11 @@ public final class LlamaModel: @unchecked Sendable {
         }
 
         var cp = llama_context_default_params()
-        let canRewind = !llama_model_is_hybrid(model) && !llama_model_is_recurrent(model)
+        // Attention-only models can drop the end of their cache. Whether they can go back any
+        // further depends on their sliding-window layers remembering more than the window.
+        let attentionOnly = !llama_model_is_hybrid(model) && !llama_model_is_recurrent(model)
+        let fullWindows = options.fullWindowCache ?? attentionOnly
+        let canRewind = attentionOnly && (fullWindows || llama_model_n_swa(model) == 0)
         cp.n_ctx = options.contextLength
         cp.n_batch = UInt32(options.batchSize)
         cp.n_ubatch = UInt32(options.batchSize)
@@ -281,7 +293,7 @@ public final class LlamaModel: @unchecked Sendable {
         }
         // A model that can't rewind has no use for sliding-window layers remembering more than
         // their window: less cache and a slightly faster prefill.
-        cp.swa_full = canRewind
+        cp.swa_full = fullWindows
         let threads = Self.threadCount
         cp.n_threads = threads
         cp.n_threads_batch = threads
@@ -301,9 +313,9 @@ public final class LlamaModel: @unchecked Sendable {
         self.canRewind = canRewind
         self.threads = threads
         self.batchSize = options.batchSize
-        if canRewind, let draftPath = options.draftModel {
+        if attentionOnly, let draftPath = options.draftModel {
             drafter = Drafter(path: draftPath, params: mp, target: model, targetContext: ctx, targetParams: cp,
-                              maxTokens: options.draftTokens)
+                              maxTokens: options.draftTokens, minProbability: options.draftMinProbability)
         }
         let file = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
         self.stateKey = [
@@ -606,7 +618,7 @@ public final class LlamaModel: @unchecked Sendable {
         if endedCleanly {
             transcript = (messages + [ChatMessage(role: .assistant, content: answer, searches: searches)], thinking)
             // Worth saving only if a later turn could continue it (not Gemma with thinking on).
-            if template.canContinue(from: thinking, to: thinking) { unsaved = checkpoint }
+            if template.canContinue(from: thinking, to: thinking, keepingThinking: !canRewind) { unsaved = checkpoint }
         }
         return stats
     }
@@ -640,7 +652,7 @@ public final class LlamaModel: @unchecked Sendable {
     private func continuation(
         of base: (messages: [ChatMessage], thinking: Thinking)?, to messages: [ChatMessage], thinking: Thinking
     ) -> [ChatMessage]? {
-        guard let base, template.canContinue(from: base.thinking, to: thinking),
+        guard let base, template.canContinue(from: base.thinking, to: thinking, keepingThinking: !canRewind),
               messages.count > base.messages.count, messages.last?.role == .user,
               Array(messages.prefix(base.messages.count)) == base.messages else { return nil }
         let rest = Array(messages[base.messages.count...])
@@ -660,7 +672,7 @@ public final class LlamaModel: @unchecked Sendable {
         var restored = false
         if keep < cached.count {
             let mem = llama_get_memory(ctx)
-            if canRewind, llama_memory_seq_rm(mem, 0, llama_pos(keep), -1) {
+            if canCut(to: keep), llama_memory_seq_rm(mem, 0, llama_pos(keep), -1) {
                 cached = Array(tokens.prefix(keep))
             } else if !canRewind, let snapshot = prefixSnapshot, snapshot.tokens.count < tokens.count,
                       tokens.starts(with: snapshot.tokens), restore(snapshot)
@@ -678,6 +690,17 @@ public final class LlamaModel: @unchecked Sendable {
             takePrefixSnapshot()
         }
         return (keep, restored)
+    }
+
+    /// Whether the cache can be cut back to its first `keep` tokens. Sliding-window layers must
+    /// still hold the window before that point, and after a restore they don't: a saved state
+    /// keeps only the last window of them, even from a full-size cache, and `llama_memory_seq_rm`
+    /// succeeds all the same, leaving those layers with less to look at than they were trained on.
+    private func canCut(to keep: Int) -> Bool {
+        guard canRewind else { return false }
+        let window = Int(llama_model_n_swa(model))
+        guard window > 0 else { return true }
+        return Int(llama_memory_seq_pos_min(llama_get_memory(ctx), 0)) <= max(0, keep - window)
     }
 
     /// How many of `tokens` are the system prompt, if the conversation starts with one.
@@ -762,7 +785,7 @@ public final class LlamaModel: @unchecked Sendable {
         }
         if keep < cached.count {
             let mem = llama_get_memory(ctx)
-            if canRewind, llama_memory_seq_rm(mem, 0, llama_pos(keep), -1) {
+            if canCut(to: keep), llama_memory_seq_rm(mem, 0, llama_pos(keep), -1) {
                 cached = Array(cached.prefix(keep))
             } else {
                 llama_memory_clear(mem, true)
@@ -948,7 +971,7 @@ public final class LlamaModel: @unchecked Sendable {
         defer { llama_batch_ext_free(batch) }
         if !canRewind, let snapshot = prefixSnapshot, snapshot.tokens == tokens, restore(snapshot) { return }
         let keep = canRewind ? zip(cached, tokens).prefix { $0 == $1 }.count : 0
-        if keep < cached.count, !(canRewind && llama_memory_seq_rm(llama_get_memory(ctx), 0, llama_pos(keep), -1)) {
+        if keep < cached.count, !(canCut(to: keep) && llama_memory_seq_rm(llama_get_memory(ctx), 0, llama_pos(keep), -1)) {
             llama_memory_clear(llama_get_memory(ctx), true)
             cached = []
         } else {
@@ -1133,12 +1156,13 @@ private final class Drafter {
     private let vocabSize: Int
     let maxTokens: Int
     /// A draft stops at a token the drafter is less sure of than this (llama.cpp's `p_min`).
-    private static let minProbability: Float = 0.5
+    private let minProbability: Float
 
     init?(
         path: String, params: llama_model_params, target: OpaquePointer, targetContext: OpaquePointer,
-        targetParams: llama_context_params, maxTokens: Int
+        targetParams: llama_context_params, maxTokens: Int, minProbability: Float
     ) {
+        self.minProbability = minProbability
         guard maxTokens > 0 else { return nil }
         var mp = params
         mp.progress_callback = nil
@@ -1236,7 +1260,7 @@ private final class Drafter {
             vvexpf(&logits, logits, &n)
             var sum: Float = 0
             vDSP_sve(logits, 1, &sum, vDSP_Length(vocabSize))
-            guard 1 / sum >= Self.minProbability else { break }
+            guard 1 / sum >= minProbability else { break }
             token = llama_token(bestIndex)
             out.append(token)
             state = Array(UnsafeBufferPointer(start: h, count: width))
@@ -1244,3 +1268,38 @@ private final class Drafter {
         return out
     }
 }
+#else
+/// Mac Catalyst: llama.cpp isn't linked there (a Mac serves or uses a Mac's model, never one of
+/// its own), so this is a model that can't be loaded.
+public final class LlamaModel: @unchecked Sendable {
+    public let contextLength = 0
+    public let canRewind = false
+    public let stateKey = ""
+    public var tokensInContext: Int { 0 }
+    public var promptLimit: Int { 0 }
+    public var sizeBytes: UInt64 { 0 }
+    public var templateName: String { "" }
+    public var hasVision: Bool { false }
+    public var hasDrafter: Bool { false }
+    public static let imageTokens = 280
+    public static let searchLimit = 3
+
+    public init(
+        path: String, options: ModelOptions = ModelOptions(),
+        progress: (@Sendable (Float) -> Void)? = nil, isCancelled: (@Sendable () -> Bool)? = nil
+    ) throws {
+        throw LlamaError.loadFailed(path)
+    }
+    public func generate(
+        _ messages: [ChatMessage], sampling: Sampling, thinking: Thinking = .off, maxTokens: Int = 2048,
+        checkpoint: URL? = nil, search: (@Sendable (WebSearch) async -> WebSearch)? = nil
+    ) -> AsyncThrowingStream<Generation, Error> {
+        AsyncThrowingStream { $0.finish(throwing: LlamaError.cancelled) }
+    }
+    public func loadVision(projector path: String) async throws { throw LlamaError.visionFailed }
+    public func prepare(_ messages: [ChatMessage], thinking: Thinking, checkpoint: URL?) async {}
+    public func adoptLegacyState(from legacy: URL, into directory: URL) {}
+    public func flush() async {}
+    public func countTokens(_ messages: [ChatMessage], thinking: Thinking = .off) async -> Int { 0 }
+}
+#endif

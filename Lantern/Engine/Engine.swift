@@ -1,85 +1,41 @@
-#if os(iOS)
-import BackgroundTasks
 import UIKit
-#endif
 import Foundation
 import LlamaKit
 import Observation
 import os
 import SwiftData
-import UserNotifications
 
-/// Runs the one generation that can happen at a time, in whichever mode a chat uses. Only one
-/// on-device model is loaded at a time, since two would crowd each other out of memory.
+/// Runs the one generation that can happen at a time: on this device's model (`store.model`)
+/// or on the Mac.
 @Observable
 final class Engine {
     let store = ModelStore.shared
     let mac = MacLink()
-    /// Apple Intelligence's on-device model (iOS 26+), which runs in a system process.
-    let apple = AppleLink()
-
     /// The chat that's answering. Every other chat's Send is disabled until it's done.
     private(set) var running: PersistentIdentifier?
     /// The reply being written. Read by the chat screen on a timer, not observed per token.
     private(set) var live: LiveReply?
-    private(set) var loadedModel: CatalogModel?
-    /// The model being loaded, for a chat that's waiting or ahead of one (`prepare`).
-    private(set) var loadingModel: CatalogModel?
-    /// Set while a model self-test runs, which also blocks chats.
-    private(set) var testing: CatalogModel?
-    /// Set while Apple Intelligence's self-test runs (it has no `CatalogModel`).
-    private(set) var testingApple = false
-    var isBusy: Bool { running != nil || testing != nil || testingApple }
-    /// The last finished reply's numbers (prompt, reused, generated tokens), for checks.
-    @ObservationIgnored private(set) var lastStats: GenerationStats?
+    var isBusy: Bool { running != nil }
 
     @ObservationIgnored private var llama: LlamaModel?
+    /// Which model `llama` is: the store's model changes when a better one finishes downloading.
+    @ObservationIgnored private var loadedID: String?
     @ObservationIgnored private var task: Task<Void, Never>?
     @ObservationIgnored private var pendingLoad: PendingLoad?
-    @ObservationIgnored private var prepared: (mode: Mode, conversation: Conversation)?
+    @ObservationIgnored private var prepared: Conversation?
     @ObservationIgnored private var prepareCount = 0
     @ObservationIgnored private var inBackground = false
-    #if os(iOS)
     @ObservationIgnored private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
-    #endif
-    /// iOS 26+: the `BGContinuedProcessingTask` keeping the running reply going after leaving the
-    /// app, once the system has started it (`AnyObject` so the property exists on iOS 18).
-    @ObservationIgnored private var continued: AnyObject?
-    /// The identifier of the request submitted for the running reply, until it ends.
-    @ObservationIgnored private var continuedID: String?
 
     init() {
-        store.canReplaceFile = { [weak self] model in
-            guard let self else { return true }
-            if isBusy || loadingModel == model { return false }
-            if loadedModel == model { unload() }
-            return true
-        }
+        store.modelWillChange = { [weak self] in self?.unload() }
         // The model's cache and buffers are the app's largest dirty memory, and what's in them is
         // saved: under memory pressure, give them back rather than be killed.
-        #if os(iOS)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.unload() }
         }
-        #endif
-        #if DEBUG && os(iOS)
-        if ProcessInfo.processInfo.arguments.contains("-featuretest") { Task { await runFeatureTest() } }
-        #endif
-    }
-
-    func model(for mode: Mode) -> CatalogModel? {
-        CatalogModel.preferred(for: mode, downloaded: store.downloaded)
-    }
-
-    /// How a footnote names where a computer's model ran: on the Mac itself, its own.
-    nonisolated static var onTheComputer: String {
-        #if os(macOS)
-        "on this Mac"
-        #else
-        "on your Mac"
-        #endif
     }
 
     // MARK: - Chats
@@ -95,15 +51,12 @@ final class Engine {
         generate(in: conversation)
     }
 
-    /// Replaces the last reply with a new one, optionally from another mode. The answer it replaces
-    /// (and its own earlier versions) are kept as the new one's other versions.
-    /// `macModel`: for `.mac`, which of the Mac's models (nil keeps the chat's).
-    func retry(in conversation: Conversation, mode: Mode, macModel: String? = nil) {
+    /// Replaces the last reply with a new one. The answer it replaces (and its own earlier
+    /// versions) are kept as the new one's other versions.
+    func retry(in conversation: Conversation) {
         guard !isBusy, let old = conversation.messages.last, !old.isUser else { return }
         let kept = old.allVersions.list.filter { !$0.content.isEmpty }
         conversation.messages.removeLast()
-        conversation.mode = mode
-        if let macModel { conversation.macModel = macModel }
         generate(in: conversation, versions: kept)
     }
 
@@ -121,7 +74,7 @@ final class Engine {
     /// Answers the last question again with `other` and keeps both answers as a pair (the current
     /// answer is A, the new one B), the current answer stays as a version like Retry.
     ///
-    /// Only B runs, through Retry's path, with the chat switched to `other`. Like Retry With, the
+    /// Only B runs, through Retry's path, with the chat switched to `other`. The
     /// chat then continues with the model of the answer it shows (B, the newest), so the next
     /// question goes to the model that wrote the history it continues and can reuse its cache.
     /// If B produced nothing (failed or stopped empty) the chat goes back to A's model.
@@ -133,19 +86,19 @@ final class Engine {
         guard !isBusy, let last = conversation.messages.indices.last else { return }
         let reply = conversation.messages[last]
         guard !reply.isUser, reply.finished, reply.error == nil, !reply.content.isEmpty else { return }
-        // An answer from before metrics: its model from its footnote, else the chat's.
-        let own = conversation.model(of: reply.metrics, footnote: reply.footnote, macModels: mac.models)
+        // An answer from before replies recorded their model: taken as the chat's.
         var a = reply.metrics ?? ReplyMetrics(
-            modeRaw: own.mode.rawValue,
-            macModel: own.mode == .mac ? own.macModel ?? conversation.resolvedMacModel : nil,
-            modelTitle: own.mode == .mac ? MacLink.displayName(own.macModel ?? conversation.resolvedMacModel) : own.mode.title)
+            modeRaw: conversation.answeringMode.rawValue,
+            macModel: conversation.answeringMode == .mac ? conversation.resolvedMacModel : nil,
+            modelTitle: conversation.modelTitle)
         let otherMac = other.mode == .mac ? other.macModel ?? conversation.resolvedMacModel : nil
         let bThinking = thinking ?? conversation.thinking
-        let sameModel = other.mode.rawValue == a.modeRaw && (other.mode != .mac || otherMac == a.macModel)
         // The same model only with the other thinking (an answer from before metrics: the chat's
-        // setting). Apple Intelligence's model doesn't think, so it never differs from itself.
+        // setting). Told apart by name, so an answer another device's model wrote can be compared
+        // with this device's.
+        let sameModel = a.modelTitle == (otherMac.map(MacLink.displayName) ?? store.model.name)
         let aThinks = a.thinking ?? (conversation.thinking != .off)
-        guard !sameModel || (other.mode != .apple && aThinks != (bThinking != .off)) else { return }
+        guard !sameModel || aThinks != (bThinking != .off) else { return }
         // A was already one side of an earlier comparison: that pair is undone rather than left
         // with one side, so its partner is an ordinary answer again (no compareID, no vote).
         if let earlier = a.compareID {
@@ -161,25 +114,15 @@ final class Engine {
         let back = (mode: conversation.mode, macModel: conversation.macModel, thinking: conversation.thinking)
         comparing = (id, conversation.persistentModelID, other)
         conversation.thinking = bThinking
-        retry(in: conversation, mode: other.mode, macModel: other.mode == .mac ? otherMac : nil)
+        conversation.mode = other.mode.current
+        if let otherMac { conversation.macModel = otherMac }
+        retry(in: conversation)
         guard let live, running == conversation.persistentModelID else {  // didn't start
             comparing = nil
-            conversation.thinking = back.thinking
+            (conversation.mode, conversation.macModel, conversation.thinking) = back
             return
         }
         comparison = (live.id, back.mode, back.macModel, back.thinking)
-    }
-
-    /// Records a vote on answer `index` of the last reply's `allVersions` (nil clears it).
-    /// The voted answer gets `preferred = true`, its pair partner `false`; nil clears both.
-    func vote(in conversation: Conversation, preferring index: Int?) {
-        guard running != conversation.persistentModelID, let last = conversation.messages.indices.last,
-              !conversation.messages[last].isUser, let pair = conversation.messages[last].comparison else { return }
-        if let index, index != pair.a, index != pair.b { return }
-        for i in [pair.a, pair.b] {
-            conversation.messages[last].updateMetrics(ofVersion: i) { $0?.preferred = index.map { $0 == i } }
-        }
-        try? conversation.modelContext?.save()
     }
 
     /// Makes answer `index` of the last reply the one shown and switches the chat to its model.
@@ -189,27 +132,15 @@ final class Engine {
               !conversation.messages[last].isUser,
               conversation.messages[last].allVersions.list.indices.contains(index) else { return }
         conversation.messages[last].showVersion(index)
-        if let m = conversation.messages[last].metrics, let mode = Mode(rawValue: m.modeRaw) {
+        if let m = conversation.messages[last].metrics, let mode = Mode(rawValue: m.modeRaw)?.current {
             conversation.mode = mode
             if mode == .mac, let macModel = m.macModel, !macModel.isEmpty { conversation.macModel = macModel }
             // And its thinking, so comparing thinking on and off can be continued either way.
-            if mode != .apple, let thought = m.thinking { conversation.thinking = thought ? .high : .off }
+            if let thought = m.thinking { conversation.thinking = thought ? .high : .off }
         }
         try? conversation.modelContext?.save()
         // Load its model and restore its saved state (kept per model) before the next question.
-        prepare(mode: conversation.mode, for: conversation)
-    }
-
-    /// Stops the running reply and starts it again in `mode` (e.g. E4B is too slow: use E2B).
-    /// What it had written so far is kept as a version, as Retry does.
-    func restart(in conversation: Conversation, mode: Mode) {
-        let previous = task
-        live?.stopNote = "Stopped for \(mode.title)"
-        previous?.cancel()
-        Task {
-            await previous?.value
-            retry(in: conversation, mode: mode)
-        }
+        prepare(conversation)
     }
 
     /// Stops the reply, including while its model is still loading.
@@ -222,87 +153,52 @@ final class Engine {
         conversation.lastActive = .now
         try? conversation.modelContext?.save()
 
-        let mode = conversation.mode
+        let mode = conversation.answeringMode
         let thinking = conversation.thinking
         let system = systemMessage(of: conversation, mode: mode)
         var history = [system] + conversation.history(before: conversation.messages.count - 1)
         let macModel = conversation.resolvedMacModel
         if mode == .mac, conversation.macModel.isEmpty, !macModel.isEmpty { conversation.macModel = macModel }
         let live = LiveReply(id: reply.id, mode: mode)
+        live.modelTitle = store.model.name
         live.macModel = macModel
-        live.thinkingAsked = thinking != .off && mode != .apple  // Apple's model doesn't think
+        live.thinkingAsked = thinking != .off
         self.live = live
         running = conversation.persistentModelID
-        #if os(iOS)
         UIApplication.shared.isIdleTimerDisabled = true  // a slow answer shouldn't lock the screen
-        beginContinuedProcessing(mode: mode, chatTitle: conversation.title)
-        #endif
 
         task = Task {
             var stats: GenerationStats?
             var failure: Error?
             var lastSave = Date()
-            var lastProgress = Date()
-            var pieces = 0
-            var statsKey: String?
-            var request: MacLink.Request?
             do {
                 let stream: AsyncThrowingStream<Generation, Error>
                 if mode == .mac {
                     live.phase = .waiting
                     var macModel = macModel
-                    if macModel.isEmpty {
-                        // No model picked yet (a fresh install): ask the Mac, which picks a default.
-                        if mac.route.host == nil { await mac.resolve() }
+                    if mac.route.host == nil { await mac.resolve() }
+                    // No model yet (a fresh install), or one the Mac no longer serves (a chat from
+                    // when it ran Ollama): the Mac serves one model, Splash's, and that answers.
+                    if macModel.isEmpty || (!mac.models.isEmpty && !mac.models.contains(macModel)) {
                         macModel = mac.modelName
                         live.macModel = macModel
                         if conversation.modelContext != nil, !conversation.isDeleted { conversation.macModel = macModel }
                     }
-                    let search = WebSearcher.isEnabled
-                    (stream, request) = try await mac.stream(history, thinking: thinking, model: macModel, search: search)
-                    if MacLink.alwaysThinks(macModel) { live.thinkingAsked = true }
-                    statsKey = "mac:\(macModel)"
+                    let search = conversation.webSearch && WebSearcher.hasKey
+                    (stream, _) = try await mac.stream(history, thinking: thinking, model: macModel, search: search)
                     conversation.tokenLimit = mac.contextLength
-                } else if mode == .apple {
-                    live.modelTitle = Mode.apple.title
-                    live.phase = .waiting
-                    statsKey = "apple"
-                    conversation.tokenLimit = apple.contextSize
-                    guard apple.status.isAvailable else { throw AppleError.unavailable(apple.status) }
-                    await freeMemoryForApple()
-                    try Task.checkCancellation()
-                    // Its context is small: when the chat doesn't fit, the oldest turns go first, a
-                    // turn at a time (if that's allowed), as on device. Each shorter history is tried
-                    // only if the one before didn't fit.
-                    var attempts = [(start: conversation.historyStart, history: history)]
-                    if trim || UserDefaults.standard.bool(forKey: Self.autoTrimKey) {
-                        let end = conversation.messages.count - 1
-                        for start in conversation.messages[..<end].indices
-                            where start > conversation.historyStart && conversation.messages[start].isUser {
-                            attempts.append((start, [system] + conversation.messages[start..<end].compactMap { $0.chatMessage }))
-                        }
-                    }
-                    stream = apple.stream(attempts: attempts, key: Self.appleKey(conversation)) { start in
-                        conversation.historyStart = start
-                        live.trimmed = true
-                    }
                 } else {
-                    guard let model = model(for: mode) else { throw EngineError.notDownloaded(mode) }
-                    guard store.states[model.id] == .ready else { throw EngineError.notDownloaded(mode) }
-                    live.modelTitle = model.name
-                    let loadStarted = Date()
-                    let llama = try await load(model)
+                    let model = store.model
+                    guard store.isReady else { throw EngineError.notDownloaded }
+                    let llama = try await load()
                     try Task.checkCancellation()
                     // A chat with images: load the projector beside the model, if it's here.
-                    if history.contains(where: \.hasImages), !llama.hasVision,
-                       let projector = model.projector, store.states[projector.id] == .ready {
-                        try await llama.loadVision(projector: store.url(for: projector).path)
+                    if history.contains(where: \.hasImages), !llama.hasVision, store.hasProjector {
+                        try await llama.loadVision(projector: store.url(for: model.projector).path)
                         try Task.checkCancellation()
                     }
-                    live.loadSeconds = Date().timeIntervalSince(loadStarted)
                     let checkpoint = self.checkpoint(for: conversation, model: model, llama: llama)
                     live.phase = .waiting
-                    statsKey = model.id
                     conversation.tokenLimit = llama.contextLength
                     // Too long for the model: drop the oldest turns if that's wanted, else say so.
                     if await llama.countTokens(history, thinking: thinking) > llama.promptLimit {
@@ -318,7 +214,7 @@ final class Engine {
                     let search: (@Sendable (WebSearch) async -> WebSearch)? = system.declaresWebSearch
                         ? { @Sendable asked in await WebSearcher.search(asked.query, topic: asked.topic, results: 3, excerpt: 700) } : nil
                     stream = llama.generate(
-                        history, sampling: model.sampling(thinking: thinking), thinking: thinking, checkpoint: checkpoint,
+                        history, sampling: model.sampling, thinking: thinking, checkpoint: checkpoint,
                         search: search)
                 }
                 for try await event in stream {
@@ -332,13 +228,6 @@ final class Engine {
                         write(live, to: conversation, finished: false)  // the sources show as soon as they're in
                     case .done(let s): stats = s
                     }
-                    pieces += 1
-                    #if os(iOS)
-                    if Date().timeIntervalSince(lastProgress) > 0.5 {
-                        reportContinuedProgress(pieces)
-                        lastProgress = .now
-                    }
-                    #endif
                     if Date().timeIntervalSince(lastSave) > 5 {  // so a crash keeps most of the answer
                         write(live, to: conversation, finished: false)
                         lastSave = .now
@@ -349,31 +238,14 @@ final class Engine {
             } catch {
                 failure = error
             }
-            finish(live, in: conversation, stats: stats, error: failure, statsKey: statsKey, request: request)
+            finish(live, in: conversation, stats: stats, error: failure)
         }
     }
 
-    private func finish(
-        _ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?, statsKey: String?,
-        request: MacLink.Request?
-    ) {
-        var parts = [live.mode == .mac ? "\(MacLink.displayName(live.macModel)) \(Self.onTheComputer)"
-                     : live.mode == .apple ? live.mode.title : loadedModel?.name ?? live.mode.title]
-        if let stats, stats.generatedTokens > 0 { parts.append(String(format: "%.1f tok/s", stats.tokensPerSecond)) }
-        if let first = live.firstTokenSeconds { parts.append(String(format: "%.1f s to first token", first)) }
-        if live.mode == .mac, stats != nil {
-            // Where the wait before the first token went: finding the Mac, connecting, the Mac
-            // loading the model, reading the chat. Only the parts that took noticeable time.
-            let t = request?.timings ?? MacLink.Timings()
-            if case .tailnet(_, let viaApp) = request?.route ?? mac.route { parts.append(viaApp ? "via the Tailscale app" : "via tailnet") }
-            let steps: [(String, Double?)] = [
-                ("found the Mac", t.findSeconds), ("connected", t.connectSeconds),
-                ("loaded the model", t.loadSeconds), ("read the chat", t.readSeconds),
-            ]
-            for (what, seconds) in steps {
-                if let seconds, seconds >= 0.3 { parts.append(String(format: "\(what) in %.1f s", seconds)) }
-            }
-        }
+    private func finish(_ live: LiveReply, in conversation: Conversation, stats: GenerationStats?, error: Error?) {
+        // Under the answer: the model that wrote it, then only what the answer can't do without.
+        let title = live.mode == .mac ? MacLink.displayName(live.macModel) : live.modelTitle
+        var parts = [title]
         if stats == nil && error == nil { parts.insert(live.stopNote ?? "Stopped", at: 0) }
         if live.trimmed { parts.append("Earlier messages left out to fit") }
         // A reply that ran into a limit says so instead of just ending.
@@ -390,7 +262,12 @@ final class Engine {
         // B of a comparison: stamped with A's compareID. The chat stays on B's model, which wrote
         // the answer it shows, unless B has nothing to show.
         let pair = comparison.flatMap { $0.reply == live.id ? $0 : nil }
-        var metrics = Self.metrics(of: live, stats: stats, request: request, cutOff: cutOff, stopped: stats == nil && error == nil)
+        var metrics = ReplyMetrics(
+            modeRaw: live.mode.rawValue, macModel: live.mode == .mac ? live.macModel : nil, modelTitle: title)
+        metrics.thinking = live.thinkingAsked
+        metrics.trimmed = live.trimmed ? true : nil
+        metrics.cutOff = cutOff?.rawValue
+        metrics.stopped = stats == nil && error == nil ? true : nil
         if pair != nil, let id = comparing?.id { metrics.compareID = id }
         write(live, to: conversation, finished: true) {
             $0.footnote = parts.joined(separator: " · ")
@@ -419,38 +296,22 @@ final class Engine {
             comparison = nil
             comparing = nil
         }
-        lastStats = stats
         if let stats, conversation.modelContext != nil, !conversation.isDeleted {
             conversation.tokensUsed = stats.promptTokens + stats.generatedTokens
             try? conversation.modelContext?.save()
-        }
-        if let stats, stats.generatedTokens > 0, let statsKey, let first = live.firstTokenSeconds {
-            // A reply that had to load the model first says nothing about the usual wait.
-            let loaded = live.waitedForLoad || (live.mode == .mac && (request?.timings.loadSeconds ?? 0) >= 1)
-            TypicalSpeed.record(firstToken: loaded ? nil : first, tokensPerSecond: stats.tokensPerSecond, for: statsKey)
         }
         // A few words from Apple Intelligence in place of the question, once there's an answer.
         if stats != nil, error == nil, conversation.modelContext != nil, !conversation.isDeleted {
             ChatTitler.shared.titleIfNeeded(conversation)
         }
-        #if os(iOS)
         if stats != nil, Date().timeIntervalSince(live.started) > 5 {
             UINotificationFeedbackGenerator().notificationOccurred(.success)  // you may have put it down
         }
-        #endif
-        #if os(iOS)
-        if inBackground, stats != nil || error != nil {
-            notifyFinished(conversation, reply: live, failed: error != nil)
-        }
-        #endif
         self.live = nil
         running = nil
         task = nil
-        #if os(iOS)
         UIApplication.shared.isIdleTimerDisabled = false
-        endContinuedProcessing(success: error == nil)
         endBackgroundTask()
-        #endif
         pruneStates()
     }
 
@@ -467,53 +328,6 @@ final class Engine {
         extra(&conversation.messages[i])
         conversation.lastActive = .now
         try? conversation.modelContext?.save()
-    }
-
-    /// How a reply was made and how fast. Load time is kept out of `firstTokenSeconds`,
-    /// `firstAnswerSeconds` and `tokensPerSecond` on both routes, and reported as `loadSeconds`:
-    /// on device it's measured around loading the model (and its projector) and subtracted from the
-    /// times since sending; on the Mac it's Ollama's `load_duration`, which falls inside the request
-    /// and is subtracted the same way. `totalSeconds` includes everything, load too.
-    private static func metrics(
-        of live: LiveReply, stats: GenerationStats?, request: MacLink.Request?, cutOff: StopReason?, stopped: Bool
-    ) -> ReplyMetrics {
-        let mac = live.mode == .mac
-        var m = ReplyMetrics(
-            modeRaw: live.mode.rawValue,
-            macModel: mac ? live.macModel : nil,
-            modelTitle: mac ? MacLink.displayName(live.macModel) : live.modelTitle ?? live.mode.title)
-        let timings = request?.timings
-        let load: Double? = mac ? timings.flatMap { $0.serverSeconds != nil ? $0.loadSeconds : nil } : live.loadSeconds
-        m.loadSeconds = load
-        m.firstTokenSeconds = live.firstTokenSeconds.map { max(0, $0 - (load ?? 0)) }
-        m.firstAnswerSeconds = live.firstAnswerSeconds.map { max(0, $0 - (load ?? 0)) }
-        if let stats {
-            m.promptTokens = stats.promptTokens
-            m.promptSeconds = stats.promptSeconds
-            m.generatedTokens = stats.generatedTokens
-            m.generateSeconds = stats.generateSeconds
-            if stats.generatedTokens > 0, stats.generateSeconds > 0 { m.tokensPerSecond = stats.tokensPerSecond }
-            if !mac {
-                m.reusedTokens = stats.reusedTokens
-                m.restored = stats.restored
-                if stats.draftedTokens > 0 {
-                    m.draftedTokens = stats.draftedTokens
-                    m.acceptedDraftTokens = stats.acceptedDraftTokens
-                }
-            }
-        }
-        m.totalSeconds = (live.lastTokenAt ?? Date()).timeIntervalSince(live.started)
-        if mac {
-            m.findSeconds = timings?.findSeconds
-            m.connectSeconds = timings?.connectSeconds
-            m.serverSeconds = timings?.serverSeconds
-            m.route = request?.route.label
-        }
-        m.thinking = live.thinkingAsked
-        m.trimmed = live.trimmed ? true : nil
-        m.cutOff = cutOff?.rawValue
-        m.stopped = stopped ? true : nil
-        return m
     }
 
     /// The user's own instructions for new chats (Settings > Personalization), in place of the
@@ -550,11 +364,11 @@ final class Engine {
 
     /// The chat's own prompt; chats from before prompts were stored get one dated when they began.
     /// The chat's system message for `mode`: its frozen prompt, declaring web search to a model on
-    /// this device when searching is on (the templates put tools in the system turn; a model on a
+    /// this device when the chat searches (and there's a key) (the templates put tools in the system turn; a model on a
     /// computer is offered it with each request instead). Built the same way for `prepare`, so the
     /// cache it readies is the one the reply starts from.
     private func systemMessage(of conversation: Conversation, mode: Mode) -> ChatMessage {
-        let tools = mode.searchesOnDevice && WebSearcher.isEnabled ? [WebSearch.toolName] : []
+        let tools = mode.isOnDevice && conversation.webSearch && WebSearcher.hasKey ? [WebSearch.toolName] : []
         return ChatMessage(role: .system, content: frozenSystemPrompt(of: conversation), tools: tools)
     }
 
@@ -569,7 +383,6 @@ final class Engine {
         case LlamaError.contextFull: .contextFull
         case LlamaError.loadFailed, LlamaError.contextFailed: .loadFailed
         case let error as MacError: error.kind
-        case let error as AppleError: error.kind
         case is URLError: .macUnreachable
         default: .other
         }
@@ -580,10 +393,6 @@ final class Engine {
     /// UserDefaults key (Bool, off by default). When on, a chat too long for the model drops its
     /// oldest turns by itself instead of failing with `.contextFull`.
     static let autoTrimKey = "context.autoTrim"
-    /// Settings' "Search the Web": models on a computer that can use tools may search while
-    /// answering (`MacLink.stream(search:)`, `WebSearcher`). Off by default, and needs a Tavily key.
-    nonisolated static let webSearchKey = "webSearch"
-
     /// After a reply failed with `.contextFull`: leaves the oldest turns out (they stay visible,
     /// the model just no longer sees them; the system prompt is kept) and answers again.
     func continueTrimmed(in conversation: Conversation) {
@@ -596,11 +405,12 @@ final class Engine {
         generate(in: conversation, trim: true)
     }
 
-    /// The other way out of a full chat: a new one in the same mode that starts with the last
+    /// The other way out of a full chat: a new one that starts with the last
     /// exchange, so the thread isn't lost. Inserted next to `conversation`; the caller selects it.
     func continueInNewChat(from conversation: Conversation) -> Conversation {
         let next = Conversation(mode: conversation.mode)
         next.thinking = conversation.thinking
+        next.webSearch = conversation.webSearch
         next.title = conversation.title
         // The last question and its answer, if they're short enough to be worth carrying over.
         let usable = conversation.messages.filter { $0.error == nil && !$0.content.isEmpty && $0.finished }
@@ -629,65 +439,37 @@ final class Engine {
         return nil
     }
 
-    /// How full a chat's context is: live while it's answering on this device, else as its last
-    /// reply left it. Nil before the first reply.
-    func contextUsage(for conversation: Conversation) -> (used: Int, limit: Int)? {
-        if running == conversation.persistentModelID, live?.mode.usesLlama == true, let llama {
-            return (llama.tokensInContext, llama.contextLength)
-        }
-        return conversation.tokenLimit > 0 ? (conversation.tokensUsed, conversation.tokenLimit) : nil
-    }
-
-    /// The most a chat in this mode can hold, in tokens, before any reply has said so.
+    /// The most a chat can hold, in tokens.
     func contextLimit(for mode: Mode) -> Int {
-        if mode == .mac { return mac.contextLength }
-        if mode == .apple { return apple.contextSize }
-        if let llama, loadedModel?.tier == mode { return llama.contextLength }
-        return Int(model(for: mode)?.options.contextLength ?? ModelOptions().contextLength)
+        mode.isOnDevice ? Int(llama?.contextLength ?? Int(store.model.options.contextLength)) : mac.contextLength
     }
 
-    /// Whether images attached in this mode are seen: on this device once the model's projector
-    /// is downloaded, on the Mac if its model has vision (checked when sending).
-    func canSeeImages(_ mode: Mode) -> Bool {
-        if mode == .apple { return apple.seesImages }
-        guard mode.isOnDevice else { return true }
-        return model(for: mode)?.projector.map { store.states[$0.id] == .ready } ?? false
-    }
-
-    /// What this mode's model usually does on this device, from past replies. Nil until it has answered.
-    func typicalSpeed(for mode: Mode, macModel: String? = nil) -> TypicalSpeed? {
-        if mode == .mac { return TypicalSpeed.stored(for: "mac:\(macModel ?? mac.modelName)") }
-        if mode == .apple { return TypicalSpeed.stored(for: "apple") }
-        return model(for: mode).flatMap { TypicalSpeed.stored(for: $0.id) }
-    }
+    /// Whether attached images are seen: on this device once the projector is here, on the Mac
+    /// if its model has vision (checked when sending).
+    func canSeeImages(_ mode: Mode) -> Bool { mode.isOnDevice ? store.hasProjector : true }
 
     // MARK: - Getting ready ahead of a message
 
-    /// Loads the mode's model and gets its cache ready for this chat (its saved state, or for a
-    /// new chat the system prompt), so the first reply doesn't wait for either. Call when a chat
-    /// opens or typing starts; cheap to call again. Does nothing while a reply is being written.
-    func prepare(mode: Mode, for conversation: Conversation) {
+    /// Loads the chat's model and gets its cache ready (its saved state, or for a new chat the
+    /// system prompt), so the first reply doesn't wait for either. Call when a chat opens or
+    /// typing starts; cheap to call again. Does nothing while a reply is being written.
+    func prepare(_ conversation: Conversation) {
         guard !isBusy, !inBackground, conversation.modelContext != nil, !conversation.isDeleted else { return }
-        prepared = (mode, conversation)
+        prepared = conversation
+        let mode = conversation.answeringMode
         if mode == .mac {
-            mac.warm(conversation.resolvedMacModel)  // Ollama loads the model while the question is typed
+            mac.prepare()  // finds the Mac while the question is typed
             return
         }
-        if mode == .apple {
-            // The system loads its model while the question is typed; the session holds the chat.
-            let history = [systemMessage(of: conversation, mode: mode)]
-                + conversation.history(before: conversation.messages.count)
-            apple.prewarm(history, key: Self.appleKey(conversation))
-            return
-        }
-        guard let model = model(for: mode), store.states[model.id] == .ready else { return }
+        guard store.isReady else { return }
+        let model = store.model
         let history = [systemMessage(of: conversation, mode: mode)]
             + conversation.history(before: conversation.messages.count)
         let thinking = conversation.thinking
         prepareCount += 1
         let turn = prepareCount
         Task {
-            guard let llama = try? await load(model), turn == prepareCount, !isBusy,
+            guard let llama = try? await load(), turn == prepareCount, !isBusy,
                   conversation.modelContext != nil, !conversation.isDeleted else { return }
             let checkpoint = self.checkpoint(for: conversation, model: model, llama: llama)
             await llama.prepare(history, thinking: thinking, checkpoint: checkpoint)
@@ -709,9 +491,8 @@ final class Engine {
     }
 
     /// Where one model's state for a chat is saved: Caches/kv/<id>/<model id>. Each model keeps
-    /// its own, so answering with another model (a comparison, Retry in another mode) never
-    /// overwrites the state of the first: going back to it restores instead of reading the chat
-    /// again. States saved before this sat in the chat's directory itself: `checkpoint` has the
+    /// its own (a chat continued on another device, with another model, starts its own there).
+    /// States saved before this sat in the chat's directory itself: `checkpoint` has the
     /// loaded model adopt its own from there (`LlamaModel.adoptLegacyState`, on its queue).
     static func stateDirectory(for conversation: Conversation, model: CatalogModel) -> URL {
         stateDirectory(for: conversation).appending(path: model.id)
@@ -736,7 +517,6 @@ final class Engine {
     /// Deletes a chat's saved model state. Call when the chat is deleted (before or after).
     func forgetState(for conversation: Conversation) {
         guard !conversation.stateID.isEmpty else { return }
-        apple.forget(conversation.stateID)
         let directory = Self.stateRoot.appending(path: conversation.stateID)
         Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: directory) }
     }
@@ -763,23 +543,17 @@ final class Engine {
 
     // MARK: - Leaving the app
 
-    #if os(iOS)
-    /// On iOS 26+, a reply whose continued-processing task the system started keeps going (an
-    /// on-device one only where background GPU is allowed; see `beginContinuedProcessing`).
-    /// Otherwise iOS doesn't allow GPU work in the background, so an on-device reply stops when you
-    /// leave, and a reply from the Mac gets the few seconds iOS allows to finish. The on-device
-    /// model is then unloaded (after a continued reply ends): its state is saved, and a suspended
-    /// app holding gigabytes is the first to be killed.
+    /// iOS doesn't allow GPU work in the background, so an on-device reply stops when you leave,
+    /// and a reply from the Mac gets the few seconds iOS allows to finish. The on-device model is
+    /// then unloaded: its state is saved, and a suspended app holding gigabytes is the first to
+    /// be killed.
     func didEnterBackground() {
         inBackground = true
         if let live {
-            if continued != nil {
-                askToNotifyQuietly()
-            } else if live.mode.usesLlama {
+            if live.mode.isOnDevice {
                 live.stopNote = "Stopped when you left Lantern"
                 stop()
             } else {
-                askToNotifyQuietly()
                 backgroundTask = UIApplication.shared.beginBackgroundTask { [weak self] in
                     self?.live?.stopNote = "Stopped when you left Lantern"
                     self?.stop()
@@ -787,7 +561,7 @@ final class Engine {
             }
         }
         guard llama != nil || pendingLoad != nil else { return }
-        let stopping = live?.mode.usesLlama == true ? task : nil
+        let stopping = live?.mode.isOnDevice == true ? task : nil
         var release = UIBackgroundTaskIdentifier.invalid
         release = UIApplication.shared.beginBackgroundTask(withName: "Save chat state") {
             UIApplication.shared.endBackgroundTask(release)
@@ -795,12 +569,10 @@ final class Engine {
         }
         Task {
             await stopping?.value
-            // Back in front already, or a self-test is running: keep the model.
-            if inBackground, testing == nil, live?.mode.usesLlama != true {
+            if inBackground {  // not back in front already
                 pendingLoad?.cancel.set()
                 if let old = llama {
                     llama = nil
-                    loadedModel = nil
                     await old.flush()
                 }
             }
@@ -808,152 +580,25 @@ final class Engine {
         }
     }
 
-    #endif
 
     /// Back in front: load the model for the chat that was open again.
     func didBecomeActive() {
         inBackground = false
         // Connections, and Lantern's own tailnet node's paths, may not have survived suspension:
-        // check the route again and keep the model warm while the user reads and types.
-        if prepared?.mode == .mac { mac.cameToFront() }
-        if let prepared, llama == nil { prepare(mode: prepared.mode, for: prepared.conversation) }
+        // check the route again while the user reads and types.
+        if prepared?.answeringMode == .mac { mac.cameToFront() }
+        if let prepared, llama == nil { prepare(prepared) }
     }
 
-    #if os(iOS)
     private func endBackgroundTask() {
         guard backgroundTask != .invalid else { return }
         UIApplication.shared.endBackgroundTask(backgroundTask)
         backgroundTask = .invalid
     }
 
-    // MARK: - Continued processing (iOS 26+)
-
-    /// Request identifiers: the prefix is in Info.plist's BGTaskSchedulerPermittedIdentifiers as
-    /// `<prefix>.*`; each reply submits its own, registered just before.
-    static let continuedPrefix = "com.merimerimeri.Lantern.reply"
-    /// Rough reply length for the system's progress display; raised as a reply runs past it.
-    private static let expectedPieces: Int64 = 600
-
-    /// Asks iOS to let the reply that's starting keep going if the user leaves. llama.cpp replies
-    /// need the GPU in the background, which needs an entitlement and a device that supports it:
-    /// without both, nothing is submitted and leaving stops the reply as before. Ollama replies
-    /// only need the network. Apple Intelligence's run in a system process, not on Lantern's GPU,
-    /// so they're treated like the Mac's: Lantern only has to stay running to receive the text.
-    /// With `.fail`, a request iOS can't start now is refused outright.
-    private func beginContinuedProcessing(mode: Mode, chatTitle: String) {
-        guard #available(iOS 26, macOS 26, *) else { return }
-        let needsGPU = mode.usesLlama && !Self.onCPU
-        if needsGPU, !BGTaskScheduler.supportedResources.contains(.gpu) { return }
-        let id = "\(Self.continuedPrefix).\(UUID().uuidString)"
-        let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: id, using: .main) { [weak self] task in
-            MainActor.assumeIsolated {
-                guard let task = task as? BGContinuedProcessingTask, let self, self.continuedID == id, self.live != nil else {
-                    task.setTaskCompleted(success: true)  // the reply ended before iOS started this
-                    return
-                }
-                task.progress.totalUnitCount = Self.expectedPieces
-                task.expirationHandler = { [weak self] in
-                    Task { @MainActor in
-                        guard let self, self.continuedID == id else { return }
-                        self.live?.stopNote = "Stopped when iOS needed Lantern to pause"
-                        self.stop()  // `finish` saves the reply and completes the task
-                    }
-                }
-                self.continued = task
-            }
-        }
-        guard registered else { return }
-        let request = BGContinuedProcessingTaskRequest(
-            identifier: id, title: mode == .mac ? "Your Mac is answering" : "Lantern is answering", subtitle: chatTitle)
-        request.strategy = .fail
-        if needsGPU { request.requiredResources = .gpu }
-        do {
-            try BGTaskScheduler.shared.submit(request)
-            continuedID = id
-        } catch {
-            Logger(subsystem: "Lantern", category: "Engine").info("Continued processing not available: \(error.localizedDescription)")
-        }
-    }
-
-    /// llama.cpp runs on the CPU in the simulator, so an on-device reply needs no background GPU there.
-    private static var onCPU: Bool {
-        #if targetEnvironment(simulator)
-        true
-        #else
-        false
-        #endif
-    }
-
-    private func reportContinuedProgress(_ pieces: Int) {
-        guard #available(iOS 26, macOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
-        let done = Int64(pieces)
-        if done >= task.progress.totalUnitCount * 9 / 10 { task.progress.totalUnitCount = done * 5 / 4 + 1 }
-        task.progress.completedUnitCount = done
-    }
-
-    private func endContinuedProcessing(success: Bool) {
-        continuedID = nil
-        guard #available(iOS 26, macOS 26, *), let task = continued as? BGContinuedProcessingTask else { return }
-        continued = nil
-        task.progress.completedUnitCount = task.progress.totalUnitCount
-        task.setTaskCompleted(success: success)
-    }
-
-
-    // MARK: - Telling the user a reply finished while away
-
-    /// Quiet (provisional) notifications need no prompt, so this never interrupts; a user who
-    /// allowed Lantern's reminders already gets full ones.
-    private func askToNotifyQuietly() {
-        Task { _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .provisional]) }
-    }
-
-    private func notifyFinished(_ conversation: Conversation, reply live: LiveReply, failed: Bool) {
-        let content = UNMutableNotificationContent()
-        content.title = conversation.title
-        content.body = failed ? "The reply didn't finish. Open Lantern to try again."
-            : live.text.isEmpty ? "Answer ready." : Markdown.firstSentence(live.text)
-        content.threadIdentifier = conversation.stateID
-        content.sound = .default
-        let request = UNNotificationRequest(identifier: "reply-\(live.id)", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
-    }
-
-    #endif
-
-    // MARK: - Apple Intelligence
-
-    /// A chat's session key in `AppleLink`: its state id, like its saved llama.cpp states.
-    private static func appleKey(_ conversation: Conversation) -> String {
-        if conversation.stateID.isEmpty { conversation.stateID = UUID().uuidString }
-        return conversation.stateID
-    }
-
-    /// Apple's model runs in a system process, so its memory isn't Lantern's, but it's the same
-    /// RAM. On a 6 GB device a loaded Gemma (2.6 GB and its cache) beside it risks either being
-    /// killed, so the llama.cpp model is unloaded first (its state saved, as on leaving the app).
-    /// With 8 GB or more it stays loaded, so going back to it costs nothing.
-    private func freeMemoryForApple() async {
-        guard MemoryStats.deviceBytes < 7 * 1_073_741_824 else { return }
-        pendingLoad?.cancel.set()
-        guard let old = llama else { return }
-        llama = nil
-        loadedModel = nil
-        await old.flush()
-    }
-
-    /// Asks Apple Intelligence for a one-word answer, like `test(_:)` for a downloaded model.
-    func testApple() async throws -> GenerationStats {
-        guard !isBusy else { throw EngineError.busy }
-        testingApple = true
-        defer { testingApple = false }
-        return try await apple.test()
-    }
 
     // MARK: - Models
 
-    /// Frees the model's memory, after saving the state of the chat it holds. It's loaded again
-    /// when next needed. Called on a memory warning, on leaving the app, and from Settings.
     /// Quitting (the Mac): stops any reply, saves the model's state and frees it. llama.cpp's
     /// Metal device is torn down as the process exits and aborts if a model still holds its buffers.
     func shutDown() async {
@@ -965,63 +610,64 @@ final class Engine {
         pendingLoad = nil
         if let old = llama {
             llama = nil
-            loadedModel = nil
             await old.flush()  // `old` is freed here, its last reference gone
         }
     }
 
+    /// Frees the model's memory, after saving the state of the chat it holds. It's loaded again
+    /// when next needed. Called on a memory warning.
     func unload() {
         guard !isBusy, let old = llama else { return }
         llama = nil
-        loadedModel = nil
         Task { await old.flush() }  // `old` is freed when this is done
     }
 
-    /// One load at a time, shared by whoever asks for the same model (a `prepare` and the message
-    /// sent while it was still loading). Cancelling the caller's task (Stop) abandons the load.
-    private func load(_ model: CatalogModel) async throws -> LlamaModel {
-        while true {
-            if let llama, loadedModel == model { return llama }
-            guard let other = pendingLoad, other.model != model else { break }
-            other.cancel.set()  // a different model was on its way: it has to go first
-            _ = try? await other.task.value
-            if pendingLoad === other { pendingLoad = nil }
+    /// Removes this device's model: stops any reply on it, frees it, deletes its files.
+    func deleteModel() async {
+        if live?.mode.isOnDevice == true {
+            let running = task
+            stop()
+            await running?.value
+        }
+        pendingLoad?.cancel.set()
+        _ = try? await pendingLoad?.task.value
+        if let old = llama {
+            llama = nil
+            await old.flush()
+        }
+        store.delete()
+    }
+
+    /// One load at a time, shared by whoever asks (a `prepare` and the message sent while it was
+    /// still loading). Cancelling the caller's task (Stop) abandons the load.
+    private func load() async throws -> LlamaModel {
+        let model = store.model
+        if let llama, loadedID == model.id { return llama }
+        if let old = llama {  // the store moved on to a better model: free the old one first
+            llama = nil
+            await old.flush()
+            if llama != nil || pendingLoad != nil { return try await load() }
         }
         let pending: PendingLoad
         if let current = pendingLoad {
             pending = current
         } else {
-            if let old = llama {  // free the old model before mapping the new one
-                llama = nil
-                loadedModel = nil
-                await old.flush()
-                // Anything may have happened meanwhile: start over if someone else got here first.
-                if llama != nil || pendingLoad != nil { return try await load(model) }
-            }
-            let path = store.url(for: model).path
             var options = model.options
-            // Gemma drafts with its MTP model once that's downloaded; until then it runs without
-            // (and the drafter is fetched quietly if there's a network).
-            if let drafter = model.drafter {
-                if store.states[drafter.id] == .ready {
-                    options.draftModel = store.url(for: drafter).path
-                } else {
-                    store.fetchMissingDrafters()
-                }
-            }
+            // Gemma drafts with its MTP model once that's downloaded; until then it runs without.
+            if store.has(model.drafter) { options.draftModel = store.url(for: model.drafter).path }
+            let path = store.url(for: model.weights).path
             let cancel = CancelFlag()
             let report: @Sendable (Float) -> Void = { progress in
                 Task { @MainActor in
                     if let live = self.live, case .loading = live.phase { live.phase = .loading(Double(progress)) }
                 }
             }
-            pending = PendingLoad(model: model, cancel: cancel, task: Task.detached(priority: .userInitiated) {
+            pending = PendingLoad(cancel: cancel, task: Task.detached(priority: .userInitiated) {
                 try LlamaModel(path: path, options: options, progress: report, isCancelled: { cancel.isSet })
             })
             pendingLoad = pending
-            loadingModel = model
         }
-        if let live, live.mode == model.tier { live.phase = .loading(0) }
+        if let live, live.mode.isOnDevice { live.phase = .loading(0) }
         do {
             let loaded = try await withTaskCancellationHandler {
                 try await pending.task.value
@@ -1030,44 +676,24 @@ final class Engine {
             }
             if pendingLoad === pending {
                 pendingLoad = nil
-                loadingModel = nil
                 llama = loaded
-                loadedModel = model
+                loadedID = model.id
             }
-            guard let llama, loadedModel == model else { throw CancellationError() }
+            guard let llama else { throw CancellationError() }
             return llama
         } catch {
-            if pendingLoad === pending {
-                pendingLoad = nil
-                loadingModel = nil
-            }
+            if pendingLoad === pending { pendingLoad = nil }
             throw error
         }
-    }
-
-    /// Loads a model and asks for a one-word answer: proof it works on this device, and its speed.
-    func test(_ model: CatalogModel) async throws -> GenerationStats {
-        guard !isBusy else { throw EngineError.busy }
-        testing = model
-        defer { testing = nil }
-        let llama = try await load(model)
-        var result = GenerationStats()
-        let question = [ChatMessage(role: .user, content: "Reply with one word: ready.")]
-        for try await event in llama.generate(question, sampling: model.sampling(thinking: .off), maxTokens: 400) {
-            if case .done(let s) = event { result = s }
-        }
-        return result
     }
 }
 
 /// A model on its way into memory.
 private final class PendingLoad {
-    let model: CatalogModel
     let cancel: CancelFlag
     let task: Task<LlamaModel, Error>
 
-    init(model: CatalogModel, cancel: CancelFlag, task: Task<LlamaModel, Error>) {
-        self.model = model
+    init(cancel: CancelFlag, task: Task<LlamaModel, Error>) {
         self.cancel = cancel
         self.task = task
     }
@@ -1077,30 +703,6 @@ nonisolated final class CancelFlag: Sendable {
     private let flag = OSAllocatedUnfairLock(initialState: false)
     var isSet: Bool { flag.withLock { $0 } }
     func set() { flag.withLock { $0 = true } }
-}
-
-/// What a model usually does on this device: a running average over its replies, kept in
-/// UserDefaults, for telling the user what to expect ("usually ~4 s").
-nonisolated struct TypicalSpeed: Codable, Sendable {
-    /// Seconds from sending to the first token, with the model already loaded.
-    var firstToken: Double
-    var tokensPerSecond: Double
-    var replies: Int
-
-    static func stored(for key: String) -> TypicalSpeed? {
-        UserDefaults.standard.data(forKey: "speed.\(key)").flatMap { try? JSONDecoder().decode(TypicalSpeed.self, from: $0) }
-    }
-
-    /// Recent replies count for more, so the figure follows a model change or a hot device.
-    static func record(firstToken: Double?, tokensPerSecond: Double, for key: String) {
-        guard var speed = stored(for: key) ?? firstToken.map({ TypicalSpeed(firstToken: $0, tokensPerSecond: tokensPerSecond, replies: 0) })
-        else { return }
-        let weight = speed.replies == 0 ? 1 : 0.3
-        if let firstToken { speed.firstToken += (firstToken - speed.firstToken) * weight }
-        speed.tokensPerSecond += (tokensPerSecond - speed.tokensPerSecond) * weight
-        speed.replies += 1
-        if let data = try? JSONEncoder().encode(speed) { UserDefaults.standard.set(data, forKey: "speed.\(key)") }
-    }
 }
 
 /// The reply being written. Plain (not observed): the chat screen polls `revision` a few times a
@@ -1126,14 +728,13 @@ final class LiveReply {
 
     let id: UUID
     let mode: Mode
-    /// For `.mac`: the Ollama model answering.
+    /// For `.mac`: the model answering, by id.
     var macModel = ""
     let started = Date()
     var phase: Phase = .waiting {
         didSet {
             revision += 1
             if phase.step != oldValue.step { phaseStarted = Date() }
-            if case .loading = phase { waitedForLoad = true }
         }
     }
     private(set) var thinking = ""
@@ -1145,23 +746,12 @@ final class LiveReply {
     var stopNote: String?
     /// When the current phase began (loading, reading, thinking…), for "Thinking · 12 s".
     private(set) var phaseStarted = Date()
-    /// Seconds from sending to the first token of thinking or answer. Nil until it arrives.
-    private(set) var firstTokenSeconds: Double?
-    /// Seconds from sending to the first token of the answer itself (after any thinking).
-    private(set) var firstAnswerSeconds: Double?
-    /// When the last token arrived.
-    private(set) var lastTokenAt: Date?
-    /// On device: seconds spent loading the model (and its projector) for this reply; about 0 when
-    /// it was already loaded. Nil on the Mac, where Ollama reports its own.
-    var loadSeconds: Double?
-    /// On device: the model's name ("Gemma 4 E2B"), once known.
-    var modelTitle: String?
+    /// On device: the model answering, as it was when the reply began.
+    var modelTitle = ""
     /// Asked to think, or a Mac model that always does.
     var thinkingAsked = false
     /// The oldest turns were left out of what the model saw, to fit its context.
     var trimmed = false
-    /// The model had to be loaded before this reply could start.
-    private(set) var waitedForLoad = false
 
     init(id: UUID, mode: Mode) {
         self.id = id
@@ -1169,17 +759,12 @@ final class LiveReply {
     }
 
     func append(thinking t: String) {
-        if firstTokenSeconds == nil { firstTokenSeconds = Date().timeIntervalSince(started) }
         thinking += t
-        lastTokenAt = Date()
         phase = .thinking
     }
 
     func append(text t: String) {
-        if firstTokenSeconds == nil { firstTokenSeconds = Date().timeIntervalSince(started) }
-        if firstAnswerSeconds == nil { firstAnswerSeconds = Date().timeIntervalSince(started) }
         text += t
-        lastTokenAt = Date()
         phase = .answering
     }
 
@@ -1187,27 +772,9 @@ final class LiveReply {
         searches.append(search)
         revision += 1
     }
-
-    /// One line for the reply while it's under way, e.g. "Thinking · 12 s".
-    var status: String? {
-        let seconds = Int(Date().timeIntervalSince(started))
-        switch phase {
-        case .loading(let p): return "Loading model \(Int(p * 100))%"
-        case .waiting: return mode == .mac ? "Asking the Mac…" : "Reading your question…"
-        case .reading(let p): return "Reading the chat \(Int(p * 100))%"
-        case .thinking: return "Thinking · \(seconds) s"
-        case .searching(let q): return "Searching for “\(q)”"
-        case .answering: return nil
-        }
-    }
 }
 
 nonisolated enum EngineError: LocalizedError {
-    case notDownloaded(Mode), busy
-    var errorDescription: String? {
-        switch self {
-        case .notDownloaded(let mode): "\(mode.title) isn't on this device yet. Get it in Settings > Models."
-        case .busy: "Lantern is answering. Try again when it's done."
-        }
-    }
+    case notDownloaded
+    var errorDescription: String? { "\(CatalogModel.device.name) hasn't been downloaded yet." }
 }

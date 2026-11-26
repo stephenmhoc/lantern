@@ -1,128 +1,176 @@
-import LlamaKit
 #if DEBUG
 import Foundation
-import CoreSpotlight
+import LlamaKit
+import Network
 import SwiftData
 import UIKit
 
-/// Launch arguments for checking the shell in the simulator without tapping
-/// (`simctl launch <device> com.merimerimeri.Lantern -seedChats -ui inspector`):
-/// - `-seedChats`: adds sample chats across the sidebar's sections, once.
-/// - `-ui readiness|settings|personalization|inspector|search:<text>`: opens that on launch.
-/// - `-ui delete|newchat|sidebar|swipe|swipepin|next|window`: runs that action a second after launch (window:
-///   opens the oldest chat in a new window).
-/// - `-testflight` (in ReadinessView): pretend to be a TestFlight install.
-/// - `-openURL <lantern://…>`: the app opens the link itself two seconds after launch, through the
-///   system like any other app would, without `simctl openurl`'s "Open in Lantern?" prompt.
-/// - `-ui inspector` opens the chat's info panel.
-/// - `-ui compare` (or `compare:b`): adds a chat whose last reply is a comparison (Gemma 4 E2B on
-///   this device against Inkling 2 Mini on the Mac, with sample metrics), opens it and shows the
-///   compare sheet on A (or B). Add `:metrics` (`compare:b:metrics`) to scroll to the table.
-///   `compare:chat` opens the chat only, for the answer's ‹ 1/2 › pager.
-/// - `-ui composer:focus|composer:text`: the message box expanded, focused or holding a draft.
-/// - `-ui modelmenu|modelmenu:collapsed`: the model picker open, from the expanded or collapsed box.
-/// - `-intent ask:<text>|new:<mode>|open:<chat title>`: runs that App Intent's `perform()`.
-/// - `-spotlightQuery <text>`: searches Lantern's own Spotlight items after indexing and prints them.
+/// Launch arguments for a Debug build in the simulator
+/// (`simctl launch <device> com.merimerimeri.Lantern -seedChats -ui sidebar`):
+/// - `-model e2b|e4b|12b`: this device's model (`CatalogModel.device`); the simulator reports the
+///   Mac's memory and runs llama.cpp on the CPU, so E2B is the one to use there.
+/// - `-seedChats`: sample chats, once, the newest holding a comparison and a web search.
+/// - `-ui welcome|model|modelpage|settings|mac|personalization|sidebar|search:<text>|chat|picker|compare|comparepicker`:
+///   opens that a second after launch (`chat` and the last three open the seeded chat first).
+/// - `-testflight`: show the build's expiry date in Settings.
+/// - `-e2e [-mac]`: the app's end-to-end check (`scripts/e2e.sh`): a chat through `Engine`.
+/// - `-pairCode <code>`: pairs by a typed code (`DebugPairing`).
+/// - The Mac: `-role serve|client|none` sets what it does before launch goes on (`none`: the first
+///   run's choice); `-ui role|pair` opens that choice, or Pair a Device; `-snapshot`, below.
 enum DebugLaunch {
     static var arguments: [String] { ProcessInfo.processInfo.arguments }
 
-    static var ui: String? {
-        guard let i = arguments.firstIndex(of: "-ui"), arguments.indices.contains(i + 1) else { return nil }
+    static var ui: String? { value(after: "-ui") }
+
+    static func value(after flag: String) -> String? {
+        guard let i = arguments.firstIndex(of: flag), arguments.indices.contains(i + 1) else { return nil }
         return arguments[i + 1]
     }
 
-    /// `-importModel <path>`: runs the Readiness import on a file, printing the result.
-    static var importPath: String? {
-        guard let i = arguments.firstIndex(of: "-importModel"), arguments.indices.contains(i + 1) else { return nil }
-        return arguments[i + 1]
+    #if targetEnvironment(macCatalyst)
+    /// The Mac: `-dark` or `-light` whatever the system is, and `-snapshot <path>`, which saves
+    /// the window as `<path>.png`, and a sheet or popover over it as `-1.png`…, `-snapshotDelay`
+    /// seconds after launch (4 unless given), then quits.
+    static func snapshot() {
+        let style: UIUserInterfaceStyle = arguments.contains("-dark") ? .dark : arguments.contains("-light") ? .light : .unspecified
+        func window() -> UIWindow? {
+            let all = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows)
+            all.forEach { $0.overrideUserInterfaceStyle = style }
+            return all.first { !$0.isHidden && type(of: $0) == UIWindow.self }
+        }
+        _ = window()
+        guard let path = value(after: "-snapshot") else { return }
+        Task {
+            try? await Task.sleep(for: .seconds(value(after: "-snapshotDelay").flatMap(Double.init) ?? 4))
+            guard let main = window() else { exit(1) }
+            try? await Task.sleep(for: .seconds(0.5))
+            // A sheet or popover is a window of its own to AppKit, but its view is UIKit's, in
+            // this window's hierarchy: drawn on its own, largest first like AppKit's windows.
+            // Other windows (Settings) too.
+            let windows = [main] + UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+                .compactMap { $0.windows.first { !$0.isHidden && type(of: $0) == UIWindow.self } }
+                .filter { $0 !== main }
+            var views: [UIView] = []
+            for window in windows {
+                views.append(window)
+                var presented = window.rootViewController?.presentedViewController
+                while let controller = presented {
+                    views.append(controller.view)
+                    presented = controller.presentedViewController
+                }
+            }
+            views.sort { $0.bounds.width * $0.bounds.height > $1.bounds.width * $1.bounds.height }
+            let contents = views.map { view in
+                UIGraphicsImageRenderer(bounds: view.bounds).pngData { _ in
+                    view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+                }
+            }
+            MacUpdater.support?.snapshot(path, contents: contents)
+            exit(0)
+        }
     }
+    #endif
+
+    /// What `RootView` lets `-ui` do.
+    struct Hooks {
+        var settings: (SettingsPage?) -> Void
+        var sheet: (RootView.Sheet) -> Void
+        var sidebar: () -> Void
+        var search: (String) -> Void
+        var open: (_ title: String) -> Void
+    }
+
+    static func open(in hooks: Hooks) {
+        #if targetEnvironment(macCatalyst)
+        snapshot()
+        #endif
+        guard let ui else { return }
+        Task {
+            try? await Task.sleep(for: .seconds(1))
+            switch ui {
+            case "welcome": hooks.sheet(.welcome)
+            case "role": hooks.sheet(.role)
+            case "pair": hooks.settings(.pairDevice)
+            case "model": hooks.sheet(.model)
+            case "settings": hooks.settings(nil)
+            case "mac": hooks.settings(.mac)
+            case "modelpage": hooks.settings(.model)
+            case "personalization": hooks.settings(.personalization)
+            case "sidebar": hooks.sidebar()
+            case "chat", "picker", "compare", "comparepicker": hooks.open(sampleTitle)
+            case let ui where ui.hasPrefix("search:"):
+                hooks.sidebar()
+                hooks.search(String(ui.dropFirst("search:".count)))
+            default: break
+            }
+        }
+    }
+
+    static let sampleTitle = "Keeping bread fresh"
 
     static func seed(_ context: ModelContext) {
-        if ui?.hasPrefix("compare") == true { seedComparison(context) }
-        if ui == "search" { seedSearch(context) }
+        #if targetEnvironment(macCatalyst)
+        if let role = value(after: "-role") {
+            if role == "none" {
+                UserDefaults.standard.removeObject(forKey: MacRole.key)
+            } else {
+                UserDefaults.standard.set(role, forKey: MacRole.key)
+            }
+        }
+        #endif
+        let sample = sampleTitle
         guard arguments.contains("-seedChats"),
-              (try? context.fetchCount(FetchDescriptor<Conversation>())) == 0 else { return }
+              (try? context.fetchCount(FetchDescriptor<Conversation>(predicate: #Predicate { $0.title == sample }))) == 0 else { return }
         let day: TimeInterval = 86_400
-        let samples: [(String, TimeInterval, Mode, Bool)] = [
-            ("Sourdough starter schedule", -40 * day, .smart, true),
-            ("Explain how a heat pump works", -600, .fast, false),
-            ("Packing list for a weekend hike", -1.2 * day, .fast, false),
-            ("Rewrite this email more politely", -3 * day, .mac, false),
-            ("What is a Fourier transform?", -20 * day, .smart, false),
-            ("Plan a vegetable bed rotation", -2 * day, .qwen, false),
-            ("Ideas for a rainy afternoon", -5 * day, .apple, false),
+        let device = CatalogModel.device.name
+        let samples: [(String, TimeInterval)] = [
+            ("How a heat pump works", -3_600),
+            ("Packing list for a weekend hike", -1.2 * day),
+            ("Vegetable bed rotation", -2 * day),
+            ("Friendlier email wording", -3 * day),
+            ("Ideas for a rainy afternoon", -5 * day),
+            ("What a Fourier transform is", -20 * day),
+            ("Sourdough starter schedule", -40 * day),
         ]
-        for (title, age, mode, pinned) in samples {
-            let model = mode == .mac ? "Inkling 2 Mini on your Mac" : mode.title
-            let c = Conversation(mode: mode)
+        for (title, age) in samples {
+            let c = Conversation(mode: .device)
             c.title = title
             c.lastActive = Date(timeIntervalSinceNow: age)
             c.created = c.lastActive
-            c.pinned = pinned
             c.messages = [
                 StoredMessage(isUser: true, content: title + "?"),
-                StoredMessage(isUser: false, content: "Here's a short answer about \(title.lowercased()).",
-                              footnote: "\(model) · 14.2 tok/s · 0.8 s to first token"),
+                StoredMessage(isUser: false, content: "Here's a short answer about \(title.lowercased()).", footnote: device),
             ]
             context.insert(c)
         }
-        try? context.save()
-    }
-}
 
-extension DebugLaunch {
-    /// The `-ui compare` chat's `stateID`, for opening it by its link.
-    static let comparisonChatID = "debug-compare"
-
-    /// A chat whose last reply holds a comparison: A from Gemma 4 E2B on this device, B from
-    /// Inkling 2 Mini on the Mac. Added once; it becomes the latest chat.
-    static func seedComparison(_ context: ModelContext) {
-        let id = comparisonChatID
-        let existing = (try? context.fetch(FetchDescriptor<Conversation>(predicate: #Predicate { $0.stateID == id }))) ?? []
-        if let chat = existing.first {
-            chat.lastActive = .now
-            try? context.save()
-            return
-        }
+        // A chat with a web search, then a question answered twice: by this device's model (A)
+        // and by the Mac's, thinking (B).
         let chat = Conversation(mode: .mac)
-        chat.stateID = id
-        chat.title = "Keeping bread fresh"
+        chat.title = sampleTitle
         chat.macModel = "inkling-2-mini:latest"
+        chat.webSearch = true
         chat.lastActive = .now
+        var searched = StoredMessage(isUser: false)
+        searched.searches = [
+            WebSearch(query: "how long does sourdough stay fresh", results: [
+                .init(title: "Storing sourdough bread", url: "https://www.example.com/storing-sourdough",
+                      content: "Sourdough keeps for three to five days at room temperature…"),
+                .init(title: "Why sourdough lasts longer", url: "https://www.example.org/sourdough-shelf-life",
+                      content: "Its acidity slows staling and mould."),
+            ]),
+        ]
+        searched.content = "A sourdough loaf stays good for **three to five days** at room temperature. Its acidity slows both staling and mould, so it outlasts most yeasted breads."
+        searched.footnote = device
+        searched.metrics = ReplyMetrics(modeRaw: Mode.device.rawValue, modelTitle: device)
+
         let compareID = UUID()
-        let question = "What's the best way to keep a loaf of sourdough fresh for a few days?"
-
-        var a = ReplyMetrics(modeRaw: Mode.fast.rawValue, modelTitle: Mode.fast.title)
+        var a = ReplyMetrics(modeRaw: Mode.device.rawValue, modelTitle: device)
         a.compareID = compareID
-        a.loadSeconds = 3.8
-        a.firstTokenSeconds = 0.6
-        a.firstAnswerSeconds = 0.6
-        a.promptTokens = 412
-        a.reusedTokens = 380
-        a.promptSeconds = 0.4
-        a.restored = false
-        a.generatedTokens = 236
-        a.generateSeconds = 11.2
-        a.tokensPerSecond = 21.1
-        a.totalSeconds = 15.6
         a.thinking = false
-
-        var b = ReplyMetrics(modeRaw: Mode.mac.rawValue, macModel: "inkling-2-mini:latest", modelTitle: "Inkling 2 Mini")
+        var b = ReplyMetrics(modeRaw: Mode.mac.rawValue, macModel: chat.macModel, modelTitle: "Inkling 2 Mini")
         b.compareID = compareID
-        b.loadSeconds = 0
-        b.firstTokenSeconds = 0.9
-        b.firstAnswerSeconds = 6.4
-        b.promptTokens = 431
-        b.promptSeconds = 0.3
-        b.generatedTokens = 512
-        b.generateSeconds = 36.5
-        b.tokensPerSecond = 14.0
-        b.totalSeconds = 37.8
-        b.findSeconds = 0.2
-        b.connectSeconds = 0.05
-        b.route = "Home network"
         b.thinking = true
-
         var reply = StoredMessage(isUser: false)
         reply.content = """
         Keep it **cut side down** on a wooden board for the first day, then in a bread bag or box.
@@ -135,7 +183,7 @@ extension DebugLaunch {
         """
         reply.thinking = "The user wants storage advice. Cover crust, cut side, fridge vs freezer."
         reply.thoughtSeconds = 5
-        reply.footnote = "Inkling 2 Mini · 14.0 tok/s · 0.9 s to first token"
+        reply.footnote = "Inkling 2 Mini"
         reply.metrics = b
         var older = StoredMessage(isUser: false)
         older.content = """
@@ -152,107 +200,115 @@ extension DebugLaunch {
 
         Don't refrigerate it; that makes it stale faster.
         """
-        older.footnote = "Gemma 4 E2B · 21.1 tok/s · 0.6 s to first token"
+        older.footnote = device
         older.metrics = a
         reply.versions = [ReplyVersion(older)]
-        chat.messages = [StoredMessage(isUser: true, content: question), reply]
-        context.insert(chat)
-        try? context.save()
-    }
-
-    static let searchChatID = "debug-search"
-
-    /// `-ui search`: a chat on the Mac whose answer ran two web searches, one of which failed.
-    static func seedSearch(_ context: ModelContext) {
-        let id = searchChatID
-        if let chat = ((try? context.fetch(FetchDescriptor<Conversation>(predicate: #Predicate { $0.stateID == id }))) ?? []).first {
-            context.delete(chat)
-        }
-        let chat = Conversation(mode: .mac)
-        chat.stateID = id
-        chat.title = "Ferry to Bainbridge"
-        chat.macModel = "inkling-2-mini:latest"
-        chat.lastActive = .now
-        var reply = StoredMessage(isUser: false)
-        reply.searches = [
-            WebSearch(query: "Seattle Bainbridge ferry schedule today", results: [
-                .init(title: "Seattle / Bainbridge Island – Sailing Schedule", url: "https://wsdot.com/ferries/schedule/seattle-bainbridge",
-                      content: "Departs Seattle 5:30 PM, 6:20 PM, 7:05 PM…"),
-                .init(title: "Bainbridge ferry delays and alerts", url: "https://www.example.com/bainbridge-alerts",
-                      content: "One-boat service this evening."),
-            ]),
-            WebSearch(query: "Bainbridge ferry vehicle wait time", error: "The search took too long."),
+        chat.messages = [
+            StoredMessage(isUser: true, content: "How long does a sourdough loaf stay fresh?"), searched,
+            StoredMessage(isUser: true, content: "What's the best way to keep it fresh for a few days?"), reply,
         ]
-        reply.content = "The next sailings from Seattle are at **5:30**, **6:20** and **7:05 PM**. There's one-boat service this evening, so expect waits for cars."
-        reply.footnote = "Inkling 2 Mini on your Mac · 72.0 tok/s · 0.3 s to first token"
-        chat.messages = [StoredMessage(isUser: true, content: "When's the next ferry to Bainbridge?"), reply]
         context.insert(chat)
         try? context.save()
     }
+}
 
-    private static var ranSystem = false
-
-    static func value(after flag: String) -> String? {
-        guard let i = arguments.firstIndex(of: flag), arguments.indices.contains(i + 1) else { return nil }
-        return arguments[i + 1]
-    }
-
-    /// `-openURL` and `-intent`, once per launch.
-    static func system() async {
-        guard !ranSystem else { return }
-        ranSystem = true
-        try? await Task.sleep(for: .seconds(2))
-        if ui?.hasPrefix("compare") == true {
-            _ = await UIApplication.shared.open(LanternLink.chat(id: comparisonChatID).url)
+/// `-pairCode <code>`: pairs with the Mac showing that code, as Settings › Mac's Enter Code does
+/// (Bonjour, then the proof), and prints `PAIR …` lines. Never prints the token.
+@MainActor
+enum DebugPairing {
+    static func run(_ engine: Engine) async {
+        guard let code = DebugLaunch.value(after: "-pairCode") else { return }
+        setvbuf(stdout, nil, _IOLBF, 0)
+        let browser = BridgeBrowser()
+        browser.start()
+        defer { browser.stop() }
+        for _ in 0..<(DebugLaunch.value(after: "-pairAt") == nil ? 40 : 4) where browser.advertised.isEmpty { try? await Task.sleep(for: .milliseconds(250)) }
+        print("PAIR found: \(browser.found.map { $0.name + ($0.fingerprint == nil ? " (no fingerprint)" : "") })\(browser.problem.map { " problem: " + $0 } ?? "")")
+        // `-pairAt <host:port>@<fingerprint>`: that bridge instead of Bonjour's (a Debug build may
+        // not have local network access granted yet).
+        var bridges = browser.advertised
+        if let at = DebugLaunch.value(after: "-pairAt")?.split(separator: "@"), at.count == 2,
+           let colon = at[0].lastIndex(of: ":"), let port = NWEndpoint.Port(String(at[0][at[0].index(after: colon)...])) {
+            bridges = [.init(name: "Bridge at \(at[0])", fingerprint: String(at[1]),
+                             endpoint: .hostPort(host: .init(String(at[0][..<colon])), port: port))]
         }
-        if ui == "search" { _ = await UIApplication.shared.open(LanternLink.chat(id: searchChatID).url) }
-        if let string = value(after: "-openURL"), let url = URL(string: string) {
-            let opened = await UIApplication.shared.open(url)
-            print("OPENURL \(string): \(opened)")
-        }
-        if let text = value(after: "-spotlightQuery") {
-            try? await Task.sleep(for: .seconds(4))  // after SpotlightIndex's launch pass
-            let context = CSSearchQueryContext()
-            context.fetchAttributes = ["title"]
-            let query = CSSearchQuery(queryString: "title == \"*\(text)*\"cd", queryContext: context)
-            do {
-                for try await result in query.results {
-                    print("SPOTLIGHT found \(result.item.uniqueIdentifier): \(result.item.attributeSet.title ?? "")")
-                }
-                print("SPOTLIGHT query done")
-            } catch {
-                print("SPOTLIGHT query failed: \(error)")
-            }
-        }
-        guard let spec = value(after: "-intent") else { return }
-        let (kind, argument) = spec.split(separator: ":", maxSplits: 1).map(String.init).splitPair
         do {
-            switch kind {
-            case "ask":
-                let intent = AskLanternIntent()
-                intent.text = argument
-                intent.mode = .usual
-                _ = try await intent.perform()
-            case "new":
-                _ = try await NewChatIntent(mode: ChatModeChoice(rawValue: argument) ?? .usual).perform()
-            case "open":
-                guard let chat = try await ChatQuery().entities(matching: argument).first else {
-                    print("INTENT no chat matches \(argument)"); return
-                }
-                let intent = OpenChatIntent()
-                intent.target = chat
-                _ = try await intent.perform()
-            default:
-                print("INTENT unknown \(kind)"); return
+            let paired = try await MacPairing.pair(code: code, device: Device.pairingName, bridges: bridges)
+            engine.mac.configure(name: paired.name, lan: paired.lan, tailnet: paired.tailnet)
+            await engine.mac.resolve()
+            let join = switch paired.join {
+            case .key: "a join key"
+            case .notConfigured: "not configured"
+            case .failed(let why): "failed: \(why)"
             }
-            print("INTENT \(spec): performed")
+            print("PAIR ok: \(paired.name) lan=\(paired.lan) tailnet=\(paired.tailnet.isEmpty ? "-" : paired.tailnet) tailscale=\(join) route=\(engine.mac.route.label) models=\(engine.mac.models)")
         } catch {
-            print("INTENT \(spec): \(error)")
+            print("PAIR failed: \(error.localizedDescription)")
         }
     }
 }
 
-private extension Array where Element == String {
-    var splitPair: (String, String) { (first ?? "", count > 1 ? self[1] : "") }
+/// `-e2e [-mac]`: the app's one end-to-end check, run by `scripts/e2e.sh`. Through `Engine`, in a
+/// store of its own (no chats touched): send a question and get an answer, retry it, then reopen
+/// the chat (the model unloaded, so it comes back from its saved state) and ask a follow-up.
+/// Prints `E2E PASS|FAIL` lines and `E2E done`.
+@MainActor
+enum EndToEnd {
+    private static var ran = false
+
+    static func run(_ engine: Engine) async {
+        guard DebugLaunch.arguments.contains("-e2e"), !ran else { return }
+        ran = true
+        setvbuf(stdout, nil, _IOLBF, 0)  // each line as it's printed, even into a pipe
+        var failed = false
+        func check(_ what: String, _ ok: Bool) {
+            print("E2E \(ok ? "PASS" : "FAIL"): \(what)")
+            if !ok { failed = true }
+        }
+        defer { print(failed ? "E2E done: FAILED" : "E2E done: ok") }
+        guard let container = try? ModelContainer(
+            for: Conversation.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true, cloudKitDatabase: .none)) else { return check("a store opens", false) }
+        let mac = DebugLaunch.arguments.contains("-mac")
+        let chat = Conversation(mode: mac ? .mac : .device)
+        chat.thinking = .off
+        chat.webSearch = false
+        container.mainContext.insert(chat)
+        try? container.mainContext.save()
+        func idle() async {
+            repeat { try? await Task.sleep(for: .milliseconds(200)) } while engine.isBusy
+            let m = chat.messages.last
+            print("E2E reply: \((m?.content ?? "").prefix(80).debugDescription) | \(m?.footnote ?? "") | error: \(m?.error ?? "none")")
+        }
+        func answered() -> Bool {
+            guard let m = chat.messages.last else { return false }
+            return !m.isUser && m.finished && m.error == nil && !m.content.isEmpty
+        }
+        if !mac { check("\(engine.store.model.name) is downloaded", engine.store.isReady) }
+
+        engine.send("In one sentence, what is a lantern?", in: chat)
+        await idle()
+        check("a question gets an answer", answered() && chat.messages.count == 2)
+        check("the answer names its model", chat.messages.last?.metrics?.modelTitle.isEmpty == false)
+        let first = chat.messages.last?.content
+
+        engine.retry(in: chat)
+        await idle()
+        check("retry answers again", answered() && chat.messages.count == 2)
+        check("retry keeps the first answer as a version", chat.messages.last?.versions?.first?.content == first)
+
+        // Reopen: the model is freed (its state saved) and loaded again for the chat.
+        try? await Task.sleep(for: .seconds(1))
+        engine.unload()
+        try? await Task.sleep(for: .seconds(1))
+        if !mac {
+            let saved = FileManager.default.subpaths(atPath: Engine.stateDirectory(for: chat).path) ?? []
+            check("the chat's state is saved", !saved.isEmpty)
+        }
+        engine.prepare(chat)
+        engine.send("Now say that in French.", in: chat)
+        await idle()
+        check("the reopened chat answers a follow-up", answered() && chat.messages.count == 4)
+        engine.forgetState(for: chat)
+    }
 }
 #endif

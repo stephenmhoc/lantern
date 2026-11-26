@@ -1,10 +1,5 @@
-#if os(iOS)
 import UIKit
 typealias PlatformImage = UIImage
-#else
-import AppKit
-typealias PlatformImage = NSImage
-#endif
 import PDFKit
 import UniformTypeIdentifiers
 
@@ -71,7 +66,6 @@ nonisolated enum AttachmentReader {
         let size = image.size
         let scale = min(1, imageSide / max(size.width, size.height, 1))
         let target = CGSize(width: (size.width * scale).rounded(), height: (size.height * scale).rounded())
-        #if os(iOS)
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = true
@@ -81,20 +75,6 @@ nonisolated enum AttachmentReader {
             image.draw(in: CGRect(origin: .zero, size: target))
         }
         guard let data = resized.jpegData(compressionQuality: 0.85) else { return nil }
-        #else
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: Int(target.width), pixelsHigh: Int(target.height),
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
-        rep.size = target  // one point a pixel, whatever the image's own resolution
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSColor.white.setFill()  // transparent PNGs get a white background, not black
-        NSRect(origin: .zero, size: target).fill()
-        image.draw(in: NSRect(origin: .zero, size: target))
-        NSGraphicsContext.restoreGraphicsState()
-        guard let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else { return nil }
-        #endif
         return Attachment(name: name, image: data)
     }
 

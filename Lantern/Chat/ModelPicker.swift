@@ -1,66 +1,82 @@
 import SwiftUI
 
-/// The composer's model button opens this: a sheet on iPhone (half height, scrolls, pulls up to
-/// full), a popover on iPad. Thinking is a switch at the top: every model either thinks or doesn't
-/// (`Thinking.low` and `.high` do the same), so there's no level to pick. Then the models on this
-/// device and on the computer, one row each; picking one closes it.
+/// The composer's model button opens this: a sheet on iPhone (half height, pulls up to full), a
+/// popover on iPad. The two models (this device's and the Mac's), then how the chat answers:
+/// Think First and Search the Web, a switch each. Picking a model closes it.
 ///
-/// It replaced a UIMenu, which put Thinking in a submenu at the very end of a list too long for
-/// the space above the composer. The answer menu's Compare With uses it too (`ComparePicker`), with
-/// the switch for the second answer.
+/// The answer menu's Compare With uses it too (`ComparePicker`), with the thinking switch for the
+/// second answer and no search switch.
 struct ModelPicker: View {
     struct Row: Identifiable {
         let choice: ModelChoice
-        let title: String
-        let symbol: String
-        /// Only when it says something: why a model can't be picked, or the computer can't be reached.
-        let note: String?
-        let enabled: Bool
-        let current: Bool
+        var title: String
+        var symbol: String
+        /// Where it runs, or why it can't be picked.
+        var note: String
+        var enabled: Bool
+        var current: Bool
+        /// Leads somewhere (Settings) rather than being picked.
+        var opens = false
         var id: ModelChoice { choice }
-    }
-
-    struct Group {
-        let title: String
-        let rows: [Row]
     }
 
     var title = "Model"
     /// Compare With closes with Cancel: picking a model is what starts it.
     var cancels = false
-    /// Read while drawing, so the rows follow the engine and the chat (a model finishing its
-    /// download, the computer answering) and the switch while the picker is open.
-    let groups: (_ thinking: Bool) -> [Group]
-    /// Nil when the chat's model doesn't think at all (Apple Intelligence).
-    let thinking: Binding<Bool>?
+    /// Read while drawing, so the rows follow the engine and the chat (the download's progress,
+    /// the Mac answering) and the switch while the picker is open.
+    let rows: (_ thinking: Bool) -> [Row]
+    let thinking: Binding<Bool>
     var thinkingFooter = "The model reasons before it answers: slower, but better at hard questions."
+    /// Nil where searching isn't offered (Compare With).
+    var search: Binding<Bool>?
+    /// Opens Settings, where the Tavily key goes.
+    var setUpSearch: (() -> Void)?
     let select: (ModelChoice) -> Void
-    let getModels: (() -> Void)?
     let close: () -> Void
+    @Environment(ModelStore.self) private var store
+    @Environment(MacLink.self) private var mac
 
     var body: some View {
         NavigationStack {
             List {
-                if let thinking {
+                Section {
+                    ForEach(rows(thinking.wrappedValue)) { row($0) }
+                }
+                Section {
+                    Toggle(isOn: thinking) { Label("Think First", systemImage: "lightbulb") }
+                } footer: {
+                    Text(thinkingFooter)
+                }
+                if let search {
                     Section {
-                        Toggle(isOn: thinking) {
-                            Label("Think First", systemImage: "lightbulb")
+                        if WebSearcher.hasKey {
+                            Toggle(isOn: search) { Label("Search the Web", systemImage: "globe") }
+                        } else {
+                            // No key yet: the row leads to where it goes, rather than a switch that does nothing.
+                            Button { setUpSearch?() } label: {
+                                LabeledContent {
+                                    HStack(spacing: 4) {
+                                        Text("Set Up")
+                                        Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).accessibilityHidden(true)
+                                    }
+                                    .foregroundStyle(Color(.secondaryLabel))
+                                } label: {
+                                    Label { Text("Search the Web").foregroundStyle(Color(.label)) } icon: { Image(systemName: "globe") }
+                                }
+                            }
+                            .accessibilityHint("Opens Settings to add a Tavily API key")
                         }
                     } footer: {
-                        Text(thinkingFooter)
-                    }
-                }
-                ForEach(Array(groups(thinking?.wrappedValue ?? false).enumerated()), id: \.offset) { _, group in
-                    Section(group.title) {
-                        ForEach(group.rows) { row($0) }
-                    }
-                }
-                if let getModels {
-                    Section {
-                        Button("Get Models…", systemImage: "arrow.down.circle", action: getModels)
+                        Text(WebSearcher.hasKey
+                             ? "The model looks things up when a question needs it, and shows its sources."
+                             : "Searching uses your own Tavily API key. Add it in Settings.")
                     }
                 }
             }
+            .toggleStyle(.switch)  // the Mac's checkbox reads as a form, not a setting of the chat
+            .scrollContentBackground(.hidden)
+            .background(Color(.systemGroupedBackground))
             .navigationTitle(title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -79,18 +95,22 @@ struct ModelPicker: View {
                 // Explicit colours: in a list button, `.primary` and `.secondary` take the amber tint.
                 Image(systemName: row.symbol)
                     .foregroundStyle(Color(.secondaryLabel))
-                    .frame(width: 24)
+                    .font(.title3)
+                    .frame(width: 30)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(row.title).foregroundStyle(Color(.label))
-                    if let note = row.note {
-                        Text(note).font(.footnote).foregroundStyle(Color(.secondaryLabel))
-                    }
+                    Text(row.note).font(.footnote).foregroundStyle(Color(.secondaryLabel))
                 }
                 Spacer(minLength: 8)
                 if row.current {
                     Image(systemName: "checkmark")
                         .fontWeight(.semibold)
                         .foregroundStyle(.tint)
+                } else if row.opens {
+                    Image(systemName: "chevron.forward")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color(.tertiaryLabel))
+                        .accessibilityHidden(true)
                 }
             }
             .contentShape(.rect)
@@ -106,15 +126,15 @@ struct ModelPicker: View {
 struct ComparePicker: View {
     /// Whether the answer being compared was written with thinking.
     let answerThought: Bool
-    let groups: (_ thinking: Bool) -> [ModelPicker.Group]
+    let rows: (_ thinking: Bool) -> [ModelPicker.Row]
     let select: (ModelChoice, _ thinking: Bool) -> Void
     let close: () -> Void
     @State private var thinking: Bool
 
-    init(answerThought: Bool, groups: @escaping (_ thinking: Bool) -> [ModelPicker.Group],
+    init(answerThought: Bool, rows: @escaping (_ thinking: Bool) -> [ModelPicker.Row],
          select: @escaping (ModelChoice, _ thinking: Bool) -> Void, close: @escaping () -> Void) {
         self.answerThought = answerThought
-        self.groups = groups
+        self.rows = rows
         self.select = select
         self.close = close
         _thinking = State(initialValue: answerThought)
@@ -124,14 +144,13 @@ struct ComparePicker: View {
         ModelPicker(
             title: "Compare With",
             cancels: true,
-            groups: groups,
+            rows: rows,
             thinking: $thinking,
             thinkingFooter: """
                 For the second answer. This one was written with thinking \(answerThought ? "on" : "off"): \
                 switch it to compare the same model \(answerThought ? "without" : "with") it.
                 """,
             select: { select($0, thinking) },
-            getModels: nil,
             close: close)
     }
 }

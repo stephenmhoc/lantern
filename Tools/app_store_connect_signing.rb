@@ -141,9 +141,18 @@ def find_or_create_bundle_id(client, identifier:, name:)
   created.fetch("data").fetch("id")
 end
 
-# Each target's entitlements need a capability on its bundle ID, or the profile lacks them and the
-# archive won't sign. Adding one that's already there is a 409. The widget extension has none.
-APP_CAPABILITIES = %w[INCREASED_MEMORY_LIMIT EXTENDED_VIRTUAL_ADDRESSING].freeze
+# The app's entitlements need a capability on its bundle ID, or the profile lacks them and the
+# archive won't sign. Adding one that's already there is a 409. iCloud (the chats' CloudKit sync)
+# needs push for its change notifications.
+APP_CAPABILITIES = %w[INCREASED_MEMORY_LIMIT EXTENDED_VIRTUAL_ADDRESSING ICLOUD PUSH_NOTIFICATIONS].freeze
+CAPABILITY_SETTINGS = {
+  "ICLOUD" => [{ key: "ICLOUD_VERSION", options: [{ key: "XCODE_6" }] }]
+}.freeze
+
+# The chats' iCloud container. The App Store Connect API can turn iCloud on for a bundle ID but
+# can't assign it a container: that's done once in the developer portal (or by Xcode's automatic
+# signing), and every profile made after that carries the container.
+ICLOUD_CONTAINER = "iCloud.com.merimerimeri.Lantern"
 
 def ensure_capabilities(client, bundle_id, capabilities)
   have = client.get("/v1/bundleIds/#{bundle_id}/bundleIdCapabilities").fetch("data", []).map do |c|
@@ -151,17 +160,46 @@ def ensure_capabilities(client, bundle_id, capabilities)
   end
   (capabilities - have).each do |type|
     puts "Enabling #{type}"
+    attributes = { capabilityType: type }
+    attributes[:settings] = CAPABILITY_SETTINGS[type] if CAPABILITY_SETTINGS.key?(type)
     client.post(
       "/v1/bundleIdCapabilities",
       {
         data: {
           type: "bundleIdCapabilities",
-          attributes: { capabilityType: type },
+          attributes: attributes,
           relationships: { bundleId: { data: { type: "bundleIds", id: bundle_id } } }
         }
       }
     )
   end
+end
+
+# The entitlements a profile grants, from its signed plist.
+def profile_entitlements(profile_content)
+  Dir.mktmpdir do |dir|
+    path = File.join(dir, "profile")
+    File.binwrite(path, Base64.decode64(profile_content))
+    plist = IO.popen(["security", "cms", "-D", "-i", path], &:read)
+    json = IO.popen(["plutil", "-extract", "Entitlements", "json", "-o", "-", "-"], "r+") do |io|
+      io.write(plist)
+      io.close_write
+      io.read
+    end
+    $?.success? ? JSON.parse(json) : {}
+  end
+end
+
+def icloud_container?(profile_content)
+  Array(profile_entitlements(profile_content)["com.apple.developer.icloud-container-identifiers"]).include?(ICLOUD_CONTAINER)
+end
+
+def missing_container!(bundle_identifier)
+  warn "The new profile for #{bundle_identifier} has no iCloud container, so the chats couldn't sync."
+  warn "The App Store Connect API can't assign one. Once, in the developer portal: Certificates,"
+  warn "Identifiers & Profiles > Identifiers > #{bundle_identifier} > iCloud > Edit (or Configure),"
+  warn "tick #{ICLOUD_CONTAINER}, Continue, Save. Then run this workflow again."
+  exit 1
 end
 
 def create_distribution_certificate(client, temp_dir)
@@ -210,7 +248,7 @@ def create_distribution_certificate(client, temp_dir)
   }
 end
 
-def create_profile(client, name:, bundle_id:, certificate_id:, output_path:)
+def create_profile(client, name:, bundle_id:, certificate_id:, output_path:, profile_type: "IOS_APP_STORE")
   response = client.post(
     "/v1/profiles",
     {
@@ -218,7 +256,7 @@ def create_profile(client, name:, bundle_id:, certificate_id:, output_path:)
         type: "profiles",
         attributes: {
           name: name,
-          profileType: "IOS_APP_STORE"
+          profileType: profile_type
         },
         relationships: {
           bundleId: {
@@ -257,44 +295,57 @@ def append_env(values)
   end
 end
 
-# Finds the App Store profile for one bundle ID, or registers the bundle ID (with its capabilities)
-# and creates the profile. Named after the certificate, so that replacing it makes a new profile.
-def prepare_profile(client, identifier:, bundle_name:, profile_prefix:, capabilities:, certificate_id:, output_path:)
-  name = "#{profile_prefix} App Store #{certificate_id}"
-  query = URI.encode_www_form("filter[name]" => name, "filter[profileState]" => "ACTIVE", "limit" => 200)
-  profile = client.get("/v1/profiles?#{query}").fetch("data").find do |candidate|
+# Finds the profile for one bundle ID, or registers the bundle ID (with its capabilities) and
+# creates the profile. Named after the certificate, so that replacing it makes a new profile. One
+# without the iCloud container (made before the app synced its chats: changing a bundle ID's
+# capabilities invalidates its profiles) is deleted and made again.
+def prepare_profile(client, identifier:, bundle_name:, profile_prefix:, capabilities:, certificate_id:, output_path:,
+                    kind: "App Store", profile_type: "IOS_APP_STORE")
+  name = "#{profile_prefix} #{kind} #{certificate_id}"
+  query = URI.encode_www_form("filter[name]" => name, "limit" => 200)
+  same_name = client.get("/v1/profiles?#{query}").fetch("data").select do |candidate|
     candidate.fetch("attributes").fetch("name") == name
+  end
+  profile = same_name.find do |candidate|
+    attributes = candidate.fetch("attributes")
+    attributes.fetch("profileState") == "ACTIVE" && icloud_container?(attributes.fetch("profileContent"))
   end
 
   if profile
     puts "Using profile #{name}"
     File.binwrite(output_path, Base64.decode64(profile.fetch("attributes").fetch("profileContent")))
-  else
-    puts "Creating profile #{name}"
-    bundle_id = find_or_create_bundle_id(client, identifier: identifier, name: bundle_name)
-    ensure_capabilities(client, bundle_id, capabilities)  # before the profile, which captures them
-    create_profile(
-      client,
-      name: name,
-      bundle_id: bundle_id,
-      certificate_id: certificate_id,
-      output_path: output_path
-    )
+    return { name: name }
   end
+
+  same_name.each do |old|
+    puts "Deleting profile #{name} (#{old.fetch('attributes').fetch('profileState')}, without iCloud)"
+    client.delete("/v1/profiles/#{old.fetch('id')}")
+  end
+  puts "Creating profile #{name}"
+  bundle_id = find_or_create_bundle_id(client, identifier: identifier, name: bundle_name)
+  ensure_capabilities(client, bundle_id, capabilities)  # before the profile, which captures them
+  created = create_profile(
+    client,
+    name: name,
+    bundle_id: bundle_id,
+    certificate_id: certificate_id,
+    output_path: output_path,
+    profile_type: profile_type
+  )
+  missing_container!(identifier) unless icloud_container?(Base64.strict_encode64(File.binread(output_path)))
+  created
 end
 
 # Revoking a certificate invalidates what it signed, and TestFlight review checks the signature
 # after processing (ITMS-90035), so one certificate stays for as long as builds need it.
 #
-# Two targets, two profiles: the app (IOS_BUNDLE_ID, "Lantern App Store <cert id>") and the widget
-# extension embedded in it (WIDGETS_BUNDLE_ID, "Lantern Widgets App Store <cert id>").
+# One target, one profile: the app (IOS_BUNDLE_ID, "Lantern App Store <cert id>").
 def prepare
   client = AppStoreConnectClient.new
   temp_dir = env_fetch("RUNNER_TEMP")
   certificate_id = env_fetch("APPLE_DISTRIBUTION_CERT_ID")
   p12_path = File.join(temp_dir, "certificate.p12")
   profile_path = File.join(temp_dir, "ios.mobileprovision")
-  widgets_profile_path = File.join(temp_dir, "widgets.mobileprovision")
 
   FileUtils.mkdir_p(temp_dir)
   File.binwrite(p12_path, Base64.decode64(env_fetch("APPLE_DISTRIBUTION_CERT_BASE64")))
@@ -308,22 +359,42 @@ def prepare
     certificate_id: certificate_id,
     output_path: profile_path
   )
-  prepare_profile(
-    client,
-    identifier: env_fetch("WIDGETS_BUNDLE_ID"),
-    bundle_name: "Lantern Widgets",
-    profile_prefix: "Lantern Widgets",
-    capabilities: [],
-    certificate_id: certificate_id,
-    output_path: widgets_profile_path
-  )
 
   append_env(
     "APPLE_CERTIFICATE_PATH" => p12_path,
     "APPLE_CERTIFICATE_PASSWORD" => env_fetch("APPLE_DISTRIBUTION_CERT_PASSWORD"),
-    "IOS_PROVISIONING_PROFILE_PATH" => profile_path,
-    "WIDGETS_PROVISIONING_PROFILE_PATH" => widgets_profile_path
+    "IOS_PROVISIONING_PROFILE_PATH" => profile_path
   )
+end
+
+# The Mac app (Mac Catalyst, the same bundle ID) outside the App Store: a Developer ID profile, since
+# iCloud needs one even there. Its certificate is the one the workflow imported, found among the
+# team's by serial number (DEVELOPER_ID_CERT_SERIAL, hex). Named "Lantern Developer ID <cert id>".
+def prepare_mac
+  client = AppStoreConnectClient.new
+  temp_dir = env_fetch("RUNNER_TEMP")
+  serial = env_fetch("DEVELOPER_ID_CERT_SERIAL").downcase.sub(/\A0+/, "")
+  query = URI.encode_www_form("filter[certificateType]" => "DEVELOPER_ID_APPLICATION_G2,DEVELOPER_ID_APPLICATION", "limit" => 200)
+  certificate = client.get("/v1/certificates?#{query}").fetch("data").find do |candidate|
+    candidate.fetch("attributes").fetch("serialNumber").downcase.sub(/\A0+/, "") == serial
+  end
+  unless certificate
+    warn "No Developer ID Application certificate of the team has the serial number of DEVELOPER_ID_CERT_BASE64's."
+    exit 1
+  end
+  profile_path = File.join(temp_dir, "mac.provisionprofile")
+  profile = prepare_profile(
+    client,
+    identifier: env_fetch("BUNDLE_ID"),
+    bundle_name: "Lantern",
+    profile_prefix: "Lantern",
+    capabilities: APP_CAPABILITIES,
+    certificate_id: certificate.fetch("id"),
+    output_path: profile_path,
+    kind: "Developer ID",
+    profile_type: "MAC_CATALYST_APP_DIRECT"
+  )
+  append_env("MAC_PROFILE_PATH" => profile_path, "MAC_PROFILE_NAME" => profile.fetch(:name))
 end
 
 # Run once by hand, and again when the certificate nears its expiry. Goes straight to GitHub's
@@ -458,6 +529,8 @@ end
 case ARGV.fetch(0, "prepare")
 when "prepare"
   prepare
+when "prepare-mac"
+  prepare_mac
 when "wait"
   wait_for_processing
 when "distribute"
@@ -465,6 +538,6 @@ when "distribute"
 when "create-distribution-cert"
   create_distribution_cert
 else
-  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|create-distribution-cert|wait|distribute]"
+  warn "Usage: #{File.basename($PROGRAM_NAME)} [prepare|prepare-mac|create-distribution-cert|wait|distribute]"
   exit 1
 end

@@ -21,28 +21,21 @@ struct EmptyChat: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.horizontal, 20)
-        #if os(iOS)
         // The message box covers the bottom of this view: centre in what's left above it.
         .padding(.bottom, 96)
-        #endif
     }
 
     private func content(starters: Bool, header: Bool) -> some View {
         VStack(spacing: 24) {
             if header {
                 VStack(spacing: 10) {
-                    Image(systemName: conversation.mode == .mac ? "desktopcomputer" : "flame.fill")
+                    Image(systemName: conversation.answeringMode == .mac ? "desktopcomputer" : "flame.fill")
                         .font(.system(size: Self.badge * 0.47, weight: .medium))
                         .foregroundStyle(.tint)
                         .frame(width: Self.badge, height: Self.badge)
                         .background(.tint.opacity(colorScheme == .dark ? 0.18 : 0.12), in: .circle)
                         .accessibilityHidden(true)
                     Text("Ask anything").font(.title2.bold())
-                    #if os(macOS)
-                    Text("\(conversation.modelTitle) · on this Mac")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    #endif
                 }
             }
             if starters, let onStarter {
@@ -57,9 +50,7 @@ struct EmptyChat: View {
                             Label("More ideas", systemImage: "arrow.clockwise").font(.subheadline)
                         }
                         .buttonStyle(.borderless)
-                        #if os(iOS)
                         .hoverEffect(.highlight)
-                        #endif
                     }
                     // A Grid, not a LazyVGrid, so both cards in a row are as tall as the taller one.
                     Grid(horizontalSpacing: 10, verticalSpacing: 10) {
@@ -80,15 +71,9 @@ struct EmptyChat: View {
         .frame(maxWidth: Self.width)
     }
 
-    #if os(iOS)
     private static let badge: CGFloat = 64
     private static let width: CGFloat = 460
     private static let columns = 2
-    #else
-    private static let badge: CGFloat = 52
-    private static let width: CGFloat = 640
-    private static let columns = 4
-    #endif
 }
 
 /// A way to start a chat: a short title, and the opening words it puts in the message box.
@@ -151,25 +136,15 @@ private struct StarterButton: View {
             .contentShape(.rect(cornerRadius: Self.radius))
         }
         .buttonStyle(.plain)
-        #if os(iOS)
-        .hoverEffect(.highlight)
-        #else
-        .onHover { hovering = $0 }
+        .hoverEffect(.highlight)  // iPad's pointer; the Mac's is the fill
+        .onHover { over in if Device.isMac { hovering = over } }
         .animation(.easeOut(duration: 0.12), value: hovering)
         .help(starter.prompt.trimmingCharacters(in: .whitespacesAndNewlines) + "…")
-        #endif
         .accessibilityHint("Starts the message for you to finish")
     }
 
-    #if os(iOS)
     private static let cardFill = Color(.secondarySystemBackground)
-    private static let hoverFill = cardFill
-    private static let padding: CGFloat = 14
-    private static let radius: CGFloat = 16
-    #else
-    private static let cardFill = Color(nsColor: .quaternarySystemFill)
-    private static let hoverFill = Color(nsColor: .tertiarySystemFill)
-    private static let padding: CGFloat = 12
-    private static let radius: CGFloat = 10
-    #endif
+    private static let hoverFill = Color(.tertiarySystemFill)
+    private static let padding: CGFloat = Device.isMac ? 12 : 14
+    private static let radius: CGFloat = Device.isMac ? 12 : 16
 }

@@ -2,10 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>BGTaskSchedulerPermittedIdentifiers</key>
-	<array>
-		<string>com.merimerimeri.Lantern.reply.*</string>
-	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
@@ -29,7 +25,7 @@
 			<string>com.merimerimeri.Lantern</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>lantern</string>
+				<string>$(LANTERN_URL_SCHEME)</string>
 			</array>
 		</dict>
 	</array>
@@ -37,8 +33,8 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -60,19 +56,23 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Lantern finds your Mac on your home network and talks to its models there, encrypted.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Lantern listens when you tap the microphone, to type what you say.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Lantern turns what you say into text on this device. Nothing is sent anywhere.</string>
+	<key>SUEnableAutomaticChecks</key>
+	<string>$(LANTERN_AUTO_UPDATE)</string>
+	<key>SUFeedURL</key>
+	<string>$(LANTERN_FEED_URL)</string>
+	<key>SUPublicEDKey</key>
+	<string>$(LANTERN_UPDATE_KEY)</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
-		<true/>
+		<false/>
 	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<key>UIFileSharingEnabled</key>
-	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiresFullScreen</key>
@@ -87,44 +87,6 @@
 		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
-	</array>
-	<key>UTImportedTypeDeclarations</key>
-	<array>
-		<dict>
-			<key>UTTypeConformsTo</key>
-			<array>
-				<string>public.data</string>
-			</array>
-			<key>UTTypeDescription</key>
-			<string>GGUF model</string>
-			<key>UTTypeIdentifier</key>
-			<string>org.ggml.gguf</string>
-			<key>UTTypeTagSpecification</key>
-			<dict>
-				<key>public.filename-extension</key>
-				<array>
-					<string>gguf</string>
-				</array>
-			</dict>
-		</dict>
-		<dict>
-			<key>UTTypeConformsTo</key>
-			<array>
-				<string>public.plain-text</string>
-			</array>
-			<key>UTTypeDescription</key>
-			<string>Markdown text</string>
-			<key>UTTypeIdentifier</key>
-			<string>net.daringfireball.markdown</string>
-			<key>UTTypeTagSpecification</key>
-			<dict>
-				<key>public.filename-extension</key>
-				<array>
-					<string>md</string>
-					<string>markdown</string>
-				</array>
-			</dict>
-		</dict>
 	</array>
 </dict>
 </plist>

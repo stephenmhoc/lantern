@@ -9,18 +9,24 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"slices"
 	"time"
 )
 
 // The admin API, for the Mac app and the command line: HTTP over a Unix socket in the bridge's
 // folder, which only this user can open. Nothing here is reachable from the network.
 //
-//	GET    /status                 name, port, fingerprint, addresses, backends, models, devices
-//	POST   /pairing                a new one-time code → {link, expires}
+//	GET    /status                 name, port, fingerprint, addresses, splash (with the drafter),
+//	                               models, devices, tailscale, pairing_code (expiry only)
+//	POST   /pairing                a QR code's link → {link, expires}
+//	POST   /pairing/code           a new code to type, replacing any → {code: "ABCD-EFGH", expires}
+//	GET    /pairing/code           the code showing now → {code, expires}, or 404
+//	DELETE /pairing/code           stop showing it
+//	GET    /tailscale              {configured, client_id, tag, last_error, last_minted, host, ips}
+//	PUT    /tailscale              {client_id, client_secret}: checked with Tailscale, then kept
+//	DELETE /tailscale              forget the OAuth client
+//	POST   /splash/restart         try starting Splash again now (after an update, or giving up)
 //	DELETE /devices/{id}           unpair a device
 //	POST   /devices/{id}/name      {name}
-//	PUT    /keep-loaded            {model, keep}
 //	PUT    /name                   {name}
 func socketPath(dir string) string { return filepath.Join(dir, "admin.sock") }
 
@@ -39,7 +45,7 @@ func shortSocketPath(dir string) string {
 	return full
 }
 
-func (b *bridge) serveAdmin(ctx context.Context) error {
+func (b *bridge) serveAdmin(ctx context.Context, restartSplash chan<- struct{}) error {
 	path := socketPath(b.dir)
 	_ = os.Remove(path)
 	listener, err := net.Listen("unix", shortSocketPath(b.dir))
@@ -48,10 +54,55 @@ func (b *bridge) serveAdmin(ctx context.Context) error {
 	}
 	_ = os.Chmod(path, 0o600)
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, b.status()) })
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, b.status(r.Context())) })
 	mux.HandleFunc("POST /pairing", func(w http.ResponseWriter, r *http.Request) {
 		o := b.devices.newOffer()
 		writeJSON(w, map[string]any{"link": b.pairingLink(o), "expires": o.expires})
+	})
+	mux.HandleFunc("POST /pairing/code", func(w http.ResponseWriter, r *http.Request) {
+		code, expires := b.devices.newCode(b.identity.fingerprint)
+		writeJSON(w, map[string]any{"code": code, "expires": expires})
+	})
+	mux.HandleFunc("GET /pairing/code", func(w http.ResponseWriter, r *http.Request) {
+		code, expires, ok := b.devices.currentCode()
+		if !ok {
+			apiError(w, http.StatusNotFound, "No code is showing.")
+			return
+		}
+		writeJSON(w, map[string]any{"code": code, "expires": expires})
+	})
+	mux.HandleFunc("DELETE /pairing/code", func(w http.ResponseWriter, r *http.Request) {
+		b.devices.clearCode()
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("GET /tailscale", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, b.tailscale.status()) })
+	mux.HandleFunc("PUT /tailscale", func(w http.ResponseWriter, r *http.Request) {
+		var c tailscaleClient
+		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&c); err != nil {
+			apiError(w, http.StatusBadRequest, "Send {client_id, client_secret}.")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := b.tailscale.set(ctx, c); err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, b.tailscale.status())
+	})
+	mux.HandleFunc("DELETE /tailscale", func(w http.ResponseWriter, r *http.Request) {
+		if err := b.tailscale.clear(); err != nil {
+			apiError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /splash/restart", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case restartSplash <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("DELETE /devices/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if err := b.devices.revoke(r.PathValue("id")); err != nil {
@@ -67,34 +118,6 @@ func (b *bridge) serveAdmin(ctx context.Context) error {
 			apiError(w, http.StatusNotFound, err.Error())
 			return
 		}
-		w.WriteHeader(http.StatusNoContent)
-	})
-	mux.HandleFunc("PUT /keep-loaded", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Model string
-			Keep  bool
-		}
-		_ = json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&body)
-		err := b.update(func(s *settings) {
-			s.KeepLoaded = slices.DeleteFunc(s.KeepLoaded, func(m string) bool { return m == body.Model })
-			if body.Keep {
-				s.KeepLoaded = append(s.KeepLoaded, body.Model)
-			}
-		})
-		if err != nil {
-			apiError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// Load it now (or let Ollama's default apply from now on).
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			keep := any(nil)
-			if body.Keep {
-				keep = -1
-			}
-			_ = b.backends.warm(ctx, body.Model, keep)
-		}()
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("PUT /name", func(w http.ResponseWriter, r *http.Request) {
@@ -119,24 +142,36 @@ func (b *bridge) serveAdmin(ctx context.Context) error {
 }
 
 type status struct {
-	Name        string    `json:"name"`
-	Version     string    `json:"version"`
-	Port        int       `json:"port"`
-	Fingerprint string    `json:"fingerprint"`
-	Addresses   []string  `json:"addresses"`
-	Backends    []backend `json:"backends"`
-	Models      []model   `json:"models"`
-	Devices     []device  `json:"devices"`
-	KeepLoaded  []string  `json:"keepLoaded"`
+	Name        string          `json:"name"`
+	Version     string          `json:"version"`
+	Port        int             `json:"port"`
+	Fingerprint string          `json:"fingerprint"`
+	Addresses   []string        `json:"addresses"`
+	Splash      splashStatus    `json:"splash"`
+	Models      []model         `json:"models"`
+	Devices     []device        `json:"devices"`
+	Tailscale   tailscaleStatus `json:"tailscale"`
+	// When the code to type stops working, while one shows (the code itself: GET /pairing/code).
+	PairingCodeExpires *time.Time `json:"pairing_code_expires,omitempty"`
 }
 
-func (b *bridge) status() status {
-	found, models := b.backends.snapshot()
-	return status{
+func (b *bridge) status(ctx context.Context) status {
+	s := status{
 		Name: b.name(), Version: version, Port: b.port(), Fingerprint: b.identity.fingerprint,
-		Addresses: b.addresses(), Backends: nonNil(found), Models: nonNil(models), Devices: nonNil(b.devices.list()),
-		KeepLoaded: nonNil(b.settings().KeepLoaded),
+		Addresses: nonNil(b.addresses()), Splash: b.splash.snapshot(), Models: []model{},
+		Devices: nonNil(b.devices.list()), Tailscale: b.tailscale.status(),
 	}
+	if s.Splash.State == splashReady {
+		ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		if models, err := (&server{b: b}).upstreamModels(ctx); err == nil {
+			s.Models = models
+		}
+	}
+	if _, expires, ok := b.devices.currentCode(); ok {
+		s.PairingCodeExpires = &expires
+	}
+	return s
 }
 
 func nonNil[T any](s []T) []T {
@@ -149,7 +184,7 @@ func nonNil[T any](s []T) []T {
 // adminClient talks to a running bridge's admin socket.
 func adminClient(dir string) *http.Client {
 	return &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: 30 * time.Second,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", shortSocketPath(dir))
 		}},

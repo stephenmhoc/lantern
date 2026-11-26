@@ -10,36 +10,39 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // What the bridge keeps in `settings.json`, edited by the Mac app (or by hand).
 type settings struct {
 	// The name devices see ("Mac Studio"); empty for the Mac's own.
 	Name string `json:"name,omitempty"`
-	Port int    `json:"port,omitempty"`
-	// Ollama models kept loaded for good, not just for Ollama's keep-alive after each request.
-	KeepLoaded []string `json:"keepLoaded,omitempty"`
-	// Servers besides the ones looked for at their default ports.
-	Backends []backend `json:"backends,omitempty"`
+	// The bridge's port (11443), and Splash's, on this Mac only (11480).
+	Port       int `json:"port,omitempty"`
+	SplashPort int `json:"splashPort,omitempty"`
 }
 
 const defaultPort = 11443
 
 type bridge struct {
-	dir      string
-	identity *identity
-	devices  *deviceStore
-	backends *backends
+	dir       string
+	identity  *identity
+	devices   *deviceStore
+	splash    *splash
+	tailscale *tailscale
 
 	mu  sync.Mutex
 	cfg settings
 }
 
+// openBridge reads the bridge's folder. LANTERN_BRIDGE_PORT overrides the port, and
+// LANTERN_BRIDGE_UPSTREAM (http://127.0.0.1:8000) uses a Splash already running instead of
+// starting one.
 func openBridge(dir string) (*bridge, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -51,6 +54,9 @@ func openBridge(dir string) (*bridge, error) {
 			return nil, fmt.Errorf("settings.json: %w", err)
 		}
 	}
+	if p, err := strconv.Atoi(os.Getenv("LANTERN_BRIDGE_PORT")); err == nil && p > 0 {
+		b.cfg.Port = p
+	}
 	var err error
 	if b.identity, err = loadIdentity(dir, b.name()); err != nil {
 		return nil, err
@@ -58,7 +64,14 @@ func openBridge(dir string) (*bridge, error) {
 	if b.devices, err = loadDevices(filepath.Join(dir, "devices.json")); err != nil {
 		return nil, err
 	}
-	b.backends = newBackends(b.cfg.Backends)
+	if b.tailscale, err = loadTailscale(dir); err != nil {
+		return nil, err
+	}
+	splashPort := b.cfg.SplashPort
+	if splashPort <= 0 {
+		splashPort = defaultSplashPort
+	}
+	b.splash = newSplash(dir, splashPort, os.Getenv("LANTERN_BRIDGE_UPSTREAM"))
 	return b, nil
 }
 
@@ -94,10 +107,6 @@ func (b *bridge) name() string {
 	return computerName()
 }
 
-// changed is called when devices are paired or removed. The admin API is polled, so there is
-// nothing to push yet.
-func (b *bridge) changed() {}
-
 func computerName() string {
 	out, err := exec.Command("/usr/sbin/scutil", "--get", "ComputerName").Output()
 	if name := strings.TrimSpace(string(out)); err == nil && name != "" {
@@ -117,8 +126,8 @@ func (b *bridge) addresses() []string {
 			out = append(out, net.JoinHostPort(h+".local", port))
 		}
 	}
-	if name := tailnetName(); name != "" {
-		out = append(out, net.JoinHostPort(name, port))
+	if self := tailnetSelf(); self.host != "" {
+		out = append(out, net.JoinHostPort(self.host, port))
 	}
 	ifaces, _ := net.Interfaces()
 	for _, iface := range ifaces {
@@ -135,30 +144,6 @@ func (b *bridge) addresses() []string {
 		}
 	}
 	return out
-}
-
-// tailnetName is this Mac's MagicDNS name ("mac-studio.tail1234.ts.net"), or "" without Tailscale.
-func tailnetName() string {
-	for _, ts := range []string{"/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"} {
-		if _, err := os.Stat(ts); err != nil {
-			continue
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		out, err := exec.CommandContext(ctx, ts, "status", "--json").Output()
-		cancel()
-		if err != nil {
-			continue
-		}
-		var status struct {
-			Self struct {
-				DNSName string `json:"DNSName"`
-			} `json:"Self"`
-		}
-		if json.Unmarshal(out, &status) == nil && status.Self.DNSName != "" {
-			return strings.TrimSuffix(status.Self.DNSName, ".")
-		}
-	}
-	return ""
 }
 
 // pairingLink is what the QR code holds: where the bridge is, the fingerprint of its certificate
@@ -178,9 +163,13 @@ func (b *bridge) pairingLink(o offer) string {
 }
 
 // advertise registers the bridge over Bonjour (`_lantern._tcp`) for as long as ctx lasts, so
-// Lantern finds it on the home network. The TXT record's fingerprint is for recognising a Mac
-// already paired; trust comes only from pairing.
+// Lantern finds it on the home network. The TXT record's fingerprint is what a device pairing by
+// typed code pins; the code exchange is what proves it (README). LANTERN_BRIDGE_BONJOUR=off
+// keeps a bridge for checks off the network's lists.
 func (b *bridge) advertise(ctx context.Context) {
+	if os.Getenv("LANTERN_BRIDGE_BONJOUR") == "off" {
+		return
+	}
 	for ctx.Err() == nil {
 		cmd := exec.CommandContext(ctx, "/usr/bin/dns-sd", "-R", b.name(), "_lantern._tcp", "local", fmt.Sprint(b.port()),
 			"v=1", "fp="+b.identity.fingerprint)

@@ -4,9 +4,9 @@ import Network
 import Observation
 import os
 
-/// Ollama on the Mac. The home network comes first (it works without the internet); the tailnet is
-/// the way in from elsewhere, through Lantern's own tailnet node or the Tailscale app's VPN,
-/// whichever answers first. Every model Ollama has is offered in the chat's model picker.
+/// Inkling on the serving Mac, through its bridge (Splash behind it). The home network comes first
+/// (it works without the internet); the tailnet is the way in from elsewhere, through Lantern's own
+/// tailnet node or the Tailscale app's VPN, whichever answers first.
 @Observable
 final class MacLink {
     enum Route: Hashable {
@@ -41,15 +41,14 @@ final class MacLink {
         var findSeconds: Double = 0
         /// Opening the connection (DNS, TCP, the tailnet's handshake), from URLSession's metrics.
         var connectSeconds: Double?
-        /// Ollama loading the model, and reading the prompt.
+        /// Loading and reading the prompt (unused: the OpenAI API doesn't say).
         var loadSeconds: Double = 0
         var readSeconds: Double = 0
-        /// Ollama's own `total_duration`: everything it did on the Mac for the request (load, read,
-        /// generate), without the network. Nil until the final chunk.
+        /// Everything the server did for the request, without the network. Nil until the final chunk.
         var serverSeconds: Double?
     }
 
-    /// One request to Ollama, handed back with its stream so a reply reads its own route and
+    /// One request to the Mac, handed back with its stream so a reply reads its own route and
     /// timings, never another request's. `timings` is complete once the stream has yielded `.done`.
     final class Request {
         /// The route it went out on.
@@ -62,11 +61,13 @@ final class MacLink {
         }
     }
 
-    /// "inkling-2-mini:latest" → "Inkling 2 Mini", "gemma4:31b-mlx" → "Gemma 4 31B".
+    /// "unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M" → "Inkling 2 Mini", "gemma4:31b-mlx" → "Gemma 4 31B".
     nonisolated static func displayName(_ model: String) -> String {
         guard !model.isEmpty else { return "Mac" }
         let parts = model.split(separator: ":", maxSplits: 1).map(String.init)
         var name = parts[0].split(separator: "/").last.map(String.init) ?? parts[0]
+        // A repository's format ("Inkling-2-Mini-GGUF") isn't part of the model's name.
+        name = name.replacing(/(?i)[-_](gguf|mlx)$/, with: "")
         // "gemma4" → "gemma 4": a number stuck to the family name.
         name = name.replacing(/([a-z])([0-9])/) { "\($0.output.1) \($0.output.2)" }
         var words = name.split(whereSeparator: { $0 == "-" || $0 == "_" || $0 == " " }).map { word in
@@ -84,43 +85,37 @@ final class MacLink {
     }
 
     // Settings, edited with @AppStorage in ComputersView (Settings › On Your Computers).
-    /// `modelKey`: the model a new Mac chat uses, the one last picked.
+    /// `modelKey`: the model a new Mac chat uses: the one the Mac serves.
     nonisolated static let lanKey = "mac.lan", tailnetKey = "mac.tailnet", modelKey = "mac.model"
-    /// The models Ollama listed last time, so the picker has them before the Mac is checked.
+    /// The models the Mac listed last time, so the picker has them before the Mac is checked.
     private static let knownModelsKey = "mac.knownModels"
-    /// The context Ollama is asked for (`options.num_ctx`); its own default is much smaller and
-    /// silently drops the start of a long chat.
-    static let contextKey = "mac.numCtx"
     // The Mac Studio by its Bonjour and MagicDNS names, so a fresh install finds it with no setup.
     static let defaultLAN = "Stephens-Mac-Studio.local", defaultTailnet = "stephens-mac-studio.tail7b6e2.ts.net"
+    /// A chat's limit when the Mac hasn't said its model's.
     static let defaultContext = 16384
 
     let tailnet = Tailnet()
     private(set) var route: Route = .unknown
-    /// Ollama's models, from the last check (or the one before, until the Mac answers).
+    /// The Mac's models, from the last check (or the one before, until the Mac answers).
     private(set) var models: [String] = UserDefaults.standard.stringArray(forKey: "mac.knownModels") ?? []
-    /// Each model's size on the Mac's disk, from the last check that answered.
-    private(set) var modelSizes: [String: Int64] = [:]
+    /// Why the Mac answered but can't serve yet (the bridge's 503: Splash starting, or its
+    /// failure), from the last check. Nil once it lists its model.
+    private(set) var notServing: String?
 
     private var defaults: UserDefaults { .standard }
     var modelName: String { defaults.string(forKey: Self.modelKey) ?? "" }
-    var contextLength: Int {
-        let n = defaults.integer(forKey: Self.contextKey)
-        return n > 0 ? n : Self.defaultContext
-    }
-    /// Models Ollama refused `think` for; they're asked without it from then on.
+    /// The chat's limit: the model's context, as the Mac listed it.
+    var contextLength: Int { contextLengths[modelName] ?? Self.defaultContext }
+    @ObservationIgnored private var contextLengths: [String: Int] = [:]
+    /// Models that refused `reasoning_effort`; they're asked without it from then on.
     @ObservationIgnored private var cannotThink: Set<String> = []
-    /// Whether each model has Ollama's "vision" capability, once asked (`/api/show`).
-    @ObservationIgnored private var vision: [String: Bool] = [:]
     /// Set when the device's network changes (left home, Wi-Fi to cellular): the route found
     /// before may lead nowhere, and sending on it would wait for a connection that never comes.
     @ObservationIgnored private var routeIsStale = false
     @ObservationIgnored private let pathMonitor = NWPathMonitor()
     @ObservationIgnored private var lastPath: (status: NWPath.Status, interfaces: [NWInterface.InterfaceType])?
     @ObservationIgnored private var resolving: Task<Route, Never>?
-    @ObservationIgnored private var lastWarm: [String: Date] = [:]
-    @ObservationIgnored private var warming: Set<String> = []
-    /// What `/api/show` says each model can do ("vision", "thinking"…), once asked.
+    /// What the bridge says each model can do ("vision", "thinking", "tools").
     @ObservationIgnored fileprivate var capabilityCache: [String: Set<String>] = [:]
     /// Bumped when the computer's addresses change, so a check begun before doesn't land after.
     @ObservationIgnored fileprivate var configuration = 0
@@ -131,9 +126,6 @@ final class MacLink {
             Task { @MainActor in self?.networkChanged(summary) }
         }
         pathMonitor.start(queue: DispatchQueue(label: "Lantern.MacLink.path"))
-        #if DEBUG && os(iOS)
-        ComputersDebug.presentIfAsked(self)  // `-ui computers|addcomputer`
-        #endif
     }
 
     private func networkChanged(_ path: (status: NWPath.Status, interfaces: [NWInterface.InterfaceType])) {
@@ -141,21 +133,35 @@ final class MacLink {
         guard let last = lastPath, last.status != path.status || last.interfaces != path.interfaces else { return }
         routeIsStale = true
         // If the Mac was in use, find it again on the new network now, not when the next
-        // question is sent, and keep its model loaded.
-        let inUse = lastWarm.keys
-        lastWarm = [:]
-        for model in inUse { warm(model) }
-    }
-
-    /// Models that think whatever `think` says.
-    nonisolated static func alwaysThinks(_ model: String) -> Bool {
-        model.lowercased().hasPrefix("inkling")
+        // question is sent.
+        if route.host != nil { Task { await resolve() } }
     }
 
     /// Back from the background: the route is checked again before it's used.
     func cameToFront() {
         routeIsStale = true
-        lastWarm = [:]
+    }
+
+    @ObservationIgnored private var recheck: Task<Void, Never>?
+
+    /// While Splash starts (or after it failed), asks again every few seconds, so the chat's
+    /// banner goes once Inkling is served.
+    private func recheckSoon() {
+        guard recheck == nil else { return }
+        recheck = Task {
+            try? await Task.sleep(for: .seconds(4))
+            recheck = nil
+            guard notServing != nil, !Task.isCancelled else { return }
+            routeIsStale = true
+            await resolve()
+        }
+    }
+
+    /// Finds the Mac ahead of a question (a chat opened, typing started) if it isn't known or the
+    /// network changed, so sending doesn't wait for it. Splash keeps Inkling loaded: nothing to warm.
+    func prepare() {
+        guard route.host == nil || routeIsStale, resolving == nil, MacLink.isConfigured else { return }
+        Task { await resolve() }
     }
 
     /// Checks both routes at once and uses the home network if it answers (it works without the
@@ -178,7 +184,7 @@ final class MacLink {
         let tail = Self.normalized(defaults.string(forKey: Self.tailnetKey) ?? Self.defaultTailnet)
         let tailnet = tailnet
         var tailViaApp = false
-        typealias Listing = [OllamaModel]
+        typealias Listing = Served
         enum Probe { case lan(Listing?), tail(Listing?, viaApp: Bool), graceOver }
         let (l, t): (Listing?, Listing?) = await withTaskGroup(of: Probe.self) { group in
             group.addTask { .lan(await Self.listing(lan)) }
@@ -234,7 +240,7 @@ final class MacLink {
         }
         // The addresses changed while this check was out: the check that follows has the say.
         guard generation == configuration else { return route }
-        var listing: Listing = []
+        var listing = Served(models: [], notServing: nil)
         if let lan, let l {
             route = .lan(lan)
             listing = l
@@ -244,12 +250,15 @@ final class MacLink {
         } else {
             route = .unreachable
         }
-        models = listing.map(\.name)
-        if !listing.isEmpty {
-            modelSizes = Dictionary(listing.map { ($0.name, $0.size ?? 0) }, uniquingKeysWith: { a, _ in a })
-            capabilityCache = Dictionary(listing.map { ($0.name, $0.capabilities) }, uniquingKeysWith: { a, _ in a })
+        notServing = listing.notServing
+        if notServing != nil { recheckSoon() }
+        models = listing.models.map(\.name)
+        if !listing.models.isEmpty {
+            capabilityCache = Dictionary(listing.models.map { ($0.name, $0.capabilities) }, uniquingKeysWith: { a, _ in a })
+            for m in listing.models { contextLengths[m.name] = m.contextLength }
         }
         if !models.isEmpty { defaults.set(models, forKey: Self.knownModelsKey) }
+        // The Mac serves one model (Splash's): it's the one new chats use.
         if !models.isEmpty, !models.contains(modelName) {
             let pick = models.first { $0.localizedCaseInsensitiveContains("inkling") } ?? models[0]
             defaults.set(pick, forKey: Self.modelKey)
@@ -266,14 +275,9 @@ final class MacLink {
         return h
     }
 
-    /// The model names Ollama has, or nil if the host doesn't answer.
-    static func tags(_ host: String?, session: URLSession = MacPairing.session, timeout: TimeInterval = 2.5) async -> [String]? {
-        await listing(host, session: session, timeout: timeout)?.map(\.name)
-    }
-
-    /// The computer's models, with their sizes and what each can do (the bridge's `/v1/models`), or
-    /// nil if the host doesn't answer.
-    static func listing(_ host: String?, session: URLSession = MacPairing.session, timeout: TimeInterval = 2.5) async -> [OllamaModel]? {
+    /// The Mac's models and what each can do (the bridge's `/v1/models`); none, with the reason,
+    /// while Splash starts or after it failed (503); nil if the host doesn't answer.
+    static func listing(_ host: String?, session: URLSession = MacPairing.session, timeout: TimeInterval = 2.5) async -> Served? {
         guard let host, var request = MacPairing.request(host, "/v1/models", timeout: timeout) else { return nil }
         request.cachePolicy = .reloadIgnoringLocalCacheData
         let answer: (Data, URLResponse)
@@ -285,9 +289,16 @@ final class MacLink {
         }
         let code = (answer.1 as? HTTPURLResponse)?.statusCode
         if code == 401 { refusal.withLock { $0 = .notPaired } }
+        if code == 503 {
+            refusal.withLock { $0 = nil }
+            let message = (try? JSONDecoder().decode(BridgeAPI.ErrorBody.self, from: answer.0))?.message
+            return Served(models: [], notServing: message ?? "")
+        }
         guard code == 200, let list = try? JSONDecoder().decode(BridgeAPI.ModelList.self, from: answer.0) else { return nil }
         refusal.withLock { $0 = nil }
-        return list.data.map { OllamaModel(name: $0.id, size: $0.lantern?.size, capabilities: $0.capabilities) }
+        return Served(models: list.data.map {
+            ServedModel(name: $0.id, contextLength: $0.lantern?.context_length, capabilities: $0.capabilities)
+        }, notServing: nil)
     }
 
     /// Why the computer last turned Lantern away (no pairing, or not the paired certificate), so a
@@ -298,7 +309,7 @@ final class MacLink {
     /// dropped) gets one fresh check and retry before giving up. The `Request` returned with the
     /// stream has the route and, once `.done` arrives, the timings.
     ///
-    /// With `search`, a model Ollama says can use tools is offered `web_search`. When it calls it,
+    /// With `search`, a model the bridge lists with `tools` is offered `web_search`. When it calls it,
     /// this device runs the search (`WebSearcher`), the call and its results go back as a tool turn and
     /// the model carries on: up to `searchRounds` times, after which it's asked without the tool so
     /// it answers. Each search is reported as `.searching` and `.searched`, for the reply to keep.
@@ -312,6 +323,7 @@ final class MacLink {
         var messages = messages
         // Images go in each message's `images`, for a model that can see. One that can't is sent
         // the text alone, unless the question itself is about an image.
+        if model.isEmpty, let notServing { throw MacError.notServing(notServing) }
         if messages.contains(where: \.hasImages), await !canSee(model) {
             if messages.last?.hasImages == true { throw MacError.noVision(model) }
             messages = messages.map(\.withoutImages)
@@ -320,7 +332,6 @@ final class MacLink {
         let turns = BridgeAPI.messages(messages)
         let metrics = ConnectMetrics()
         let (first, _) = try await open(turns, tools: tools, thinking: thinking, model: model, metrics: metrics, retry: true)
-        lastWarm[model] = .now  // a real request keeps it loaded as well as a warm-up does
         let request = Request(route: route, timings: timings)  // after `open`, which may have re-resolved
         let stream = AsyncThrowingStream<Generation, Error> { continuation in
             let task = Task {
@@ -340,7 +351,7 @@ final class MacLink {
                             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
                             if payload == "[DONE]" { finished = true; break lines }
                             guard let chunk = try? JSONDecoder().decode(BridgeAPI.Chunk.self, from: Data(payload.utf8)) else { continue }
-                            if let error = chunk.error { throw MacError.ollama(error.message ?? "the model server failed") }
+                            if let error = chunk.error { throw MacError.server(error.message ?? "Splash failed") }
                             if let usage = chunk.usage {
                                 // The prompt of the last round is the whole chat as the model last saw it.
                                 total.promptTokens = usage.prompt_tokens ?? total.promptTokens
@@ -348,7 +359,7 @@ final class MacLink {
                             }
                             guard let choice = chunk.choices?.first else { continue }
                             if let delta = choice.delta {
-                                if let t = delta.reasoning ?? delta.reasoning_content, !t.isEmpty {
+                                if let t = delta.reasoning_content ?? delta.reasoning, !t.isEmpty {
                                     if firstToken == nil { firstToken = .now }
                                     continuation.yield(.thinking(t))
                                 }
@@ -422,27 +433,6 @@ final class MacLink {
     /// Searches a reply may run before it has to answer.
     nonisolated static let searchRounds = 3
 
-    /// Gets the Mac ready for a question that's coming (a chat opened, typing started): finds the
-    /// route if it isn't known or the network changed, then asks the bridge to load the model. It also opens the connection (and the
-    /// tailnet's path to the Mac) before it's needed. Cheap to call often: it does nothing if this
-    /// model was warmed in the last minute on the same network.
-    func warm(_ model: String) {
-        guard !model.isEmpty, !warming.contains(model) else { return }
-        if let last = lastWarm[model], Date().timeIntervalSince(last) < 60, !routeIsStale, route.host != nil { return }
-        warming.insert(model)
-        Task {
-            defer { warming.remove(model) }
-            if route.host == nil || routeIsStale { await resolve() }
-            // The bridge loads it (an empty chat, for Ollama) and answers at once.
-            guard let host = route.host, var request = MacPairing.request(host, "/lantern/v1/warm", timeout: 10) else { return }
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try? JSONEncoder().encode(["model": model])
-            lastWarm[model] = .now
-            if (try? await session.data(for: request)) == nil { lastWarm[model] = nil }
-        }
-    }
-
     /// Where requests go on the current route: through Lantern's tailnet node when that's the route.
     fileprivate var session: URLSession {
         if case .tailnet(_, viaApp: false) = route { return tailnet.session ?? MacPairing.session }
@@ -463,13 +453,10 @@ final class MacLink {
         guard !model.isEmpty else { throw MacError.noModel }
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // Thinking is asked for only from a model that thinks ("none" turns it off). A model that
-        // always thinks is asked for its thinking even when it's off: told not to, it thinks anyway
-        // and Ollama hides it, so nothing shows for seconds (Inkling: first token after 4 s instead
-        // of 0.4 s on the Mac Studio, the answer at the same moment).
-        let thinks = capabilityCache[model]?.contains("thinking") == true || Self.alwaysThinks(model)
-        let effort: String? = !thinks || cannotThink.contains(model) ? nil
-            : thinking != .off || Self.alwaysThinks(model) ? "medium" : "none"
+        // Only a model listed as thinking is told how much: "high" (Splash's default) with Think
+        // First, else "none", which the bridge makes "minimal" (Inkling thinks a little anyway).
+        let thinks = capabilityCache[model]?.contains("thinking") == true
+        let effort: String? = !thinks || cannotThink.contains(model) ? nil : thinking != .off ? "high" : "none"
         request.httpBody = try JSONEncoder().encode(BridgeAPI.Request(
             model: model, messages: turns, reasoning_effort: effort,
             tools: tools ? [BridgeAPI.Tool.webSearch] : nil))
@@ -497,24 +484,30 @@ final class MacLink {
         }
     }
 
-    /// Whether Ollama says the model can call tools (`/api/show`'s "tools").
+    /// Whether the bridge lists the model as able to call tools.
     func canUseTools(_ model: String) async -> Bool {
         await capabilities(of: model)?.contains("tools") == true
     }
 
-    /// One of the computer's models, from the bridge's `/v1/models`: its name, size on disk and
-    /// what it can do ("vision", "tools", "thinking").
-    nonisolated struct OllamaModel: Hashable, Sendable {
+    /// One of the Mac's models, from the bridge's `/v1/models`: its name, context and what it can
+    /// do ("vision", "tools", "thinking").
+    nonisolated struct ServedModel: Hashable, Sendable {
         let name: String
-        let size: Int64?
+        let contextLength: Int?
         var capabilities: Set<String> = []
+    }
+
+    /// What `/v1/models` said: the models, or none and why (`notServing`, the bridge's 503).
+    nonisolated struct Served: Sendable {
+        var models: [ServedModel]
+        var notServing: String?
     }
 
 }
 
 // MARK: - The computer
 
-/// The computer Ollama runs on, as Settings' "On Your Computers" shows it. One computer for now:
+/// The serving Mac, as Settings' "On Your Computers" shows it. One computer for now:
 /// its two addresses (`lanKey`, `tailnetKey`), the model new chats use (`modelKey`) and its name
 /// (`computerNameKey`).
 extension MacLink {
@@ -602,8 +595,7 @@ extension MacLink {
         resolving = nil
         route = .unknown
         routeIsStale = true
-        lastWarm = [:]
-        vision = [:]
+        notServing = nil
         capabilityCache = [:]
         cannotThink = []
     }
@@ -613,138 +605,83 @@ extension MacLink {
         MacPairing.forget()
         configure(name: nil, lan: "", tailnet: "")
         models = []
-        modelSizes = [:]
         defaults.removeObject(forKey: "mac.knownModels")
     }
 
-    /// The bridge on the current route and what it serves: "Lantern Bridge 0.1.0 · Ollama".
-    func ollamaVersion() async -> String? {
+    /// The bridge on the current route and what it serves: "Lantern Bridge 0.2.0 · Splash 1.7.3".
+    func bridgeVersion() async -> String? {
         guard let host = route.host else { return nil }
         return await Self.version(host, session: session)
     }
 
-    /// The bridge's version and model servers at a host, or nil if nothing answers there.
+    /// The bridge's version and Splash's at a host, or nil if nothing answers there.
     static func version(_ host: String?, session: URLSession = MacPairing.session, timeout: TimeInterval = 2.5) async -> String? {
         guard let host, var request = MacPairing.request(host, "/lantern/v1/info", timeout: timeout) else { return nil }
         request.cachePolicy = .reloadIgnoringLocalCacheData
         guard let (data, response) = try? await session.data(for: request),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let info = try? JSONDecoder().decode(BridgeAPI.Info.self, from: data) else { return nil }
-        let servers = info.backends.map(\.name)
-        return (["Lantern Bridge \(info.version)"] + (servers.isEmpty ? [] : [ListFormatter.localizedString(byJoining: servers)]))
+        return (["Lantern Bridge \(info.version)"] + (info.splash?.version.map { ["Splash \($0)"] } ?? []))
             .joined(separator: " · ")
     }
-
-    /// The models in memory now: the bridge doesn't say, so nil.
-    func loadedModels() async -> Set<String>? { nil }
 
     /// What a model can do ("thinking", "vision", "tools"), as the bridge listed it; the list is
     /// asked for again for a model it didn't have.
     func capabilities(of model: String) async -> Set<String>? {
         if let known = capabilityCache[model] { return known }
         guard let host = route.host, let listing = await Self.listing(host, session: session) else { return nil }
-        for m in listing { capabilityCache[m.name] = m.capabilities }
+        for m in listing.models { capabilityCache[m.name] = m.capabilities }
         return capabilityCache[model]
     }
-
-    /// The result of "Test Connection".    /// The result of "Test Connection".
-    struct ConnectionTest {
-        var route: Route
-        var timings = Timings()
-        /// Wall time of the whole test.
-        var totalSeconds: Double = 0
-        var failure: String?
-    }
-
-    /// Finds the computer again (both routes, as a send would) and loads `model` (as `warm` does),
-    /// timing each: found, connected, loaded.
-    func testConnection(model: String) async -> ConnectionTest {
-        let started = ContinuousClock.now
-        routeIsStale = true
-        let found = await resolve()
-        var result = ConnectionTest(route: found)
-        result.timings.findSeconds = (ContinuousClock.now - started).seconds
-        guard let host = found.host, var request = MacPairing.request(host, "/v1/chat/completions", timeout: 120) else {
-            result.failure = (Self.refusal.withLock { $0 } ?? MacError.unreachable).errorDescription
-            result.totalSeconds = (ContinuousClock.now - started).seconds
-            return result
-        }
-        guard !model.isEmpty else {
-            result.failure = MacError.noModel.errorDescription
-            result.totalSeconds = (ContinuousClock.now - started).seconds
-            return result
-        }
-
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // One token of an answer: loads the model if it isn't, and reads almost nothing.
-        var ask = BridgeAPI.Request(model: model, messages: [.init(role: "user", content: .text("Hi"))], max_tokens: 1)
-        ask.stream = false
-        ask.stream_options = [:]
-        if capabilityCache[model]?.contains("thinking") == true, !Self.alwaysThinks(model) { ask.reasoning_effort = "none" }
-        request.httpBody = try? JSONEncoder().encode(ask)
-        // A fresh connection, so "connected" is measured rather than reused from finding it. Lantern's
-        // own tailnet node has one session, used as it is.
-        let fresh = session === MacPairing.session
-        let testSession = fresh ? URLSession(configuration: .ephemeral, delegate: PinningDelegate.shared, delegateQueue: nil) : session
-        defer { if fresh { testSession.finishTasksAndInvalidate() } }
-        let metrics = ConnectMetrics()
-        let sent = ContinuousClock.now
-        do {
-            let (data, response) = try await testSession.data(for: request, delegate: metrics)
-            let elapsed = (ContinuousClock.now - sent).seconds
-            let connect = await metrics.connectSeconds(waitingUpTo: .milliseconds(300))
-            result.timings.connectSeconds = connect
-            let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if code != 200 {
-                let message = (try? JSONDecoder().decode(BridgeAPI.ErrorBody.self, from: data))?.message
-                result.failure = MacError.http(code, model: model, message: message).errorDescription
-            } else {
-                // What isn't the connection is loading the model (if it wasn't) and one token.
-                result.timings.loadSeconds = max(0, elapsed - (connect ?? 0))
-                lastWarm[model] = .now
-            }
-        } catch {
-            result.failure = MacPairing.isUntrusted(error) ? MacError.untrusted.errorDescription : error.localizedDescription
-        }
-        result.totalSeconds = (ContinuousClock.now - started).seconds
-        return result
-    }
-
 }
 
 nonisolated enum MacError: LocalizedError {
-    case unreachable, noModel, http(Int, model: String, message: String?), ollama(String), noVision(String)
+    case unreachable, noModel, http(Int, model: String, message: String?), server(String), noVision(String)
     /// The computer turned down the access key, or answered with a certificate other than the paired one.
     case notPaired, untrusted
+    /// The bridge answered but Splash isn't serving: starting (an empty or "starting" message),
+    /// or why it failed.
+    case notServing(String)
 
     var errorDescription: String? {
         switch self {
-        case .unreachable: "Can't reach the Mac over the home network or the tailnet. Check that Lantern is open on it."
-        case .noModel: "The Mac has no models. Add one in Ollama or LM Studio."
+        case .unreachable: "Can't reach the Mac over the home network or the tailnet. Check that it's on and serving Inkling."
+        case .noModel: "The Mac isn't serving a model yet."
         case .http(404, let model, _):
-            "The Mac doesn't have the model \(model) any more. Pick another in Settings."
+            "The Mac doesn't serve \(MacLink.displayName(model)) any more."
         case .http(400, _, let message): "The Mac couldn't use this request: \(message ?? "bad request")."
         case .notPaired, .http(401, _, _):
-            "This device isn't paired with the Mac. In Lantern on the Mac, choose Pair a Device and scan the code with this device's camera."
+            "This device isn't paired with the Mac. In Lantern on the Mac, choose Pair a Device and scan the code, or enter it here."
         case .untrusted:
             "The computer didn't prove it's the Mac Lantern was paired with, so nothing was sent. If you set it up again, pair again."
         case .http(403, _, _): "The Mac refused the connection."
-        case .http(429, _, _), .http(503, _, _): "The Mac is busy. Try again in a moment."
-        case .http(502, _, let message): "The Mac's model server didn't answer\(message.map { ": \($0)" } ?? ""). Check that Ollama or LM Studio is running."
+        case .http(503, _, let message): Self.notServingText(message ?? "")
+        case .notServing(let message): Self.notServingText(message)
+        case .http(429, _, _): "The Mac is busy. Try again in a moment."
+        case .http(502, _, _): "Splash on the Mac didn't answer. It restarts by itself; try again in a moment."
         case .http(let code, let model, let message) where code >= 500:
-            "The Mac failed to run \(model)\(message.map { ": \($0)" } ?? " (HTTP \(code))"). It may be out of memory."
+            "The Mac failed to run \(MacLink.displayName(model))\(message.map { ": \($0)" } ?? " (HTTP \(code))")."
         case .http(let code, _, let message): "The Mac answered with HTTP \(code)\(message.map { ": \($0)" } ?? "")."
-        case .ollama(let message): "The computer's model server: \(message)"
-        case .noVision(let model): "\(model) on the Mac can't see images. Pick a vision model in Settings, or use Gemma on this device."
+        case .server(let message): "Splash on the Mac: \(message)"
+        case .noVision(let model): "\(MacLink.displayName(model)) on the Mac can't see images."
         }
+    }
+
+    /// The bridge's 503: "The model is starting." while Splash loads, else why it failed.
+    static func isStarting(_ message: String) -> Bool {
+        message.isEmpty || message.localizedCaseInsensitiveContains("starting")
+    }
+
+    static func notServingText(_ message: String) -> String {
+        isStarting(message) ? "The Mac is starting Inkling. Try again in a moment."
+            : "Inkling isn't running on the Mac: \(message)"
     }
 
     var kind: ReplyErrorKind {
         switch self {
         case .unreachable: .macUnreachable
         case .noModel, .http(404, _, _): .macNoModel
-        case .http, .ollama, .noVision, .notPaired, .untrusted: .macFailed
+        case .http, .server, .noVision, .notPaired, .untrusted, .notServing: .macFailed
         }
     }
 }

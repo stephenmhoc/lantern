@@ -1,63 +1,87 @@
-import LlamaKit
 import SwiftUI
 
 /// Pages pushed inside the Settings sheet.
 enum SettingsPage: Hashable {
-    case readiness
+    case model
+    case mac
     case personalization
+    /// The Mac that serves: a code for a device to pair with (`PairDeviceView`).
+    case pairDevice
 }
 
+/// Settings with its pages: a sheet on iPhone and iPad, a window of its own on the Mac.
+struct SettingsStack: View {
+    @Binding var path: [SettingsPage]
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            SettingsView()
+                .navigationDestination(for: SettingsPage.self) { page in
+                    switch page {
+                    case .model: ModelSetupView(style: .page)
+                    case .mac: ComputersView()
+                    case .personalization: PersonalizationView()
+                    case .pairDevice:
+                        #if targetEnvironment(macCatalyst)
+                        PairDeviceView()
+                        #else
+                        EmptyView()
+                        #endif
+                    }
+                }
+        }
+    }
+}
+
+/// Settings: the two models (this device's, the Mac's; on a Mac, what it does), the web search
+/// key, the instructions, and which build this is.
 struct SettingsView: View {
     @Environment(MacLink.self) private var mac
-    @Environment(Engine.self) private var engine
     @Environment(ModelStore.self) private var store
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openURL) private var openURL
-    @AppStorage(ReplyDetails.key) private var showMetrics = true
-    @AppStorage(Engine.webSearchKey) private var webSearch = false
     @AppStorage(Engine.customPromptKey) private var customPrompt = ""
     /// The Tavily key as typed; saved to the Keychain as it changes.
     @State private var searchKey = WebSearcher.storedKey ?? ""
+    /// Whether iCloud is signed in, for the chats' sync (nil until known).
+    @State private var iCloud: Bool?
 
     var body: some View {
         Form {
-            Section("Models") {
-                NavigationLink(value: SettingsPage.readiness) {
-                    LabeledContent {
-                        Text("\(CatalogModel.all.filter { Readiness.state($0, store: store) == .ready }.count) downloaded")
-                    } label: {
-                        Label("On This \(UIDevice.current.model)", systemImage: Mode.fast.symbol)
-                    }
-                }
-                NavigationLink { ComputersView() } label: {
-                    LabeledContent {
-                        Text(MacLink.isConfigured ? mac.computerName : "Not set up")
-                    } label: {
-                        Label("On Your Computers", systemImage: "desktopcomputer")
-                    }
-                }
-            }
-
+            #if targetEnvironment(macCatalyst)
+            MacRoleSections()
+            #else
             Section {
-                Toggle("Speed and Tokens", isOn: $showMetrics)
+                NavigationLink(value: SettingsPage.model) {
+                    LabeledContent {
+                        Text(modelStatus).monospacedDigit()
+                    } label: {
+                        Label(store.model.name, systemImage: Mode.device.symbol)
+                    }
+                }
+                NavigationLink(value: SettingsPage.mac) {
+                    LabeledContent {
+                        Text(MacLink.isConfigured ? mac.computerName : "Not Paired")
+                    } label: {
+                        Label("Mac", systemImage: "desktopcomputer")
+                    }
+                }
             } header: {
-                Text("Chats")
+                Text("Models")
             } footer: {
-                Text("Under each answer: the model, tokens per second and how long it took to start.")
+                Text("Lantern answers on this \(Device.name), with no connection needed. Pair your Mac to use its larger model too.")
             }
+            #endif
 
             Section {
-                Toggle("Search the Web", isOn: $webSearch)
-                if webSearch {
-                    SecureField("Tavily API Key", text: $searchKey)
-                        .textContentType(.password)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .onSubmit { WebSearcher.setKey(searchKey) }
-                        .onChange(of: searchKey) { _, key in WebSearcher.setKey(key) }
-                }
+                SecureField("Tavily API Key", text: $searchKey)
+                    .textContentType(.password)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .onChange(of: searchKey) { _, key in WebSearcher.setKey(key) }
+            } header: {
+                Text("Web Search")
             } footer: {
-                Text(searchFooter)
+                Text("With your own key from [tavily.com](https://tavily.com), a chat can look things up: turn on Search the Web where you pick its model. Searches go from this \(Device.name) straight to Tavily, and the key stays on it.")
             }
 
             Section {
@@ -68,33 +92,49 @@ struct SettingsView: View {
                         Label("Instructions", systemImage: "text.quote")
                     }
                 }
-            } header: {
-                Text("Personalization")
             } footer: {
-                Text("What every model is told at the start of a new chat.")
+                Text("What the model is told at the start of every new chat.")
             }
 
-            Section("This device") {
-                LabeledContent("Memory", value: MemoryStats.gb(MemoryStats.deviceBytes))
-                LabeledContent("Lantern is using", value: MemoryStats.gb(MemoryStats.footprintBytes))
-                if let free = MemoryStats.availableBytes {
-                    LabeledContent("Free for models", value: MemoryStats.gb(free))
+            Section {
+            } footer: {
+                VStack(spacing: 4) {
+                    if iCloud == false {
+                        Text("Chats stay on this \(Device.name). Sign in to iCloud to have them on your other devices too.")
+                            .padding(.bottom, 6)
+                    }
+                    Text("Lantern \(Self.version)")
+                    if let expiry = BuildExpiry.date {
+                        Text("This build stops opening on \(expiry.formatted(date: .long, time: .omitted)). Update it in TestFlight before then.")
+                            .foregroundStyle(BuildExpiry.isSoon ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+                    }
                 }
-                LabeledContent("Loaded model", value: engine.loadedModel?.name ?? "None")
-                if engine.loadedModel != nil {
-                    Button("Unload model") { engine.unload() }.disabled(engine.isBusy)
-                }
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
             }
         }
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+        #if !targetEnvironment(macCatalyst)  // a window of its own on the Mac
         .toolbar {
             ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
         }
+        #endif
+        .task { iCloud = await ChatStore.signedIn() }
     }
 
-    /// What the switch does, and what's still missing.
-    private var searchFooter: String {
-        let what = "Every model, here and on your computer, can look things up while they answer. This \(UIDevice.current.model) sends their searches to Tavily, with your own API key from tavily.com."
-        return webSearch && searchKey.isEmpty ? what + " Add a key to start searching." : what
+    private var modelStatus: String {
+        if store.isReady, !store.hasUpgrade { return "Ready" }
+        switch store.state {
+        case .downloading(let p): return "Downloading \(Int(p * 100))%"
+        case .paused: return "Paused"
+        case .failed: return "Needs Attention"
+        default: return store.isReady ? "Update Available" : "Not Downloaded"
+        }
+    }
+
+    private static var version: String {
+        let info = Bundle.main.infoDictionary
+        return "\(info?["CFBundleShortVersionString"] as? String ?? "") (\(info?["CFBundleVersion"] as? String ?? ""))"
     }
 }

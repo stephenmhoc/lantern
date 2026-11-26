@@ -1,8 +1,4 @@
-#if os(iOS)
 import UIKit
-#else
-import AppKit
-#endif
 
 extension NSAttributedString.Key {
     /// Marks a code block or table, so `BlockLayoutManager` can draw one even background behind it.

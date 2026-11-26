@@ -3,27 +3,6 @@ import Observation
 import SwiftData
 import SwiftUI
 
-/// Which part of the chats the sidebar's search looks in (its scope bar while searching).
-nonisolated enum SearchScope: String, CaseIterable, Hashable, Sendable {
-    case all, questions, answers
-
-    func includes(_ field: ChatSearch.Field) -> Bool {
-        switch self {
-        case .all: true
-        case .questions: field.isQuestion
-        case .answers: !field.isQuestion
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .all: "All"
-        case .questions: "Questions"
-        case .answers: "Answers"
-        }
-    }
-}
-
 /// History search for the sidebar. Chats keep their messages as one Codable blob, so this is an
 /// in-memory scan: `documents` copies what's searchable out of the chats on the main actor (plain
 /// strings, shared rather than copied), then `run` matches and builds snippets off it.
@@ -54,8 +33,6 @@ nonisolated enum ChatSearch {
         /// Position in the chat, for preferring the latest of equally good matches.
         let index: Int
         let kind: Kind
-        /// In a question (its text or files) rather than an answer, for the scopes.
-        let isQuestion: Bool
         /// For `.otherAnswer`, which of `StoredMessage.allVersions` it is.
         let version: Int?
         let text: String
@@ -81,32 +58,32 @@ nonisolated enum ChatSearch {
             for (i, m) in c.messages.enumerated() {
                 if m.isUser {
                     if !m.content.isEmpty {
-                        fields.append(Field(message: m.id, index: i, kind: .said, isQuestion: true, version: nil, text: m.content,
+                        fields.append(Field(message: m.id, index: i, kind: .said, version: nil, text: m.content,
                                             speaker: "You", spoken: "you said"))
                     }
                     for file in m.attachments ?? [] {
-                        fields.append(Field(message: m.id, index: i, kind: .fileName, isQuestion: true, version: nil, text: file.name,
+                        fields.append(Field(message: m.id, index: i, kind: .fileName, version: nil, text: file.name,
                                             speaker: "You attached", spoken: "you attached"))
                         if !file.text.isEmpty {
-                            fields.append(Field(message: m.id, index: i, kind: .fileText, isQuestion: true, version: nil, text: file.text,
+                            fields.append(Field(message: m.id, index: i, kind: .fileText, version: nil, text: file.text,
                                                 speaker: file.name, spoken: "in \(file.name)"))
                         }
                     }
                 } else {
                     let model = m.metrics?.modelTitle ?? modelName(m.footnote) ?? chatModel
                     if !m.content.isEmpty {
-                        fields.append(Field(message: m.id, index: i, kind: .said, isQuestion: false, version: nil, text: m.content,
+                        fields.append(Field(message: m.id, index: i, kind: .said, version: nil, text: m.content,
                                             speaker: model, spoken: "\(model) said"))
                     }
                     if !m.thinking.isEmpty {
-                        fields.append(Field(message: m.id, index: i, kind: .thinking, isQuestion: false, version: nil, text: m.thinking,
+                        fields.append(Field(message: m.id, index: i, kind: .thinking, version: nil, text: m.thinking,
                                             speaker: "\(model), thinking", spoken: "\(model) thought"))
                     }
                     guard let others = m.versions, !others.isEmpty else { continue }
                     let (list, current) = m.allVersions
                     for (v, version) in list.enumerated() where v != current && !version.content.isEmpty {
                         let other = version.metrics?.modelTitle ?? modelName(version.footnote) ?? model
-                        fields.append(Field(message: m.id, index: i, kind: .otherAnswer, isQuestion: false, version: v, text: version.content,
+                        fields.append(Field(message: m.id, index: i, kind: .otherAnswer, version: v, text: version.content,
                                             speaker: "\(other), another answer", spoken: "\(other) said, in another answer"))
                     }
                 }
@@ -156,8 +133,8 @@ nonisolated enum ChatSearch {
 
     /// `run` off the main actor, cancelled with the caller (typing on cancels the last search).
     @concurrent
-    static func search(_ documents: [Document], query: String, scope: SearchScope) async -> [Result] {
-        run(documents, query: query, scope: scope)
+    static func search(_ documents: [Document], query: String) async -> [Result] {
+        run(documents, query: query)
     }
 
     /// Matches `query` in `documents`: chats whose title matches first, then by `lastActive`
@@ -166,7 +143,7 @@ nonisolated enum ChatSearch {
     /// The scan is over `SearchIndex`'s folded bytes with `memmem` (a chat is folded once per
     /// version of it, then reused); only the one or two hits shown are located in the original
     /// text with `range(of:options:)`, which is far slower per character.
-    static func run(_ documents: [Document], query raw: String, scope: SearchScope) -> [Result] {
+    static func run(_ documents: [Document], query raw: String) -> [Result] {
         let query = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return [] }
         let needle = SearchIndex.fold(query)
@@ -176,9 +153,9 @@ nonisolated enum ChatSearch {
             if Task.isCancelled { return [] }
             let entry = index.entry(for: doc)
             // The title is neither a question nor an answer: it counts only in All.
-            let titleMatch = scope == .all && SearchIndex.contains(entry.title, needle)
+            let titleMatch = SearchIndex.contains(entry.title, needle)
             var found: [(offset: Int, field: Field)] = []
-            for (i, field) in doc.fields.enumerated() where scope.includes(field) {
+            for (i, field) in doc.fields.enumerated() {
                 if SearchIndex.contains(entry.fields[i], needle) { found.append((i, field)) }
             }
             guard titleMatch || !found.isEmpty else { continue }
@@ -236,21 +213,12 @@ nonisolated enum ChatSearch {
     /// `text` with each occurrence of `query` in bold, on a faint tint of the accent colour. The
     /// text stays the primary colour: the amber itself as text is about 2.3:1 on white.
     /// The accent at a strength that shows on black as well as white, stronger with Increase Contrast.
-    #if os(iOS)
     static let matchTint = Color(UIColor { traits in
         let high = traits.accessibilityContrast == .high
         let alpha: CGFloat = traits.userInterfaceStyle == .dark ? (high ? 0.45 : 0.32) : (high ? 0.32 : 0.22)
         let accent = UIColor(named: "AccentColor")?.resolvedColor(with: traits) ?? .systemOrange
         return accent.withAlphaComponent(alpha)
     })
-    #else
-    static let matchTint = Color(NSColor(name: nil) { appearance in
-        let dark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let high = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
-        let alpha: CGFloat = dark ? (high ? 0.45 : 0.32) : (high ? 0.32 : 0.22)
-        return (NSColor(named: "AccentColor") ?? .systemOrange).withAlphaComponent(alpha)
-    })
-    #endif
 
     static func highlighted(_ text: String, query: String) -> AttributedString {
         var out = AttributedString()
@@ -419,37 +387,3 @@ struct SearchResultRow: View {
         return parts.joined(separator: ", ")
     }
 }
-
-#if DEBUG
-extension ChatSearch {
-    /// `-searchBench`: 300 made-up chats of 40 messages (short questions, ~2,500-character answers)
-    /// in an in-memory store; prints how long copying them out (main actor) and searching take.
-    static func benchmark() {
-        guard ProcessInfo.processInfo.arguments.contains("-searchBench") else { return }
-        Task { @MainActor in
-            let words = ["starter", "flour", "water", "heat", "pump", "résumé", "café", "Fourier", "signal", "frequency",
-                         "the", "and", "a", "of", "to", "in", "is", "that", "it", "for", "with", "as", "on", "be"]
-            func paragraph(_ n: Int) -> String { (0..<n).map { _ in words.randomElement()! }.joined(separator: " ") }
-            let container = try! ModelContainer(for: Conversation.self, configurations: .init(isStoredInMemoryOnly: true))
-            let context = container.mainContext
-            for c in 0..<300 {
-                let chat = Conversation(mode: .fast)
-                chat.title = "Chat \(c) " + paragraph(4)
-                chat.messages = (0..<40).map { i in StoredMessage(isUser: i % 2 == 0, content: paragraph(i % 2 == 0 ? 40 : 400)) }
-                context.insert(chat)
-            }
-            try? context.save()
-            let chats = (try? context.fetch(FetchDescriptor<Conversation>())) ?? []
-            var start = ContinuousClock.now
-            let docs = documents(chats)
-            let chars = docs.reduce(0) { $0 + $1.fields.reduce(0) { $0 + $1.text.count } }
-            print("SEARCHBENCH documents: \(docs.count) chats, \(chars) characters, in \(ContinuousClock.now - start)")
-            for q in ["cafe", "cafe", "fourier sig", "zzz", "Résumé the"] {
-                start = ContinuousClock.now
-                let results = await search(docs, query: q, scope: .all)
-                print("SEARCHBENCH \(q): \(results.count) chats in \(ContinuousClock.now - start)")
-            }
-        }
-    }
-}
-#endif

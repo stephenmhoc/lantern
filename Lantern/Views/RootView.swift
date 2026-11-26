@@ -1,27 +1,19 @@
-import CoreSpotlight
-import LlamaKit
 import SwiftData
 import SwiftUI
 import UIKit
 
-/// One window, opening on a new chat. Past chats and Settings are in a side panel: a sidebar
-/// column on iPad (chat list, chat, and the inspector as a third column), a drawer that slides over
-/// the chat on iPhone. A window opened for a chat ("Open in New Window") restores it with
-/// `@SceneStorage`; all windows share the app's one `Engine`.
+/// The one window, opening on a new chat. Past chats and Settings are in a side panel: a sidebar
+/// column on iPad, a drawer that slides over the chat on iPhone.
 struct RootView: View {
-    /// The chat this window was opened for with "Open in New Window", if any.
-    let opened: PersistentIdentifier?
-
     @Environment(\.modelContext) private var context
     @Environment(Engine.self) private var engine
     @Environment(ModelStore.self) private var store
     @Environment(\.horizontalSizeClass) private var sizeClass
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.openWindow) private var openWindow
-    @Environment(\.supportsMultipleWindows) private var supportsMultipleWindows
     @Query(sort: \Conversation.lastActive, order: .reverse) private var conversations: [Conversation]
     @State private var selection: Conversation?
-    @SceneStorage("selection") private var storedSelection: String?
-    @State private var restored = false
+    @State private var started = false
     @State private var sheet: Sheet?
     @State private var settingsPath: [SettingsPage] = []
     @State private var columns = NavigationSplitViewVisibility.all
@@ -35,105 +27,102 @@ struct RootView: View {
     @GestureState private var drawerDragging = false
     @State private var query = ""
     @FocusState private var searchFocused: Bool
-    @State private var scope = SearchScope.all
     /// What the sidebar shows while a query is typed, computed off the main actor in `search`.
     @State private var results: [ChatSearch.Result] = []
-    /// The query and scope `results` are for: "No results" waits until the current one has run.
+    /// The query `results` are for: "No results" waits until the current one has run.
     @State private var resultsFor: SearchKey?
     @State private var renaming: Conversation?
-    /// The row whose swipe actions are out, if any.
-    @State private var swiped: SwipeOpen?
     @State private var renameText = ""
-    /// The chat this window last asked `ChatJump` to scroll, to clear only its own request.
+    @State private var deleting: Conversation?
+    /// The chat last asked to scroll to a search match (`ChatJump`), to clear a request nobody took.
     @State private var jumpRequested: PersistentIdentifier?
-    @AppStorage(DefaultMode.key) private var lastMode = ""
-    @Environment(\.scenePhase) private var scenePhase
-    @State private var window = WindowProbe()
-    private let router = SystemRouter.shared
-
-    /// Readiness lives inside Settings: showing it opens Settings with it pushed.
-    /// A computer being paired from its QR code.
-    @State private var pairing: LanternLink.PairOffer?
+    /// The welcome is shown once, to someone with no model yet.
+    @AppStorage("setup.welcomed") private var welcomed = false
+    /// The better model already offered (its id), so the offer comes up once.
+    @AppStorage("setup.offered") private var offeredModel = ""
+    /// A Mac being paired from its QR code.
+    @State private var pairing: PairOffer?
 
     enum Sheet: String, Identifiable {
-        case settings
+        /// `role`: the Mac's first run (`MacWelcomeView`).
+        case settings, welcome, model, role
         var id: String { rawValue }
     }
 
-    private func showSettings(readiness: Bool = false) {
-        settingsPath = readiness ? [.readiness] : []
+    private func showSettings(_ page: SettingsPage? = nil) {
+        #if targetEnvironment(macCatalyst)
+        SettingsWindow.shared.show(page, open: openWindow)
+        #else
+        settingsPath = page.map { [$0] } ?? []
         sheet = .settings
+        #endif
     }
 
     /// The chats the side panel lists: an empty chat is just the new-chat page, not history.
-    private var history: [Conversation] { conversations.filter { !$0.messages.isEmpty || $0.pinned } }
+    private var history: [Conversation] { conversations.filter { !$0.messages.isEmpty } }
     private var sections: [ChatSection] { ChatSection.group(history) }
     private var trimmedQuery: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var isSearching: Bool { !trimmedQuery.isEmpty }
-    /// The chats in the order the sidebar shows them, for ⌘↑/⌘↓ and moving on after a delete.
-    private var ordered: [Conversation] {
-        guard isSearching else { return sections.flatMap(\.chats) }
-        let byID = Dictionary(conversations.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { a, _ in a })
-        return results.compactMap { byID[$0.id] }
-    }
-    private var hasSidebarToggle: Bool { sizeClass == .regular }
+    private var isWide: Bool { sizeClass == .regular }
 
     var body: some View {
         Group {
-            if hasSidebarToggle { splitView } else { drawerLayout }
+            if isWide { splitView } else { drawerLayout }
         }
         .onChange(of: sheet) { _, shown in
             // The message box keeps focus behind a sheet, and its keyboard would cover the sheet.
             if shown != nil { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
         }
-        .sheet(item: $sheet) { _ in
-            NavigationStack(path: $settingsPath) {
-                SettingsView()
-                    .navigationDestination(for: SettingsPage.self) { page in
-                        switch page {
-                        case .readiness: ReadinessView { sheet = nil }
-                        case .personalization: PersonalizationView()
-                        }
-                    }
-            }
-            .presentationSizing(.page)
-        }
+        .sheet(item: $sheet) { content(for: $0) }
         .sheet(item: $pairing) { PairingSheet(offer: $0) }
         .alert("Rename Chat", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $renameText)
             Button("Rename") { rename() }
             Button("Cancel", role: .cancel) {}
         }
-        .environment(\.showReadiness, OpenSheetAction { showSettings(readiness: true) })
+        .confirmationDialog(
+            "Delete “\(deleting?.title ?? "")”?", isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+            titleVisibility: .visible, presenting: deleting
+        ) { c in
+            Button("Delete Chat", role: .destructive) { withAnimation { delete(c) } }
+        } message: { _ in
+            Text("This can't be undone.")
+        }
+        .environment(\.showModel, OpenSheetAction { sheet = .model })
         .environment(\.showSettings, OpenSheetAction { showSettings() })
+        .environment(\.showMacSettings, OpenSheetAction { showSettings(.mac) })
         .environment(\.openChat, OpenChatAction { selection = $0 })
-        .focusedSceneValue(\.sceneActions, actions)
-        .onAppear(perform: restoreSelection)
+        .focusedSceneValue(\.sceneActions, sceneActions)
+        .onAppear(perform: start)
+        #if targetEnvironment(macCatalyst)
+        .onChange(of: selection?.title, initial: true) { _, title in MacWindow.configure(title: title) }
+        #endif
+        .task(id: searchKey) { await search(searchKey) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            SearchIndex.shared.clear()
+        }
         .onChange(of: selection) { _, c in
-            // A new chat's identifier is temporary until it's saved; newChat() saves first.
-            storedSelection = c?.persistentModelID.stored
-            // The chat screen warms its model when it appears (Engine.prepare).
+            if let requested = jumpRequested, requested != c?.persistentModelID {
+                ChatJump.shared.clear(for: requested)  // a jump nobody took shouldn't fire on a later visit
+                jumpRequested = nil
+            }
         }
         .onChange(of: conversations) {
-            // Deleted in another window: don't keep showing a chat that's gone.
+            // Don't keep showing a chat that's gone.
             if let s = selection, s.isDeleted || s.modelContext == nil || !conversations.contains(s) {
                 newChat(excluding: s)
             }
         }
-        // Deep links, App Intents and Spotlight (Lantern/System).
-        .background { WindowReader(probe: window) }
-        .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
-        .onOpenURL { url in if let link = LanternLink(url: url) { handle(link) } }
-        .onContinueUserActivity(CSSearchableItemActionType) { activity in
-            if let id = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String { handle(.chat(id: id)) }
+        // The Mac's pairing code, scanned with the camera, opens `lantern://pair`.
+        .onOpenURL { url in
+            guard let offer = PairOffer(url: url) else { return }
+            sheet = nil
+            DispatchQueue.main.async { pairing = offer }
         }
-        .onChange(of: router.pending) { claimRequest() }
-        .onChange(of: scenePhase) { claimRequest() }
-        .onReceive(NotificationCenter.default.publisher(for: UIWindow.didBecomeKeyNotification)) { _ in claimRequest() }
         .task {
-            // Only if the Mac has been used: checking it would otherwise ask for local network
+            // Only once a Mac is paired: looking for one would otherwise ask for local network
             // access at launch. It doesn't hold anything up.
-            if lastMode == Mode.mac.rawValue, engine.mac.route == .unknown { await engine.mac.resolve() }
+            if MacLink.isConfigured, engine.mac.route == .unknown { await engine.mac.resolve() }
         }
         .task {
             // Short titles for chats that still have their question as the title, after launch settles.
@@ -142,19 +131,50 @@ struct RootView: View {
         }
     }
 
-    /// iPad: the side panel as a column, which can be hidden.
+    @ViewBuilder private func content(for shown: Sheet) -> some View {
+        switch shown {
+        case .settings:
+            // The Mac: never a sheet, Settings has a window of its own (`SettingsWindow`).
+            SettingsStack(path: $settingsPath).presentationSizing(.page)
+        case .welcome:
+            ModelSetupView(style: .welcome).presentationSizing(.page)
+        case .model:
+            NavigationStack { ModelSetupView(style: .sheet) }.presentationSizing(.page)
+        case .role:
+            #if targetEnvironment(macCatalyst)
+            MacWelcomeView { role in
+                sheet = nil
+                Task {
+                    await MacRole.choose(role, link: engine.mac)
+                    if role == .client { showSettings(.mac) }  // pairing is next
+                }
+            }
+            .presentationSizing(.fitted)
+            #else
+            EmptyView()
+            #endif
+        }
+    }
+
+    /// iPad and Mac: the side panel as a column, which can be hidden.
     private var splitView: some View {
         NavigationSplitView(columnVisibility: $columns) {
+            #if targetEnvironment(macCatalyst)
+            macSidebar
+            #else
             sidebar
+            #endif
         } detail: {
             chat
                 .toolbar {
+                    #if !targetEnvironment(macCatalyst)  // the Mac's own sidebar button stays in the title bar
                     if columns == .detailOnly {
                         ToolbarItem(placement: .topBarLeading) {
-                            Button("Show sidebar", systemImage: "sidebar.left") { toggleSidebar() }
+                            Button("Show Sidebar", systemImage: "sidebar.left") { toggleSidebar() }
                         }
                     }
-                    ToolbarItem(placement: .topBarTrailing) { newChatButton }
+                    #endif
+                    ToolbarItem(placement: .topBarTrailing) { newChatButton.help("New Chat (⌘N)") }
                 }
         }
     }
@@ -163,14 +183,12 @@ struct RootView: View {
     private var chat: some View {
         if let selection {
             ChatScreen(conversation: selection).id(selection.persistentModelID)
-        } else {
-            ContentUnavailableView("No chat selected", systemImage: "bubble.left.and.bubble.right")
         }
     }
 
     /// Nothing to do on the new-chat page itself.
     private var newChatButton: some View {
-        Button("New chat", systemImage: "square.and.pencil") { newChat() }
+        Button("New Chat", systemImage: "square.and.pencil") { newChat() }
             .disabled(selection?.messages.isEmpty ?? false)
     }
 
@@ -222,6 +240,7 @@ struct RootView: View {
                     .shadow(color: .black.opacity(shown > 0 ? 0.15 : 0), radius: 12)
                     .offset(x: shown - width)
                     .accessibilityHidden(!drawerOpen)
+                    .accessibilityAddTraits(.isModal)
                     .accessibilityAction(.escape) { setDrawer(false) }
             }
             // A drag the system cancelled (no `onEnded`) goes back to where it started.
@@ -247,14 +266,18 @@ struct RootView: View {
     private func setDrawer(_ open: Bool) {
         // The message box's keyboard would sit over the panel.
         if open { UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil) }
-        withAnimation(.snappy(duration: 0.3)) {
+        withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .snappy(duration: 0.3)) {
             drawerOpen = open
             drawerDrag = 0
         }
         if !open { searchFocused = false }
     }
 
-    private var needsAttention: Bool { Readiness.needsAttention(store: store) }
+    /// Settings needs a look only when nothing here can answer or this build is about to stop
+    /// launching.
+    private var needsAttention: Bool {
+        (!store.isReady && !MacLink.isConfigured) || BuildExpiry.isSoon
+    }
 
     private var attentionBadge: some View {
         Image(systemName: "exclamationmark.circle.fill")
@@ -267,7 +290,7 @@ struct RootView: View {
     // MARK: - Sidebar
 
     /// The side panel: Lantern and search at the top, the chats as plain rows (the open one
-    /// highlighted), Settings and New chat at the bottom. The same view is the iPad's sidebar column
+    /// highlighted), Settings and New Chat at the bottom. The same view is the iPad's sidebar column
     /// and the iPhone's drawer; neither has a navigation bar of its own.
     private var sidebar: some View {
         // Buttons, not list selection: the panel's own highlight, the same on iPhone and iPad, and
@@ -283,50 +306,81 @@ struct RootView: View {
         .scrollContentBackground(.hidden)
         .environment(\.defaultMinListRowHeight, 0)
         .scrollDismissesKeyboard(.immediately)
-        .onScrollPhaseChange { _, phase in if phase != .idle { putSwipeAway() } }
-        .onChange(of: query) { putSwipeAway() }
-        .onChange(of: drawerOpen) { putSwipeAway() }
         .modifier(TopBar { sidebarHeader })
-        // Settings and New chat sit in the list's own bottom inset.
         .modifier(BottomBar { sidebarButtons })
         .toolbar(.hidden, for: .navigationBar)
         .toolbar(removing: .sidebarToggle)
-        .task(id: searchKey) { await search(searchKey) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-            SearchIndex.shared.clear()
-        }
-        .onChange(of: selection) { _, c in
-            if let requested = jumpRequested, requested != c?.persistentModelID {
-                // This window's jump nobody took shouldn't fire on some later visit. Only its own:
-                // another window's is for the chat that window shows.
-                ChatJump.shared.clear(for: requested)
-                jumpRequested = nil
-            }
-        }
         .navigationSplitViewColumnWidth(min: 260, ideal: 300, max: 380)
-        .overlay {
-            if history.isEmpty, !isSearching {
-                ContentUnavailableView {
-                    Label("No chats yet", systemImage: "bubble.left.and.bubble.right")
-                } description: {
-                    Text("Your chats show up here, and stay on this device.")
-                }
-            } else if isSearching, resultsFor == searchKey, results.isEmpty {
-                ContentUnavailableView.search(text: trimmedQuery)
+        .overlay { sidebarEmpty }
+    }
+
+    @ViewBuilder private var sidebarEmpty: some View {
+        if history.isEmpty, !isSearching {
+            ContentUnavailableView {
+                Label("No Chats Yet", systemImage: "bubble.left.and.bubble.right")
+            } description: {
+                Text("Your chats show up here. They stay on this \(Device.name).")
             }
+        } else if isSearching, resultsFor == searchKey, results.isEmpty {
+            ContentUnavailableView.search(text: trimmedQuery)
         }
     }
 
-    /// "Lantern" with the flame, the iPad's hide-sidebar button, the search field and, while a
-    /// query is typed, what to search.
+    #if targetEnvironment(macCatalyst)
+    /// The Mac's sidebar is the system's: a sidebar list with its own selection, the search field
+    /// and the sidebar button where a Mac app has them. Settings is in the app menu, New Chat in
+    /// the toolbar.
+    private var macSidebar: some View {
+        let byID = Dictionary(conversations.map { ($0.persistentModelID, $0) }, uniquingKeysWith: { a, _ in a })
+        let picked = Binding<Conversation?>(
+            get: { selection },
+            set: { c in
+                guard let c else { return }  // a click on nothing keeps the chat open
+                if isSearching, let r = results.first(where: { $0.id == c.persistentModelID }) { requestJump(to: r) }
+                selection = c
+            })
+        return List(selection: picked) {
+            if isSearching {
+                ForEach(results) { r in
+                    if let c = byID[r.id] {
+                        SearchResultRow(result: r).padding(.vertical, 2).tag(c).contextMenu { chatMenu(c) }
+                    }
+                }
+            } else {
+                ForEach(sections) { section in
+                    Section(section.title) {
+                        ForEach(section.chats) { c in
+                            ChatRow(conversation: c, answering: engine.running == c.persistentModelID)
+                                .padding(.vertical, 2)
+                                .tag(c)
+                                .contextMenu { chatMenu(c) }
+                        }
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .searchable(text: $query, placement: .sidebar, prompt: "Search")
+        .searchFocused($searchFocused)
+        .navigationSplitViewColumnWidth(min: 220, ideal: 270, max: 400)
+        .overlay { sidebarEmpty }
+    }
+    #endif
+
+    @ViewBuilder private func chatMenu(_ c: Conversation) -> some View {
+        Button("Rename", systemImage: "pencil") { startRename(c) }
+        Button("Delete", systemImage: "trash", role: .destructive) { deleting = c }
+    }
+
+    /// "Lantern" with the flame, the iPad's hide-sidebar button and the search field.
     private var sidebarHeader: some View {
         VStack(spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "flame.fill").foregroundStyle(.tint).accessibilityHidden(true)
                 Text("Lantern").font(.title3.weight(.bold)).accessibilityAddTraits(.isHeader)
                 Spacer()
-                if hasSidebarToggle {
-                    Button("Hide sidebar", systemImage: "sidebar.left") { toggleSidebar() }
+                if isWide {
+                    Button("Hide Sidebar", systemImage: "sidebar.left") { toggleSidebar() }
                         .labelStyle(.iconOnly)
                         .font(.title3)
                         .frame(minWidth: 44, minHeight: 44)
@@ -338,12 +392,12 @@ struct RootView: View {
             .frame(minHeight: 44)
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary).accessibilityHidden(true)
-                TextField("Search chats", text: $query)
+                TextField("Search", text: $query)
                     .focused($searchFocused)
                     .submitLabel(.search)
                     .autocorrectionDisabled()
                 if !query.isEmpty {
-                    Button("Clear search", systemImage: "xmark.circle.fill") { query = "" }
+                    Button("Clear Search", systemImage: "xmark.circle.fill") { query = "" }
                         .labelStyle(.iconOnly)
                         .buttonStyle(.plain)
                         .foregroundStyle(.secondary)
@@ -352,36 +406,28 @@ struct RootView: View {
             .padding(.horizontal, 12)
             .frame(minHeight: 40)
             .background(Color(.tertiarySystemFill), in: .capsule)
-            if isSearching {
-                Picker("Search in", selection: $scope) {
-                    ForEach(SearchScope.allCases, id: \.self) { Text($0.title).tag($0) }
-                }
-                .pickerStyle(.segmented)
-            }
         }
         .padding(.horizontal, 16)
-        .padding(.top, hasSidebarToggle ? 4 : 8)
+        .padding(.top, isWide ? 4 : 8)
         .padding(.bottom, 8)
     }
 
-    /// Settings on the left (badged when it needs a look), New chat on the right, as round glass buttons.
+    /// Settings on the left (badged when it needs a look), New Chat on the right, as round glass buttons.
     private var sidebarButtons: some View {
-        // Models are inside Settings; a mark on the gear only when there's no model at all or the build expires soon.
-        let ready = !needsAttention
-        return HStack {
-            Button { showSettings(readiness: !ready) } label: {
+        HStack {
+            Button { showSettings() } label: {
                 Label("Settings", systemImage: "gearshape")
                     .labelStyle(.iconOnly)
                     .font(.title3)
                     .frame(width: 28, height: 28)
             }
             .modifier(RoundGlass(prominent: false))
-            .overlay(alignment: .topTrailing) { if !ready { attentionBadge.font(.footnote) } }
-            .accessibilityLabel(ready ? "Settings" : "Settings, needs attention")
+            .overlay(alignment: .topTrailing) { if needsAttention { attentionBadge.font(.footnote) } }
+            .accessibilityLabel(needsAttention ? "Settings, needs attention" : "Settings")
             Spacer()
             // ⌘N lives in the menu bar (LanternCommands), so it works with the sidebar hidden.
             Button { newChat() } label: {
-                Label("New chat", systemImage: "square.and.pencil")
+                Label("New Chat", systemImage: "square.and.pencil")
                     .labelStyle(.iconOnly)
                     .font(.title3.weight(.medium))
                     // Dark on the amber: white on it is about 2.3:1, under the 3:1 icons need;
@@ -395,8 +441,8 @@ struct RootView: View {
         .padding(.vertical, 8)
     }
 
-    /// The chats by date, with their swipe actions and menu. The dates are plain rows rather than
-    /// section headers, which a plain list pins to the top with a bar behind them.
+    /// The chats by date. The dates are plain rows rather than section headers, which a plain
+    /// list pins to the top with a bar behind them.
     private var chatSections: some View {
         ForEach(Array(sections.enumerated()), id: \.element.id) { i, section in
             Text(section.title)
@@ -422,43 +468,34 @@ struct RootView: View {
         }
     }
 
-    /// A chat in the panel: opens it (at the match, for a search result) and puts the drawer away,
-    /// with its swipe actions (`SwipeRow`) and menu. The open chat is highlighted.
+    /// A chat in the panel: opens it (at the match, for a search result) and puts the drawer away.
+    /// Rename and Delete are the list's swipe actions and the row's menu. The open chat is highlighted.
     private func chatButton(_ c: Conversation, result: ChatSearch.Result? = nil,
                             @ViewBuilder label: () -> some View) -> some View {
-        SwipeRow(id: c.persistentModelID, open: $swiped, pinned: c.pinned,
-                 onPin: { withAnimation { togglePin(c) } },
-                 onRename: { startRename(c) },
-                 onDelete: { withAnimation { delete(c) } }) {
-            Button {
-                // With a row's actions out, a tap anywhere in the list just puts them away.
-                if swiped != nil { putSwipeAway(); return }
-                if let result { requestJump(to: result) }
-                selection = c
-                if !hasSidebarToggle { setDrawer(false) }
-            } label: {
-                label()
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 9)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(.rect(cornerRadius: 12))
-            }
-            .buttonStyle(SidebarRowStyle(selected: selection == c))
-            .accessibilityAddTraits(selection == c ? .isSelected : [])
-            .contextMenu { menu(for: c, result: result) }
+        Button {
+            if let result { requestJump(to: result) }
+            selection = c
+            if !isWide { setDrawer(false) }
+        } label: {
+            label()
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(.rect(cornerRadius: 12))
+        }
+        .buttonStyle(SidebarRowStyle(selected: selection == c))
+        .accessibilityAddTraits(selection == c ? .isSelected : [])
+        .contextMenu { chatMenu(c) }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button("Delete", systemImage: "trash", role: .destructive) { deleting = c }
+            Button("Rename", systemImage: "pencil") { startRename(c) }.tint(.gray)
         }
         .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }
 
-    private func putSwipeAway() {
-        guard swiped != nil else { return }
-        withAnimation(.spring(response: 0.32, dampingFraction: 0.86)) { swiped = nil }
-    }
-
-    /// Asks the chat screen showing `r`'s chat to scroll to its match. Keyed by the chat, so it
-    /// can't be taken or cleared by another window showing another chat.
+    /// Asks the chat screen showing `r`'s chat to scroll to its match.
     private func requestJump(to r: ChatSearch.Result) {
         if let requested = jumpRequested, requested != r.id { ChatJump.shared.clear(for: requested) }
         guard let hit = r.target else { ChatJump.shared.clear(for: r.id); jumpRequested = nil; return }
@@ -467,17 +504,16 @@ struct RootView: View {
     }
 
     /// What `results` depends on. `revision` changes when a chat is added, removed, renamed, has a
-    /// turn start or end, or shows another answer (a version switch, Continue With), so results
-    /// don't go stale while the query stays the same. Votes don't change what's searched.
+    /// turn start or end, or shows another answer, so results don't go stale while the query
+    /// stays the same.
     struct SearchKey: Hashable {
         var query: String
-        var scope: SearchScope
         var revision: Int
     }
 
     private var searchKey: SearchKey {
         // Only while searching: it reads every chat's messages.
-        guard isSearching else { return SearchKey(query: "", scope: scope, revision: 0) }
+        guard isSearching else { return SearchKey(query: "", revision: 0) }
         var h = Hasher()
         h.combine(conversations.count)
         for c in conversations {
@@ -488,7 +524,7 @@ struct RootView: View {
                 h.combine(m.versionIndex)
             }
         }
-        return SearchKey(query: trimmedQuery, scope: scope, revision: h.finalize())
+        return SearchKey(query: trimmedQuery, revision: h.finalize())
     }
 
     /// Runs the search for `key` after a short pause for typing, off the main actor.
@@ -503,51 +539,14 @@ struct RootView: View {
         try? await Task.sleep(for: .milliseconds(180))
         guard !Task.isCancelled else { return }
         let documents = ChatSearch.documents(conversations)
-        let found = await ChatSearch.search(documents, query: key.query, scope: key.scope)
+        let found = await ChatSearch.search(documents, query: key.query)
         guard !Task.isCancelled else { return }
         results = found
         resultsFor = key
     }
 
-    @ViewBuilder
-    private func menu(for c: Conversation, result: ChatSearch.Result? = nil) -> some View {
-        Button("Rename", systemImage: "pencil") { startRename(c) }
-        Button(c.pinned ? "Unpin" : "Pin", systemImage: c.pinned ? "pin.slash" : "pin") { togglePin(c) }
-        if supportsMultipleWindows {
-            Button("Open in New Window", systemImage: "macwindow.badge.plus") {
-                if let result { requestJump(to: result) }
-                try? context.save()  // so the window gets a permanent identifier
-                openWindow(id: LanternApp.mainWindow, value: c.persistentModelID)
-            }
-        }
-        Divider()
-        Button("Delete", systemImage: "trash", role: .destructive) { delete(c) }
-    }
-
-    // MARK: - Menu bar
-
-    private var actions: SceneActions {
-        var deleteSelected: (() -> Void)?
-        if let c = selection { deleteSelected = { delete(c) } }
-        let canStep = !ordered.isEmpty
-        let previous: (() -> Void)? = canStep ? { step(-1) } : nil
-        let next: (() -> Void)? = canStep ? { step(1) } : nil
-        let toggle: (() -> Void)? = { toggleSidebar() }
-        return SceneActions(
-            newChat: { newChat() },
-            showSettings: { showSettings() },
-            showReadiness: { showSettings(readiness: true) },
-            find: { find() },
-            deleteSelected: deleteSelected,
-            previous: previous,
-            next: next,
-            toggleSidebar: toggle,
-            sidebarVisible: hasSidebarToggle ? columns != .detailOnly : drawerOpen
-        )
-    }
-
     private func toggleSidebar() {
-        if hasSidebarToggle {
+        if isWide {
             withAnimation { columns = columns == .detailOnly ? .all : .detailOnly }
         } else {
             setDrawer(!drawerOpen)
@@ -555,7 +554,7 @@ struct RootView: View {
     }
 
     private func find() {
-        if hasSidebarToggle {
+        if isWide {
             withAnimation { columns = .all }
         } else {
             setDrawer(true)
@@ -563,132 +562,89 @@ struct RootView: View {
         searchFocused = true
     }
 
-    private func step(_ offset: Int) {
-        let list = ordered
-        guard !list.isEmpty else { return }
-        guard let current = selection, let i = list.firstIndex(of: current) else {
-            selection = offset > 0 ? list.first : list.last
-            return
-        }
-        selection = list[min(max(i + offset, 0), list.count - 1)]
-    }
-
     // MARK: - Chats
 
-    private func restoreSelection() {
-        guard !restored else { return }
-        restored = true
+    private func start() {
+        guard !started else { return }
+        started = true
         #if DEBUG
         DebugLaunch.seed(context)
-        ChatSearch.benchmark()
-        switch DebugLaunch.ui {
-        case "readiness"?: showSettings(readiness: true)
-        case "settings"?: showSettings()
-        case "personalization"?:
-            settingsPath = [.personalization]
-            sheet = .settings
-        case let ui? where ui.hasPrefix("search:"):
-            query = String(ui.dropFirst("search:".count))
-        case let ui?:
-            // Menu-bar actions, once the window has settled: delete, newchat, sidebar, next, window.
-            Task {
-                try? await Task.sleep(for: .seconds(1))
-                switch ui {
-                case "delete": actions.deleteSelected?()
-                case "newchat": newChat()
-                case "sidebar": actions.toggleSidebar?()
-                case "swipe", "swipepin":
-                    // The first chat's swipe actions out (Rename and Delete, or Pin), in the open panel.
-                    if !hasSidebarToggle { setDrawer(true) }
-                    try? await Task.sleep(for: .seconds(0.5))
-                    if let c = sections.first?.chats.first {
-                        withAnimation { swiped = SwipeOpen(id: c.persistentModelID, edge: ui == "swipe" ? .trailing : .leading) }
-                    }
-                case "next": actions.next?()
-                case "window": if let c = conversations.last { openWindow(id: LanternApp.mainWindow, value: c.persistentModelID) }
-                default: break
-                }
-            }
-        default: break
+        #endif
+        newChat()
+        #if targetEnvironment(macCatalyst)
+        // A Mac has no model to download: its first run asks what it does instead.
+        if MacRole.current == nil {
+            sheet = .role
+        } else {
+            MacRole.resume(engine.mac)
         }
-        if let path = DebugLaunch.importPath {
-            Task.detached {
-                let result = Result { try ModelImport.importFile(at: URL(filePath: path)) }
-                print("IMPORT \(path): \(result.map(\.name))")
-            }
+        MacUpdater.start()
+        #else
+        // First run: the welcome, which downloads the model. Once.
+        if store.isReady || MacLink.isConfigured { welcomed = true }
+        if !welcomed {
+            welcomed = true
+            sheet = .welcome
+        } else if store.hasUpgrade, store.state == .missing, offeredModel != store.best.id {
+            // A better model than the one here: offered once, never forced. It stays in Settings.
+            offeredModel = store.best.id
+            sheet = .model
         }
         #endif
-        let firstRun = conversations.isEmpty && store.downloaded.isEmpty
-        // A window opened for a chat keeps showing it; every other window opens on a new chat.
-        if opened != nil, let id = PersistentIdentifier(stored: storedSelection) ?? opened,
-           let c = conversations.first(where: { $0.persistentModelID == id }) {
-            selection = c
-            if storedSelection == nil, hasSidebarToggle { columns = .detailOnly }
-        } else {
-            newChat()
-        }
-        // First run: straight to getting the models (in the first window only).
-        if opened == nil, firstRun { showSettings(readiness: true) }
+        #if DEBUG
+        DebugLaunch.open(in: self.debugHooks)
+        #endif
     }
 
     /// `excluding`: a chat being deleted, which the query may still list.
     @discardableResult
-    private func newChat(mode: Mode? = nil, excluding: Conversation? = nil) -> Conversation {
-        let mode = mode ?? DefaultMode.pick(last: lastMode, engine: engine)
+    private func newChat(excluding: Conversation? = nil) -> Conversation {
         query = ""
-        if !hasSidebarToggle, drawerOpen { setDrawer(false) }
+        if !isWide, drawerOpen { setDrawer(false) }
         // Reuse an empty chat rather than stacking up empty ones.
         if let empty = conversations.first(where: {
-            $0.messages.isEmpty && !$0.pinned && $0 != excluding && !$0.isDeleted && $0.modelContext != nil
+            $0.messages.isEmpty && $0 != excluding && !$0.isDeleted && $0.modelContext != nil
         }) {
-            empty.mode = mode
+            empty.mode = ChatDefaults.mode
+            empty.thinking = ChatDefaults.thinking
+            empty.webSearch = ChatDefaults.webSearch
+            // A prompt as it would be written today: the date, and any change to the instructions.
+            empty.systemPrompt = Engine.systemPrompt()
             empty.lastActive = .now
             selection = empty
             return empty
         }
-        let c = Conversation(mode: mode)
+        let c = Conversation(mode: ChatDefaults.mode)
         context.insert(c)
-        try? context.save()  // a permanent identifier, for @SceneStorage and Engine.running
+        try? context.save()  // a permanent identifier, for `Engine.running`
         selection = c
         return c
     }
 
-    // MARK: - Deep links and intents
-
-    private func claimRequest() {
-        if let link = router.claim(active: scenePhase == .active, window: window.window) { handle(link) }
+    /// What the menu bar can do in this window.
+    private var sceneActions: SceneActions {
+        SceneActions(
+            newChat: { newChat() }, showSettings: { showSettings() }, find: { find() },
+            toggleSidebar: { toggleSidebar() }, sidebarVisible: isWide ? columns != .detailOnly : drawerOpen,
+            thinking: chatSetting { $0.thinking != .off }, webSearch: chatSetting { $0.webSearch },
+            setThinking: { on in changeChat { $0.thinking = on ? .high : .off } },
+            setWebSearch: { on in changeChat { $0.webSearch = on } })
     }
 
-    /// A `lantern://` link, an App Intent or a Spotlight result, in this window.
-    private func handle(_ link: LanternLink) {
-        restoreSelection()  // first, in case this arrives before the window appeared
-        searchFocused = false
-        if drawerOpen { setDrawer(false) }
-        guard sheet == nil else {
-            // Selecting while the sheet goes away can be lost: dismiss, then go on next turn.
-            sheet = nil
-            DispatchQueue.main.async { open(link) }
-            return
-        }
-        open(link)
+    /// One of the open chat's settings, for the menu bar: nil while it can't change (no chat, or
+    /// it's answering).
+    private func chatSetting(_ value: (Conversation) -> Bool) -> Bool? {
+        guard let selection, engine.running != selection.persistentModelID else { return nil }
+        return value(selection)
     }
 
-    private func open(_ link: LanternLink) {
-        switch link {
-        case .new(let mode):
-            newChat(mode: mode.flatMap(Mode.init(rawValue:)))
-        case .ask(let text, let mode):
-            let c = newChat(mode: mode.flatMap(Mode.init(rawValue:)))
-            let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
-            // Another chat is answering: leave the question in the message box to send after.
-            if engine.isBusy { c.draft = text } else { engine.send(text, in: c) }
-        case .chat(let id):
-            query = ""
-            if let c = conversations.first(where: { $0.stateID == id }) { selection = c }
-        case .pair(let offer):
-            pairing = offer
-        }
+    /// Changes the open chat's Think First or Search the Web from the menu bar, as the model
+    /// picker does: remembered for new chats, and the model gets ready for the new system turn.
+    private func changeChat(_ change: (Conversation) -> Void) {
+        guard let selection, engine.running != selection.persistentModelID else { return }
+        change(selection)
+        ChatDefaults.remember(selection)
+        engine.prepare(selection)
     }
 
     private func startRename(_ c: Conversation) {
@@ -702,21 +658,41 @@ struct RootView: View {
         renaming = nil
     }
 
-    private func togglePin(_ c: Conversation) {
-        withAnimation { c.pinned.toggle() }
-    }
-
-    /// Immediate, with no undo. Swipe-delete still takes a tap on its button (no full swipe).
     /// Deleting the chat on screen goes to a new chat.
     private func delete(_ c: Conversation) {
         if engine.running == c.persistentModelID { engine.stop() }
         engine.forgetState(for: c)  // its saved model state in Caches/kv
         let shown = selection == c
-        withAnimation { context.delete(c) }
+        context.delete(c)
         try? context.save()
         if shown { newChat(excluding: c) }
     }
+
+    #if DEBUG
+    /// What `-ui` can open from outside the view (see `DebugLaunch`).
+    private var debugHooks: DebugLaunch.Hooks {
+        DebugLaunch.Hooks(
+            settings: { showSettings($0) },
+            sheet: { sheet = $0 },
+            sidebar: { if isWide { columns = .all } else { setDrawer(true) } },
+            search: { query = $0 },
+            open: { title in if let c = conversations.first(where: { $0.title == title }) { selection = c } })
+    }
+    #endif
 }
+
+#if targetEnvironment(macCatalyst)
+/// The Mac's window: a size it can't be shrunk past, and the open chat's title (the Window menu
+/// lists it by that).
+enum MacWindow {
+    static func configure(title: String?) {
+        for case let scene as UIWindowScene in UIApplication.shared.connectedScenes where scene !== SettingsWindow.shared.scene {
+            scene.sizeRestrictions?.minimumSize = CGSize(width: 700, height: 480)
+            scene.title = title ?? ""
+        }
+    }
+}
+#endif
 
 /// Buttons in a scroll view's own bottom inset (the sidebar's, the comparison's): on iOS 26 a
 /// bar with no background of its own, over the scroll view's soft edge effect; the system bar

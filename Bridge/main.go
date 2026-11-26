@@ -1,18 +1,25 @@
-// lantern-bridge connects Lantern on an iPhone or iPad to the models on this Mac (Ollama,
-// LM Studio, llama.cpp, vLLM, Jan…), on the home network or over Tailscale, encrypted from the
-// device to the Mac: TLS with the bridge's own certificate, which devices pin when they pair,
-// and a token of each device's own. The backends themselves then only need to listen on this Mac.
+// lantern-bridge connects Lantern on an iPhone or iPad to the model on this Mac, served by Splash
+// (which it starts, keeps running and stops), on the home network or over Tailscale, encrypted
+// from the device to the Mac: TLS with the bridge's own certificate, which devices pin when they
+// pair, and a token of each device's own. Splash itself only listens on this Mac.
 //
-//	lantern-bridge serve          run it (the Mac app or a login agent keeps it running)
-//	lantern-bridge pair [--link]  show a QR code for pairing a device (or just print the link)
-//	lantern-bridge status         what it serves and who's paired
-//	lantern-bridge revoke <id>    unpair a device
+//	lantern-bridge serve                 run it (the Mac app or a login agent keeps it running)
+//	lantern-bridge pair [--link]         show a QR code for pairing a device (or just print the link)
+//	lantern-bridge pair --code           show a code to type on the device instead
+//	lantern-bridge status                Splash, the drafter, the tailnet and who's paired
+//	lantern-bridge revoke <id>           unpair a device
+//	lantern-bridge tailscale set <id>    keep a Tailscale OAuth client (its secret from stdin)
+//	lantern-bridge tailscale clear       forget it
 //
-// Its folder (identity, devices, settings, admin socket) is ~/Library/Application Support/Lantern/Bridge,
-// or LANTERN_BRIDGE_DIR.
+// Its folder (identity, devices, settings, admin socket, Splash's log) is
+// ~/Library/Application Support/Lantern/Bridge, or LANTERN_BRIDGE_DIR. For development,
+// LANTERN_BRIDGE_PORT sets the port and LANTERN_BRIDGE_UPSTREAM (http://127.0.0.1:8000) uses a
+// Splash already running instead of starting one.
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -35,28 +42,32 @@ func main() {
 		home, _ := os.UserHomeDir()
 		dir = filepath.Join(home, "Library", "Application Support", "Lantern", "Bridge")
 	}
-	command := "serve"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
-	}
+	args := append(os.Args[1:], "", "")
 	var err error
-	switch command {
-	case "serve":
+	switch args[0] {
+	case "serve", "":
 		err = serve(dir)
 	case "pair":
-		err = pair(dir, len(os.Args) > 2 && os.Args[2] == "--link")
+		switch args[1] {
+		case "--code":
+			err = pairCode(dir)
+		default:
+			err = pair(dir, args[1] == "--link")
+		}
 	case "status":
 		err = printStatus(dir)
 	case "revoke":
-		if len(os.Args) < 3 {
+		if args[1] == "" {
 			err = fmt.Errorf("usage: lantern-bridge revoke <device id>")
 		} else {
-			err = admin(dir, http.MethodDelete, "/devices/"+os.Args[2], nil)
+			err = admin(dir, http.MethodDelete, "/devices/"+args[1], nil, nil)
 		}
+	case "tailscale":
+		err = tailscaleCommand(dir, args[1], args[2])
 	case "version":
 		fmt.Println(version)
 	default:
-		err = fmt.Errorf("usage: lantern-bridge [serve|pair [--link]|status|revoke <id>|version]")
+		err = fmt.Errorf("usage: lantern-bridge [serve | pair [--link|--code] | status | revoke <id> | tailscale set <client id>|clear | version]")
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -69,53 +80,53 @@ func serve(dir string) error {
 	if err != nil {
 		return err
 	}
+	// The port first: until it's this bridge's, nothing else (Splash, the admin socket) starts.
+	ln, err := claimPort(b.port())
+	if err != nil {
+		return err
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go b.backends.watch(ctx, 10*time.Second)
+	restartSplash := make(chan struct{}, 1)
+	splashDone := make(chan struct{})
+	go func() {
+		defer close(splashDone)
+		b.splash.run(ctx, restartSplash)
+	}()
 	go b.advertise(ctx)
 	go func() {
-		if err := b.serveAdmin(ctx); err != nil {
+		if err := b.serveAdmin(ctx, restartSplash); err != nil {
 			log.Printf("admin socket: %v", err)
 		}
 	}()
-	// Models kept loaded for good are loaded now, not on the first question, and again whenever
-	// they aren't (the model server restarted, or something unloaded them).
-	go func() {
-		time.Sleep(3 * time.Second) // the first look at the backends
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			for _, m := range b.settings().KeepLoaded {
-				if b.backends.loaded(ctx, m) {
-					continue
-				}
-				log.Printf("loading %s, kept loaded", m)
-				if err := b.backends.warm(ctx, m, -1); err != nil {
-					log.Printf("loading %s: %v", m, err)
-				}
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-		}
-	}()
-	log.Printf("lantern-bridge %s on :%d, certificate %s", version, b.port(), b.identity.fingerprint)
-	s := &server{b: b, backends: b.backends, devices: b.devices}
-	return s.listen(ctx, fmt.Sprintf(":%d", b.port()))
+	log.Printf("lantern-bridge %s on :%d, certificate %s, Splash at %s", version, b.port(), b.identity.fingerprint, b.splash.url)
+	err = (&server{b: b}).serve(ctx, ln)
+	stop()
+	<-splashDone // Splash stops with the bridge
+	return err
 }
 
-func admin(dir, method, path string, into any) error {
-	req, _ := http.NewRequest(method, "http://bridge"+path, nil)
+func admin(dir, method, path string, body, into any) error {
+	var reader io.Reader
+	if body != nil {
+		data, _ := json.Marshal(body)
+		reader = bytes.NewReader(data)
+	}
+	req, _ := http.NewRequest(method, "http://bridge"+path, reader)
 	resp, err := adminClient(dir).Do(req)
 	if err != nil {
 		return fmt.Errorf("the bridge isn't running (%v)", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		var e struct {
+			Error struct{ Message string } `json:"error"`
+		}
+		data, _ := io.ReadAll(resp.Body)
+		if json.Unmarshal(data, &e) == nil && e.Error.Message != "" {
+			return fmt.Errorf("%s", e.Error.Message)
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if into != nil {
 		return json.NewDecoder(resp.Body).Decode(into)
@@ -128,7 +139,7 @@ func pair(dir string, linkOnly bool) error {
 		Link    string    `json:"link"`
 		Expires time.Time `json:"expires"`
 	}
-	if err := admin(dir, http.MethodPost, "/pairing", &offer); err != nil {
+	if err := admin(dir, http.MethodPost, "/pairing", nil, &offer); err != nil {
 		return err
 	}
 	if linkOnly {
@@ -143,6 +154,40 @@ func pair(dir string, linkOnly bool) error {
 	fmt.Printf("Scan with the iPhone's camera and open in Lantern. Good for one device until %s.\n",
 		offer.Expires.Local().Format("3:04 PM"))
 	return nil
+}
+
+func pairCode(dir string) error {
+	var c struct {
+		Code    string    `json:"code"`
+		Expires time.Time `json:"expires"`
+	}
+	if err := admin(dir, http.MethodPost, "/pairing/code", nil, &c); err != nil {
+		return err
+	}
+	fmt.Printf("%s\nType it in Lantern on the device (on the same network). Good for one device until %s.\n",
+		c.Code, c.Expires.Local().Format("3:04 PM"))
+	return nil
+}
+
+func tailscaleCommand(dir, verb, id string) error {
+	switch verb {
+	case "set":
+		if id == "" {
+			return fmt.Errorf("usage: lantern-bridge tailscale set <client id>   (the secret on stdin)")
+		}
+		fmt.Fprint(os.Stderr, "OAuth client secret: ")
+		secret, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		var st tailscaleStatus
+		if err := admin(dir, http.MethodPut, "/tailscale", tailscaleClient{ClientID: id, ClientSecret: strings.TrimSpace(secret)}, &st); err != nil {
+			return err
+		}
+		fmt.Println("Tailscale: devices that pair get a key to join the tailnet as " + st.Tag + ".")
+		return nil
+	case "clear":
+		return admin(dir, http.MethodDelete, "/tailscale", nil, nil)
+	default:
+		return fmt.Errorf("usage: lantern-bridge tailscale set <client id> | clear")
+	}
 }
 
 // printQR draws the code in the terminal, two rows of modules to a line, with a quiet zone.
@@ -175,22 +220,36 @@ func printQR(code *qr.Code) {
 
 func printStatus(dir string) error {
 	var s status
-	if err := admin(dir, http.MethodGet, "/status", &s); err != nil {
+	if err := admin(dir, http.MethodGet, "/status", nil, &s); err != nil {
 		return err
 	}
 	fmt.Printf("%s: lantern-bridge %s on port %d\ncertificate %s\n", s.Name, s.Version, s.Port, s.Fingerprint)
 	fmt.Printf("addresses: %s\n", strings.Join(s.Addresses, ", "))
-	for _, be := range s.Backends {
-		fmt.Printf("backend %s at %s\n", be.Name, be.URL)
+	sp := s.Splash
+	fmt.Printf("splash %s %s at %s (%s)", sp.Version, sp.State, sp.URL, sp.Model)
+	if sp.Message != "" {
+		fmt.Printf(": %s", sp.Message)
+	}
+	fmt.Println()
+	if d := sp.Drafter; d != nil {
+		fmt.Printf("drafter: %d of %d drafted tokens accepted (%.0f%%)", d.Accepted, d.Drafted, d.AcceptRate*100)
+		if d.TokensPerStep > 0 {
+			fmt.Printf(", %.2f tokens per step", d.TokensPerStep)
+		}
+		fmt.Printf(", %.0f tokens/s, %s\n", d.TokensPerSec, d.At.Local().Format(time.TimeOnly))
 	}
 	for _, m := range s.Models {
-		var can []string
-		for name, on := range map[string]bool{"vision": m.Lantern.Vision, "tools": m.Lantern.Tools, "thinking": m.Lantern.Thinking} {
-			if on {
-				can = append(can, name)
-			}
+		fmt.Printf("model %s vision=%v tools=%v thinking=%v efforts=%s\n", m.ID, m.Lantern.Vision, m.Lantern.Tools, m.Lantern.Thinking, strings.Join(m.Lantern.Efforts, ","))
+	}
+	ts := s.Tailscale
+	if ts.Configured {
+		fmt.Printf("tailscale: OAuth client %s, keys tagged %s", ts.ClientID, ts.Tag)
+		if ts.LastError != "" {
+			fmt.Printf(" (last: %s)", ts.LastError)
 		}
-		fmt.Printf("model %s (%s) %s\n", m.ID, m.OwnedBy, strings.Join(can, " "))
+		fmt.Println()
+	} else {
+		fmt.Println("tailscale: not set up (devices pair for the home network only)")
 	}
 	for _, d := range s.Devices {
 		seen := "never"

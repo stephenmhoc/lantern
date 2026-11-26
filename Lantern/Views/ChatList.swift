@@ -3,7 +3,7 @@ import LlamaKit
 import SwiftData
 import SwiftUI
 
-/// A group of chats in the sidebar: Pinned, then by when they were last used.
+/// A group of chats in the sidebar, by when they were last used.
 struct ChatSection: Identifiable {
     let title: String
     let chats: [Conversation]
@@ -14,55 +14,47 @@ struct ChatSection: Identifiable {
         let today = calendar.startOfDay(for: now)
         let yesterday = calendar.date(byAdding: .day, value: -1, to: today) ?? today
         let week = calendar.date(byAdding: .day, value: -7, to: today) ?? today
-        var pinned: [Conversation] = [], todays: [Conversation] = [], yesterdays: [Conversation] = []
+        var todays: [Conversation] = [], yesterdays: [Conversation] = []
         var weeks: [Conversation] = [], older: [Conversation] = []
         for c in chats {
-            if c.pinned { pinned.append(c) }
-            else if c.lastActive >= today { todays.append(c) }
+            if c.lastActive >= today { todays.append(c) }
             else if c.lastActive >= yesterday { yesterdays.append(c) }
             else if c.lastActive >= week { weeks.append(c) }
             else { older.append(c) }
         }
         return [
-            ChatSection(title: "Pinned", chats: pinned),
             ChatSection(title: "Today", chats: todays),
             ChatSection(title: "Yesterday", chats: yesterdays),
             ChatSection(title: "Previous 7 Days", chats: weeks),
             ChatSection(title: "Older", chats: older),
         ].filter { !$0.chats.isEmpty }
     }
-
-    /// The chats matching `query` anywhere the sidebar's search looks (`ChatSearch`): titles,
-    /// questions and answers with their other versions, attached files and thinking. For callers
-    /// that only need the chats (`ChatQuery`); the sidebar shows `ChatSearch.run`'s results.
-    static func filter(_ chats: [Conversation], query: String) -> [Conversation] {
-        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return chats }
-        return chats.filter { ChatSearch.matches($0, query: q) }
-    }
 }
 
-/// The mode a new chat starts in: the last one used if it works right now, else the quickest that
-/// does (the Mac if it answers, then Gemma 4 E2B, then E4B, then Qwen 3.5 4B, then Apple
-/// Intelligence: last, since its small context fills after a few turns; first only for someone who
-/// has downloaded nothing, where it means a new chat works at once).
-enum DefaultMode {
-    static let key = "chat.lastMode"
+/// What a new chat starts with: the model, thinking and web search last chosen in a chat.
+enum ChatDefaults {
+    nonisolated static let modeKey = "chat.lastMode", thinkingKey = "chat.lastThinking", searchKey = "chat.lastSearch"
+    /// Settings' old "Search the Web" switch (see `Conversation.repairModes`).
+    nonisolated static let oldSearchKey = "webSearch"
 
-    static func pick(last: String, engine: Engine) -> Mode {
-        if let last = Mode(rawValue: last), isAvailable(last, engine: engine) { return last }
-        return [Mode.mac, .fast, .smart, .qwen, .apple].first { isAvailable($0, engine: engine) } ?? .fast
+    /// The Mac only if it was used last and is still paired (always, on a Mac).
+    static var mode: Mode {
+        if Device.isMac { return .mac }
+        return UserDefaults.standard.string(forKey: modeKey) == Mode.mac.rawValue && MacLink.isConfigured ? .mac : .device
     }
+    nonisolated static var thinking: Thinking { UserDefaults.standard.bool(forKey: thinkingKey) ? .high : .off }
+    nonisolated static var webSearch: Bool { UserDefaults.standard.bool(forKey: searchKey) }
 
-    static func isAvailable(_ mode: Mode, engine: Engine) -> Bool {
-        if mode == .mac { return engine.mac.route.host != nil }
-        if mode == .apple { return engine.apple.status.isAvailable }
-        return engine.model(for: mode).map { engine.store.states[$0.id] == .ready } ?? false
+    static func remember(_ c: Conversation) {
+        let d = UserDefaults.standard
+        d.set(c.mode.current.rawValue, forKey: modeKey)
+        d.set(c.thinking != .off, forKey: thinkingKey)
+        d.set(c.webSearch, forKey: searchKey)
     }
 }
 
 /// One chat in the side panel: its title (a few words from Apple Intelligence, or the first
-/// question) on up to two lines, then the model and when.
+/// question) on up to two lines, then when it was last used.
 struct ChatRow: View {
     let conversation: Conversation
     let answering: Bool
@@ -73,15 +65,15 @@ struct ChatRow: View {
                 .font(.body)
                 .lineLimit(2)
                 .multilineTextAlignment(.leading)
-            HStack(spacing: 4) {
-                Text(conversation.modelTitle)
-                Text("·").accessibilityHidden(true)
+            Group {
                 if answering {
                     // Animates on its own: the row isn't redrawn while the reply streams.
-                    Text("Answering")
-                    Image(systemName: "ellipsis")
-                        .symbolEffect(.variableColor.iterative, options: .repeat(.continuous))
-                        .accessibilityHidden(true)
+                    HStack(spacing: 4) {
+                        Text("Answering")
+                        Image(systemName: "ellipsis")
+                            .symbolEffect(.variableColor.iterative, options: .repeat(.continuous))
+                            .accessibilityHidden(true)
+                    }
                 } else {
                     Text(Self.when(conversation.lastActive))
                 }
@@ -91,20 +83,6 @@ struct ChatRow: View {
             .lineLimit(1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityValue(conversation.pinned ? "Pinned" : "")
-    }
-
-    /// The last thing said, on one line. Messages are only written at a turn's start and end (and
-    /// every few seconds while streaming), so this doesn't redraw the row per token.
-    static func preview(_ messages: [StoredMessage]) -> String? {
-        guard let text = messages.last(where: { !$0.content.isEmpty })?.content else { return nil }
-        // Markdown marks and line breaks read as noise in one line.
-        let flat = text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "#>*-` \t")) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .replacingOccurrences(of: "**", with: "")
-        return flat.isEmpty ? nil : String(flat.prefix(160))
     }
 
     /// Like Mail: the time today, "Yesterday", the weekday this week, else the date.
@@ -114,15 +92,5 @@ struct ChatRow: View {
         let week = calendar.date(byAdding: .day, value: -6, to: calendar.startOfDay(for: now)) ?? now
         if date >= week { return date.formatted(.dateTime.weekday(.wide)) }
         return date.formatted(date: .numeric, time: .omitted)
-    }
-}
-
-extension PersistentIdentifier {
-    /// For `@SceneStorage`, which only stores plain values.
-    var stored: String? { (try? JSONEncoder().encode(self)).map { String(decoding: $0, as: UTF8.self) } }
-
-    init?(stored: String?) {
-        guard let stored, let id = try? JSONDecoder().decode(PersistentIdentifier.self, from: Data(stored.utf8)) else { return nil }
-        self = id
     }
 }

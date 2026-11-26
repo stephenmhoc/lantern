@@ -4,10 +4,11 @@ import Security
 
 /// Runs the web searches models ask for, with Tavily, straight from this device: any model can
 /// use it, wherever the device is, as long as it has the internet. The key is the user's own
-/// Tavily API key, kept in the Keychain (Settings > Search the Web).
+/// Tavily API key, kept in the Keychain (Settings). Whether a chat searches is the chat's own
+/// switch (`Conversation.webSearch`).
 nonisolated enum WebSearcher {
-    /// Whether searching can happen at all: switched on in Settings, with a key.
-    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: Engine.webSearchKey) && apiKey != nil }
+    /// Whether searching can happen at all: there's a key.
+    static var hasKey: Bool { apiKey != nil }
 
     /// Never throws: a failure comes back as the search's `error`, which the model is told, so it
     /// answers from what it knows.
@@ -94,27 +95,16 @@ nonisolated enum WebSearcher {
 
     /// The key saved in Settings, if any (not the Debug fallback).
     static var storedKey: String? {
-        var query = baseQuery
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data, let key = String(data: data, encoding: .utf8), !key.isEmpty else { return nil }
-        return key
+        Keychain.read(service: service, account: account).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     /// Saves the key, or removes it when it's empty. It stays on this device: not synced.
     static func setKey(_ key: String) {
-        SecItemDelete(baseQuery as CFDictionary)
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        var item = baseQuery
-        item[kSecValueData as String] = Data(trimmed.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        SecItemAdd(item as CFDictionary, nil)
-    }
-
-    private static var baseQuery: [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+        if trimmed.isEmpty {
+            Keychain.delete(service: service, account: account)
+        } else {
+            Keychain.write(trimmed, service: service, account: account)
+        }
     }
 }

@@ -1,9 +1,9 @@
 import Foundation
 import LlamaKit
 
-/// What Lantern says to the bridge on a computer (`Bridge/`, the Mac app's `lantern-bridge`): the
-/// OpenAI API (`/v1/models`, streamed `/v1/chat/completions`) whatever the model server behind it
-/// (Ollama, LM Studio…), plus the bridge's own `/lantern/v1/…` (pairing, warming a model, its info).
+/// What Lantern says to the bridge on the serving Mac (`Bridge/`, `lantern-bridge`; see its README):
+/// the OpenAI API (`/v1/models`, streamed `/v1/chat/completions`) passed to Splash, which serves
+/// Inkling, plus the bridge's own `/lantern/v1/…` (pairing, its info).
 nonisolated enum BridgeAPI {
     // MARK: Models
 
@@ -15,12 +15,12 @@ nonisolated enum BridgeAPI {
             let vision: Bool?
             let tools: Bool?
             let thinking: Bool?
-            let size: Int64?
+            let context_length: Int?
         }
         let id: String
         let lantern: Info?
 
-        /// As `/api/show` said them: "vision", "tools", "thinking".
+        /// "vision", "tools", "thinking", as the bridge lists them.
         var capabilities: Set<String> {
             var set: Set<String> = []
             if lantern?.vision == true { set.insert("vision") }
@@ -31,15 +31,29 @@ nonisolated enum BridgeAPI {
     }
 
     struct Info: Decodable, Sendable {
-        struct Backend: Decodable, Sendable { let id: String; let name: String }
+        struct Splash: Decodable, Sendable { let state: String?; let message: String?; let version: String? }
         let name: String
         let version: String
-        let backends: [Backend]
+        let splash: Splash?
     }
 
-    struct Paired: Decodable { let token: String; let name: String? }
+    /// Both ways of pairing answer with this (`proof` only for a typed code).
+    struct Paired: Decodable {
+        struct Tailnet: Decodable {
+            /// "ok", "not_configured" or "failed".
+            let status: String
+            let message: String?
+            let auth_key: String?
+            let address: String?
+        }
+        let token: String
+        let name: String?
+        let proof: String?
+        let addresses: [String]?
+        let tailnet: Tailnet?
+    }
 
-    /// An error as the OpenAI API (and the bridge) word them, or as Ollama's own API did.
+    /// An error as the OpenAI API (and the bridge) word them.
     struct ErrorBody: Decodable {
         struct Detail: Decodable { let message: String? }
         let detail: Detail?
@@ -60,7 +74,7 @@ nonisolated enum BridgeAPI {
         let messages: [Message]
         var stream = true
         var stream_options = ["include_usage": true]
-        /// "none" turns a thinking model's thinking off; left out for a model that doesn't think.
+        /// "high" or "none" (which the bridge makes Splash's "minimal"); left out for a model that doesn't think.
         var reasoning_effort: String?
         var tools: [Tool]?
         var max_tokens: Int?
@@ -139,9 +153,9 @@ nonisolated enum BridgeAPI {
                     let function: Function?
                 }
                 let content: String?
-                /// Ollama's name for thinking; LM Studio, llama.cpp and vLLM say `reasoning_content`.
-                let reasoning: String?
+                /// Splash's thinking (`reasoning` is the same under another server's name).
                 let reasoning_content: String?
+                let reasoning: String?
                 let tool_calls: [CallDelta]?
             }
             let delta: Delta?
