@@ -89,7 +89,7 @@ struct SettingsView: View {
 
     /// What the switch does, and what's still missing.
     private var searchFooter: String {
-        let what = "Gemma, Qwen and the models on your computer can look things up while they answer. This \(UIDevice.current.model) sends their searches to Tavily, with your own API key from tavily.com."
+        let what = "Every model, here and on your computer, can look things up while they answer. This \(UIDevice.current.model) sends their searches to Tavily, with your own API key from tavily.com."
         return webSearch && searchKey.isEmpty ? what + " Add a key to start searching." : what
     }
 }

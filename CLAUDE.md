@@ -186,7 +186,7 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   read the chat; `MacLink.Timings`). Keep `num_ctx` the same on every request: a different one
   makes Ollama reload the model. Inkling thinks even with `think: false` (Ollama just hides it,
   so nothing showed for seconds); `MacLink.alwaysThinks` models are always asked for thinking.
-- **Web search** (not Apple Intelligence yet). Settings' "Search the Web" (`Engine.webSearchKey`,
+- **Web search**, for every model. Settings' "Search the Web" (`Engine.webSearchKey`,
   off by default) plus the user's own Tavily API key (Keychain, `WebSearcher`; Ollama's own web
   search needs paid credits). This device runs every search (`WebSearcher.search`), at most
   `MacLink.searchRounds` / `LlamaModel.searchLimit` (3) per reply; a failed search never fails the
@@ -204,8 +204,13 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
     Qwen's cache and saved states work as for any turn. Three results of 700 characters (8K context).
     Check with `lantern-smoke <file> --search [--think]` (TAVILY_API_KEY) and `--render`, whose tool
     cases must match the GGUF's Jinja.
+  - Apple Intelligence: a Foundation Models `Tool` (`WebSearchTool`, same name and description) on
+    the chat's session, there only when the system message declares search, so switching rebuilds
+    the session. Each reply points the session's `SearchSink` at its own stream, which collects that
+    reply's searches. A rebuilt session gets them back as tool call and tool output entries. Three
+    results of 500 characters.
   - Debug builds take the key from `TAVILY_API_KEY` in the environment (`SIMCTL_CHILD_TAVILY_API_KEY=…
-    simctl launch … -searchtest [-model <name>]` for the computer); `-ui search` shows a reply that searched.
+    simctl launch … -searchtest [-model <name> | -apple]` for the computer or Apple Intelligence); `-ui search` shows a reply that searched.
 - **One on-device model loaded at a time.** `Engine.load` frees the old one first. It stays
   loaded while Lantern is in front and is unloaded on a memory warning or on leaving the app,
   after its state is saved; `Engine.prepare` (called when a chat opens) loads it again.

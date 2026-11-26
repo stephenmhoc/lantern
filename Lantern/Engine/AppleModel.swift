@@ -116,8 +116,14 @@ final class AppleLink {
     private struct Cached {
         var held: [ChatMessage]
         var session: AnyObject  // LanguageModelSession, which only exists on iOS 26+
+        /// Where its web search tool reports, if it has one.
+        var searches: SearchSink?
         var used: Date
     }
+
+    /// Results a search here keeps: the context is about 4,000 tokens, half of Gemma's.
+    nonisolated static let searchResults = 3
+    nonisolated static let searchExcerpt = 500
 
     private var sessions: [String: Cached] = [:]
     /// A few open chats (windows) keep theirs; sessions are small, the model is the system's.
@@ -190,6 +196,10 @@ final class AppleLink {
             }
             if n > 0 { onTrim(attempt.start) }
             let session = session(for: Array(attempt.history.dropLast()), key: key, rebuildFrom: attempt.history)
+            // The session's tool reports to this reply: what it searched goes on the answer.
+            let sink = sessions[key]?.searches
+            sink?.start(continuation)
+            defer { sink?.stop() }
             var text = ""
             var stats = GenerationStats()
             let started = Date()
@@ -232,7 +242,7 @@ final class AppleLink {
             let streamed = firstAt.map { end.timeIntervalSince($0) } ?? 0
             stats.generateSeconds = streamed >= 0.25 ? streamed : end.timeIntervalSince(started)
             if stats.stopReason == .end {
-                sessions[key]?.held = attempt.history + [ChatMessage(role: .assistant, content: text)]
+                sessions[key]?.held = attempt.history + [ChatMessage(role: .assistant, content: text, searches: sink?.searches ?? [])]
             }
             continuation.yield(.done(stats))
             return
@@ -272,26 +282,42 @@ final class AppleLink {
             sessions[key]?.used = .now
             return session
         }
-        let session = LanguageModelSession(model: .default, transcript: Self.transcript(held))
-        sessions[key] = Cached(held: held, session: session, used: .now)
+        // Search is declared with the system prompt, as for Gemma and Qwen, so a change rebuilds it.
+        let sink = held.first?.declaresWebSearch == true ? SearchSink() : nil
+        let tools: [any Tool] = sink.map { [WebSearchTool(sink: $0)] } ?? []
+        let session = LanguageModelSession(model: .default, tools: tools, transcript: Self.transcript(held))
+        sessions[key] = Cached(held: held, session: session, searches: sink, used: .now)
         if sessions.count > Self.kept, let oldest = sessions.min(by: { $0.value.used < $1.value.used })?.key {
             sessions[oldest] = nil
         }
         return session
     }
 
-    /// The system prompt as instructions, then the turns as prompts and responses.
+    /// The system prompt as instructions (with the search tool when it's declared), then the turns
+    /// as prompts and responses, each answer's searches before it as the calls and what they found.
     @available(iOS 26, *)
     private static func transcript(_ messages: [ChatMessage]) -> Transcript {
         var entries: [Transcript.Entry] = []
+        var calls = 0
         for m in messages {
             let text = Transcript.Segment.text(Transcript.TextSegment(content: m.content))
             switch m.role {
             case .system:
-                entries.append(.instructions(Transcript.Instructions(segments: [text], toolDefinitions: [])))
+                let tools = m.declaresWebSearch ? [Transcript.ToolDefinition(tool: WebSearchTool(sink: SearchSink()))] : []
+                entries.append(.instructions(Transcript.Instructions(segments: [text], toolDefinitions: tools)))
             case .user:
                 entries.append(.prompt(Transcript.Prompt(segments: imageSegments(m) + [text])))
             case .assistant:
+                for search in m.searches ?? [] {
+                    calls += 1
+                    let id = "search-\(calls)"
+                    let call = Transcript.ToolCall(
+                        id: id, toolName: WebSearch.toolName, arguments: GeneratedContent(properties: ["query": search.query]))
+                    entries.append(.toolCalls(Transcript.ToolCalls([call])))
+                    entries.append(.toolOutput(Transcript.ToolOutput(
+                        id: id, toolName: WebSearch.toolName,
+                        segments: [.text(Transcript.TextSegment(content: search.modelText))])))
+                }
                 entries.append(.response(Transcript.Response(assetIDs: [], segments: [text])))
             }
         }
@@ -359,3 +385,55 @@ final class AppleLink {
     }
     #endif
 }
+
+/// Hands a session's search events to the reply being written. A session (and its tool) can write
+/// many replies, so each one points the sink at its own stream and collects its own searches.
+nonisolated final class SearchSink: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: AsyncThrowingStream<Generation, Error>.Continuation?
+    private var collected: [WebSearch] = []
+
+    var searches: [WebSearch] { lock.withLock { collected } }
+
+    func start(_ continuation: AsyncThrowingStream<Generation, Error>.Continuation) {
+        lock.withLock { self.continuation = continuation; collected = [] }
+    }
+
+    func stop() { lock.withLock { continuation = nil } }
+
+    /// Runs a search for the reply, unless it has already run as many as one may.
+    func search(_ query: String) async -> WebSearch {
+        let (sink, count) = lock.withLock { (continuation, collected.count) }
+        let result: WebSearch
+        if count >= LlamaModel.searchLimit {
+            result = WebSearch(query: query, error: "That's as many searches as one answer can run.")
+        } else {
+            sink?.yield(.searching(query))
+            result = await WebSearcher.search(query, results: AppleLink.searchResults, excerpt: AppleLink.searchExcerpt)
+        }
+        lock.withLock { collected.append(result) }
+        sink?.yield(.searched(result))
+        return result
+    }
+}
+
+#if canImport(FoundationModels)
+/// The web search tool, as Gemma and Qwen are given it: the same name, description and query, and
+/// the model reads the same text back (`WebSearch.modelText`).
+@available(iOS 26, *)
+nonisolated struct WebSearchTool: Tool {
+    let sink: SearchSink
+    let name = WebSearch.toolName
+    let description = WebSearch.toolDescription
+
+    @Generable
+    nonisolated struct Arguments {
+        @Guide(description: "What to search for, as you'd type it into a search engine.")
+        var query: String
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        await sink.search(arguments.query).modelText
+    }
+}
+#endif

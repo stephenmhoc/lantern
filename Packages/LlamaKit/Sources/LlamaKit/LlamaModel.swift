@@ -608,7 +608,7 @@ public final class LlamaModel: @unchecked Sendable {
     }
 
     /// Searches one reply may run; a call past it is told so, and the model answers.
-    static let searchLimit = 3
+    public static let searchLimit = 3
 
     /// Runs `work` from `queue` (which waits on it), giving up when the reply is stopped.
     private static func wait<T: Sendable>(isStopped: () -> Bool, _ work: @escaping @Sendable () async -> T) -> T? {

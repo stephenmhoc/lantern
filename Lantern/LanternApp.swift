@@ -83,6 +83,7 @@ private struct EngineTest: ViewModifier {
     func body(content: Content) -> some View {
         content.task {
             guard ProcessInfo.processInfo.arguments.contains("-enginetest") else { return }
+            setvbuf(stdout, nil, _IOLBF, 0)  // each line as it's printed, even into a pipe
             // Chats from an older build must still open: their stored messages predate newer fields.
             for old in (try? context.fetch(FetchDescriptor<Conversation>())) ?? [] {
                 print("ENGINETEST existing chat: \(old.messages.count) messages, \(old.history(before: old.messages.count).count) in history")
@@ -280,7 +281,8 @@ enum SearchTest {
         let was = defaults.bool(forKey: Engine.webSearchKey)
         defaults.set(true, forKey: Engine.webSearchKey)
         defer { defaults.set(was, forKey: Engine.webSearchKey) }
-        let chat = Conversation(mode: .mac)
+        // `-apple` asks Apple Intelligence; otherwise the computer (`-model <name>` for one of its models).
+        let chat = Conversation(mode: arguments.contains("-apple") ? .apple : .mac)
         if let i = arguments.firstIndex(of: "-model"), arguments.indices.contains(i + 1) { chat.macModel = arguments[i + 1] }
         container.mainContext.insert(chat)
         func idle() async {
@@ -295,7 +297,7 @@ enum SearchTest {
             print("SEARCHTEST \(label) answer: \(m.content.prefix(300).debugDescription)")
             print("SEARCHTEST \(label) footnote: \(m.footnote ?? "") | error: \(m.error ?? "none")")
         }
-        print("SEARCHTEST model: \(chat.resolvedMacModel), key: \(WebSearcher.apiKey == nil ? "missing" : "present")")
+        print("SEARCHTEST model: \(chat.mode == .apple ? "Apple Intelligence" : chat.resolvedMacModel), key: \(WebSearcher.apiKey == nil ? "missing" : "present")")
         engine.send("What are the top news headlines today?", in: chat)
         await idle()
         report("first")
@@ -304,6 +306,13 @@ enum SearchTest {
         report("follow-up")
         let sent = chat.history(before: chat.messages.count - 1)
         print("SEARCHTEST history carries \(sent.compactMap(\.searches).flatMap { $0 }.count) searches")
+        if chat.mode == .apple {
+            // A session built again from the stored chat, searches included, as when it's reopened.
+            engine.apple.forget(chat.stateID)
+            engine.send("Where did you read that? Name the site.", in: chat)
+            await idle()
+            report("rebuilt")
+        }
         engine.send("What is 2 + 2?", in: chat)
         await idle()
         report("no search needed")
