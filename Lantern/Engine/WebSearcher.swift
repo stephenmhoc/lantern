@@ -11,24 +11,30 @@ nonisolated enum WebSearcher {
 
     /// Never throws: a failure comes back as the search's `error`, which the model is told, so it
     /// answers from what it knows.
+    /// `topic` is what the model asked for: "news" searches Tavily's news index, which favours
+    /// recent pages and dates them; anything else the whole web. It's kept on the result as given.
     static func search(
-        _ query: String, results limit: Int = WebSearch.resultLimit, excerpt: Int = WebSearch.excerptLimit
+        _ query: String, topic: String? = nil, results limit: Int = WebSearch.resultLimit, excerpt: Int = WebSearch.excerptLimit
     ) async -> WebSearch {
-        guard let key = apiKey else { return WebSearch(query: query, error: "There's no Tavily API key in Settings.") }
+        let asked = WebSearch(query: query, topic: topic)
+        func failed(_ reason: String) -> WebSearch { WebSearch(query: query, topic: topic, error: reason) }
+        guard let key = apiKey else { return failed("There's no Tavily API key in Settings.") }
         var request = URLRequest(url: URL(string: "https://api.tavily.com/search")!, timeoutInterval: 20)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try? JSONEncoder().encode(Request(query: query, max_results: limit))
+        request.httpBody = try? JSONEncoder().encode(Request(query: query, max_results: limit, topic: asked.wantsNews ? "news" : "general"))
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard code == 200 else { return WebSearch(query: query, error: failure(code: code, body: data)) }
+            guard code == 200 else { return failed(failure(code: code, body: data)) }
             let found = try JSONDecoder().decode(Response.self, from: data)
             let results = (found.results ?? []).prefix(limit).map {
-                WebSearch.Result(title: $0.title ?? $0.url, url: $0.url, content: WebSearch.excerpt($0.content ?? "", limit: excerpt))
+                WebSearch.Result(
+                    title: $0.title ?? $0.url, url: $0.url, content: WebSearch.excerpt($0.content ?? "", limit: excerpt),
+                    published: WebSearch.day(fromHTTPDate: $0.published_date))
             }
-            return WebSearch(query: query, results: Array(results))
+            return WebSearch(query: query, topic: topic, results: Array(results))
         } catch let error as URLError {
             let reason = switch error.code {
             case .notConnectedToInternet, .networkConnectionLost, .dataNotAllowed: "This device has no internet connection."
@@ -36,9 +42,9 @@ nonisolated enum WebSearcher {
             case .cancelled: "The search was stopped."
             default: "The search service couldn't be reached."
             }
-            return WebSearch(query: query, error: reason)
+            return failed(reason)
         } catch {
-            return WebSearch(query: query, error: "The search came back in a form Lantern can't read.")
+            return failed("The search came back in a form Lantern can't read.")
         }
     }
 
@@ -57,11 +63,12 @@ nonisolated enum WebSearcher {
     private struct Request: Encodable {
         let query: String
         let max_results: Int
+        let topic: String
         var search_depth = "basic"
     }
 
     private struct Response: Decodable {
-        struct Item: Decodable { let title: String?; let url: String; let content: String? }
+        struct Item: Decodable { let title: String?; let url: String; let content: String?; let published_date: String? }
         let results: [Item]?
     }
 

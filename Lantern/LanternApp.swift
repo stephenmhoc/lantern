@@ -291,14 +291,16 @@ enum SearchTest {
         func report(_ label: String) {
             guard let m = chat.messages.last else { return }
             for s in m.searches ?? [] {
-                print("SEARCHTEST \(label) searched “\(s.query)”: \(s.results.count) results, error: \(s.error ?? "none")")
-                for r in s.results { print("SEARCHTEST   \(r.title) | \(r.url) | \(r.content.count) chars") }
+                print("SEARCHTEST \(label) searched “\(s.query)” (topic \(s.topic ?? "none")): \(s.results.count) results, error: \(s.error ?? "none")")
+                for r in s.results { print("SEARCHTEST   \(r.published ?? "undated") | \(r.title) | \(r.url)") }
             }
             print("SEARCHTEST \(label) answer: \(m.content.prefix(300).debugDescription)")
             print("SEARCHTEST \(label) footnote: \(m.footnote ?? "") | error: \(m.error ?? "none")")
         }
         print("SEARCHTEST model: \(chat.mode == .apple ? "Apple Intelligence" : chat.resolvedMacModel), key: \(WebSearcher.apiKey == nil ? "missing" : "present")")
-        engine.send("What are the top news headlines today?", in: chat)
+        // `-question <text>` in place of the headlines.
+        let question = arguments.firstIndex(of: "-question").flatMap { arguments.indices.contains($0 + 1) ? arguments[$0 + 1] : nil }
+        engine.send(question ?? "What are the top news headlines today?", in: chat)
         await idle()
         report("first")
         engine.send("Which of those is the most important? One sentence.", in: chat)

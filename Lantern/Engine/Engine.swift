@@ -298,8 +298,8 @@ final class Engine {
                     }
                     try Task.checkCancellation()
                     // A search on device keeps three short results: the context is 8K, not the computer's 16K.
-                    let search: (@Sendable (String) async -> WebSearch)? = system.declaresWebSearch
-                        ? { @Sendable query in await WebSearcher.search(query, results: 3, excerpt: 700) } : nil
+                    let search: (@Sendable (WebSearch) async -> WebSearch)? = system.declaresWebSearch
+                        ? { @Sendable asked in await WebSearcher.search(asked.query, topic: asked.topic, results: 3, excerpt: 700) } : nil
                     stream = llama.generate(
                         history, sampling: model.sampling(thinking: thinking), thinking: thinking, checkpoint: checkpoint,
                         search: search)

@@ -193,7 +193,13 @@ polite quit, so the script kills and reopens it) and preloads Inkling, the one m
   reply: the model is told why and answers anyway. Each search (`WebSearch`, in LlamaKit: query,
   trimmed results, or the error) is kept on the reply (`StoredMessage.searches`,
   `ChatMessage.searches`) and sent back with the history as the call and `WebSearch.modelText`,
-  rendered from those fields only. The cell shows "Searched for “…”" with the sources in its menu.
+  rendered from those fields only. The tool has an optional `topic` (`general` or `news`): the
+  model picks `news` for anything recent, which searches Tavily's news index. Its default index
+  answered "today's sports news" with archived pages years old. A forced time range doesn't
+  help either: it ruins ordinary questions. `WebSearch.topic` is kept exactly as the model wrote it,
+  so the call renders back byte for byte. Results carry `published` ("Nov 25, 2026"), shown to the
+  model and in the sources menu; older stored searches have neither and render as before.
+  The cell shows "Searched for “…”" with the sources in its menu.
   - Computer: Ollama models with the `tools` capability are offered `web_search` per request
     (`MacLink.stream(search:)`); a call goes back as a `tool` turn. Five results of 1,500 characters.
   - Gemma and Qwen: the tool is declared in the system turn (`ChatMessage.tools` on the system

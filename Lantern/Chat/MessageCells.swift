@@ -639,7 +639,7 @@ final class AssistantCell: UICollectionViewCell, UITextViewDelegate {
                 search.results.compactMap { result in
                     guard let url = URL(string: result.url) else { return nil }
                     let site = url.host()?.replacingOccurrences(of: "www.", with: "") ?? result.url
-                    return UIAction(title: result.title, subtitle: site, image: UIImage(systemName: "safari")) { _ in
+                    return UIAction(title: result.title, subtitle: result.published.map { "\(site) · \($0)" } ?? site, image: UIImage(systemName: "safari")) { _ in
                         UIApplication.shared.open(url)
                     }
                 }

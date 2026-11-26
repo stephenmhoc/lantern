@@ -93,7 +93,7 @@ struct ChatTemplate {
     private func gemmaTurn(_ m: ChatMessage) -> String {
         if m.role == .system { return gemmaSystem(m, thinking: .off) }
         // A reply that searched: each call and its result, then the answer, all in one model turn.
-        let searches = m.role == .assistant ? (m.searches ?? []).map { gemmaCall($0.query) + gemmaResponse($0) }.joined() : ""
+        let searches = m.role == .assistant ? (m.searches ?? []).map { gemmaCall($0) + gemmaResponse($0) }.joined() : ""
         return "<|turn>\(m.role == .assistant ? "model" : m.role.rawValue)\n\(searches)\(trim(content(m)))<turn|>\n"
     }
 
@@ -123,12 +123,16 @@ struct ChatTemplate {
     private var gemmaWebSearchDeclaration: String {
         let q = Self.q
         return "<|tool>declaration:\(WebSearch.toolName){description:\(q)\(WebSearch.toolDescription)\(q)"
-            + ",parameters:{properties:{query:{description:\(q)\(WebSearch.queryDescription)\(q),type:\(q)STRING\(q)}}"
+            + ",parameters:{properties:{query:{description:\(q)\(WebSearch.queryDescription)\(q),type:\(q)STRING\(q)}"
+            + ",topic:{description:\(q)\(WebSearch.topicDescription)\(q),enum:["
+            + WebSearch.topics.map { "\(q)\($0)\(q)" }.joined(separator: ",") + "],type:\(q)STRING\(q)}}"
             + ",required:[\(q)query\(q)],type:\(q)OBJECT\(q)}}<tool|>"
     }
 
-    private func gemmaCall(_ query: String) -> String {
-        "<|tool_call>call:\(WebSearch.toolName){query:\(Self.q)\(query)\(Self.q)}<tool_call|>"
+    /// Arguments in the order the declaration lists them, as the template writes a call.
+    private func gemmaCall(_ search: WebSearch) -> String {
+        let topic = search.topic.map { ",topic:\(Self.q)\($0)\(Self.q)" } ?? ""
+        return "<|tool_call>call:\(WebSearch.toolName){query:\(Self.q)\(search.query)\(Self.q)\(topic)}<tool_call|>"
     }
 
     private func gemmaResponse(_ search: WebSearch) -> String {
@@ -155,7 +159,7 @@ struct ChatTemplate {
             return "<|im_start|>system\n" + qwenWebSearchDeclaration + (prompt.isEmpty ? "" : "\n\n" + prompt) + "<|im_end|>\n"
         }
         let searches = m.role == .assistant ? (m.searches ?? []).map {
-            "<|im_start|>assistant\n" + qwenCall($0.query) + "<|im_end|>\n" + qwenResponseTurn($0)
+            "<|im_start|>assistant\n" + qwenCall($0) + "<|im_end|>\n" + qwenResponseTurn($0)
         }.joined() : ""
         return searches + "<|im_start|>\(m.role.rawValue)\n\(trim(m.content))<|im_end|>\n"
     }
@@ -166,14 +170,18 @@ struct ChatTemplate {
             String(decoding: try! JSONEncoder().encode(s), as: UTF8.self).replacingOccurrences(of: "\\/", with: "/")
         }
         let tool = "{\"type\": \"function\", \"function\": {\"name\": \(json(WebSearch.toolName)), \"description\": \(json(WebSearch.toolDescription)), "
-            + "\"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \(json(WebSearch.queryDescription))}}, "
+            + "\"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\", \"description\": \(json(WebSearch.queryDescription))}, "
+            + "\"topic\": {\"type\": \"string\", \"enum\": [" + WebSearch.topics.map(json).joined(separator: ", ")
+            + "], \"description\": \(json(WebSearch.topicDescription))}}, "
             + "\"required\": [\"query\"]}}}"
         return "# Tools\n\nYou have access to the following functions:\n\n<tools>\n" + tool + "\n</tools>"
             + "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>"
     }
 
-    private func qwenCall(_ query: String) -> String {
-        "<tool_call>\n<function=\(WebSearch.toolName)>\n<parameter=query>\n\(query)\n</parameter>\n</function>\n</tool_call>"
+    private func qwenCall(_ search: WebSearch) -> String {
+        let topic = search.topic.map { "<parameter=topic>\n\($0)\n</parameter>\n" } ?? ""
+        return "<tool_call>\n<function=\(WebSearch.toolName)>\n<parameter=query>\n\(search.query)\n</parameter>\n"
+            + topic + "</function>\n</tool_call>"
     }
 
     /// A search's result, as the user turn the template wraps tool results in.
@@ -213,6 +221,19 @@ struct ChatTemplate {
             query = text.firstMatch(of: /<parameter=query>(?<q>[\s\S]*?)<\/parameter>/)?.output.q
         }
         let trimmed = query.map { trim(String($0)) } ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// The topic a `web_search` call asked for, as written ("news", "general"), or nil if none.
+    func searchTopic(inCall text: String) -> String? {
+        let topic: Substring? = switch format {
+        case .gemma4:
+            text.firstMatch(of: /topic:<\|"\|>(?<t>[\s\S]*?)<\|"\|>/)?.output.t
+                ?? text.firstMatch(of: /topic:"(?<t>[^"]*)"/)?.output.t
+        case .qwen35:
+            text.firstMatch(of: /<parameter=topic>(?<t>[\s\S]*?)<\/parameter>/)?.output.t
+        }
+        let trimmed = topic.map { trim(String($0)) } ?? ""
         return trimmed.isEmpty ? nil : trimmed
     }
 

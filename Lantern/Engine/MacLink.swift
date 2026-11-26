@@ -323,7 +323,7 @@ final class MacLink {
                     var rounds = 0
                     var total = GenerationStats()
                     while true {
-                        var calls: [String] = []
+                        var calls: [WebSearch] = []  // what each call asked for
                         var said = ""
                         var finished: ChatChunk?
                         for try await line in bytes.lines {
@@ -336,7 +336,8 @@ final class MacLink {
                             }
                             for call in chunk.message?.tool_calls ?? [] where call.function.name == WebSearch.toolName {
                                 if let q = call.function.arguments?.query?.trimmingCharacters(in: .whitespacesAndNewlines), !q.isEmpty {
-                                    calls.append(q)
+                                    let topic = call.function.arguments?.topic?.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    calls.append(WebSearch(query: q, topic: topic?.isEmpty == false ? topic : nil))
                                 }
                             }
                             if chunk.done == true { finished = chunk }
@@ -365,10 +366,10 @@ final class MacLink {
                         // The model's turn as it was (anything it said, then its calls), then each
                         // result, as `turns(_:)` renders a stored reply.
                         var searches: [WebSearch] = []
-                        for query in calls {
+                        for asked in calls {
                             try Task.checkCancellation()
-                            continuation.yield(.searching(query))
-                            let result = await WebSearcher.search(query)
+                            continuation.yield(.searching(asked.query))
+                            let result = await WebSearcher.search(asked.query, topic: asked.topic)
                             searches.append(result)
                             continuation.yield(.searched(result))
                         }
@@ -406,9 +407,16 @@ final class MacLink {
         return searchTurns(searches, said: "") + [.init(role: "assistant", content: m.content)]
     }
 
+    /// A call's arguments as the model gave them: the topic only if it named one.
+    nonisolated private static func arguments(of search: WebSearch) -> [String: String] {
+        var arguments = ["query": search.query]
+        arguments["topic"] = search.topic
+        return arguments
+    }
+
     nonisolated fileprivate static func searchTurns(_ searches: [WebSearch], said: String) -> [ChatRequest.Message] {
         guard !searches.isEmpty else { return [] }
-        let calls = searches.map { ChatRequest.Call(function: .init(name: WebSearch.toolName, arguments: ["query": $0.query])) }
+        let calls = searches.map { ChatRequest.Call(function: .init(name: WebSearch.toolName, arguments: arguments(of: $0))) }
         return [.init(role: "assistant", content: said, tool_calls: calls)]
             + searches.map { .init(role: "tool", content: $0.modelText, tool_name: WebSearch.toolName) }
     }
@@ -532,7 +540,7 @@ final class MacLink {
         struct Tool: Encodable {
             struct Function: Encodable {
                 struct Parameters: Encodable {
-                    struct Property: Encodable { let type: String; let description: String }
+                    struct Property: Encodable { let type: String; var `enum`: [String]? = nil; let description: String }
                     let type = "object"
                     let properties: [String: Property]
                     let required: [String]
@@ -546,8 +554,12 @@ final class MacLink {
 
             static let webSearch = Tool(function: .init(
                 name: WebSearch.toolName, description: WebSearch.toolDescription,
-                parameters: .init(properties: ["query": .init(type: "string", description: WebSearch.queryDescription)],
-                                  required: ["query"])))
+                parameters: .init(
+                    properties: [
+                        "query": .init(type: "string", description: WebSearch.queryDescription),
+                        "topic": .init(type: "string", enum: WebSearch.topics, description: WebSearch.topicDescription),
+                    ],
+                    required: ["query"])))
         }
         let model: String
         let messages: [Message]
@@ -564,7 +576,7 @@ final class MacLink {
         struct Message: Decodable {
             struct Call: Decodable {
                 struct Function: Decodable {
-                    struct Arguments: Decodable { let query: String? }
+                    struct Arguments: Decodable { let query: String?; let topic: String? }
                     let name: String
                     let arguments: Arguments?
                 }

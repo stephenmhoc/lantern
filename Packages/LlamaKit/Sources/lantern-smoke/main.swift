@@ -51,6 +51,8 @@ if args.contains("--render") {
          .init(role: .assistant, content: " The next one is at 5:30. ", searches: [
             WebSearch(query: "Bainbridge ferry", results: [.init(title: "Schedule", url: "https://wsdot.com/a", content: "5:30 PM\n6:20 PM")]),
             WebSearch(query: "ferry delays", error: "The search took too long."),
+            WebSearch(query: "ferry news today", topic: "news", results: [
+                .init(title: "Ferry back", url: "https://news.example/f", content: "Service resumed.", published: "Nov 22, 2026")]),
          ]),
          .init(role: .user, content: "And after that?")],
     ]
@@ -60,13 +62,14 @@ if args.contains("--render") {
             // As the Jinja takes them: a reply's searches as its call turns and tool results, ahead of it.
             let jinja: [[String: Any]] = messages.flatMap { m -> [[String: Any]] in
                 (m.searches ?? []).flatMap { search -> [[String: Any]] in [
-                    ["role": "assistant", "content": "", "tool_calls": [["function": ["name": WebSearch.toolName, "arguments": ["query": search.query]]]]],
+                    ["role": "assistant", "content": "", "tool_calls": [["function": ["name": WebSearch.toolName, "arguments": search.topic.map { ["query": search.query, "topic": $0] } ?? ["query": search.query]]]]],
                     ["role": "tool", "content": search.modelText],
                 ] } + [["role": m.role.rawValue, "content": m.content]]
             }
             let json: [String: Any] = [
                 "messages": jinja, "tools": messages.first?.declaresWebSearch == true,
                 "toolDescription": WebSearch.toolDescription, "queryDescription": WebSearch.queryDescription,
+                "topicDescription": WebSearch.topicDescription, "topics": WebSearch.topics,
                 "thinking": thinking != .off, "prompt": r.prompt, "systemPrefix": r.systemPrefix ?? NSNull(),
             ]
             print(String(decoding: try JSONSerialization.data(withJSONObject: json), as: UTF8.self))
@@ -95,7 +98,7 @@ struct Reply {
 /// Returns the answer; stops reading after `stopAfter` pieces if given.
 @MainActor func ask(
     _ model: LlamaModel, _ history: [ChatMessage], stopAfter: Int? = nil, checkpoint: URL? = nil, quiet: Bool = false,
-    maxTokens: Int? = nil, search: (@Sendable (String) async -> WebSearch)? = nil
+    maxTokens: Int? = nil, search: (@Sendable (WebSearch) async -> WebSearch)? = nil
 ) async throws -> Reply {
     var reply = Reply()
     var pieces = 0
@@ -108,6 +111,7 @@ struct Reply {
         case .searching(let q): print("\n[searching “\(q)”]", terminator: "")
         case .searched(let s):
             reply.searches.append(s)
+            print("\n[\(s.results.count) results, topic \(s.topic ?? "none"), dated \(s.results.compactMap(\.published))]", terminator: "")
             print("[\(s.results.count) results\(s.error.map { ", error: \($0)" } ?? "")]")
         case .reading(let p): if !quiet { print(String(format: "[reading %.0f%%]", p * 100), terminator: "") }
         case .thinking(let t):
@@ -203,7 +207,8 @@ if args.contains("--bench") {
 }
 if args.contains("--search") {
     // The app's on-device search: Tavily, three results of up to 700 characters each.
-    @Sendable func tavily(_ query: String) async -> WebSearch {
+    @Sendable func tavily(_ asked: WebSearch) async -> WebSearch {
+        let query = asked.query
         guard let key = ProcessInfo.processInfo.environment["TAVILY_API_KEY"] else {
             return WebSearch(query: query, error: "No TAVILY_API_KEY.")
         }
@@ -211,12 +216,13 @@ if args.contains("--search") {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["query": query, "max_results": 3])
-        struct Found: Decodable { struct Item: Decodable { let title: String?; let url: String; let content: String? }; let results: [Item]? }
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["query": query, "max_results": 3, "topic": asked.wantsNews ? "news" : "general"])
+        struct Found: Decodable { struct Item: Decodable { let title: String?; let url: String; let content: String?; let published_date: String? }; let results: [Item]? }
         guard let (data, _) = try? await URLSession.shared.data(for: request),
               let found = try? JSONDecoder().decode(Found.self, from: data) else { return WebSearch(query: query, error: "The search failed.") }
         return WebSearch(query: query, results: (found.results ?? []).map {
-            .init(title: $0.title ?? $0.url, url: $0.url, content: WebSearch.excerpt($0.content ?? "", limit: 700))
+            .init(title: $0.title ?? $0.url, url: $0.url, content: WebSearch.excerpt($0.content ?? "", limit: 700),
+                  published: WebSearch.day(fromHTTPDate: $0.published_date))
         })
     }
     let question = firstPrompt.hasPrefix("In two sentences: how do I purify") ? "What's the weather forecast for Seattle tomorrow?" : firstPrompt

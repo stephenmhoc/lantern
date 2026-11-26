@@ -312,7 +312,8 @@ final class AppleLink {
                     calls += 1
                     let id = "search-\(calls)"
                     let call = Transcript.ToolCall(
-                        id: id, toolName: WebSearch.toolName, arguments: GeneratedContent(properties: ["query": search.query]))
+                        id: id, toolName: WebSearch.toolName, arguments: search.topic.map { GeneratedContent(properties: ["query": search.query, "topic": $0]) }
+                            ?? GeneratedContent(properties: ["query": search.query]))
                     entries.append(.toolCalls(Transcript.ToolCalls([call])))
                     entries.append(.toolOutput(Transcript.ToolOutput(
                         id: id, toolName: WebSearch.toolName,
@@ -402,14 +403,14 @@ nonisolated final class SearchSink: @unchecked Sendable {
     func stop() { lock.withLock { continuation = nil } }
 
     /// Runs a search for the reply, unless it has already run as many as one may.
-    func search(_ query: String) async -> WebSearch {
+    func search(_ query: String, topic: String?) async -> WebSearch {
         let (sink, count) = lock.withLock { (continuation, collected.count) }
         let result: WebSearch
         if count >= LlamaModel.searchLimit {
-            result = WebSearch(query: query, error: "That's as many searches as one answer can run.")
+            result = WebSearch(query: query, topic: topic, error: "That's as many searches as one answer can run.")
         } else {
             sink?.yield(.searching(query))
-            result = await WebSearcher.search(query, results: AppleLink.searchResults, excerpt: AppleLink.searchExcerpt)
+            result = await WebSearcher.search(query, topic: topic, results: AppleLink.searchResults, excerpt: AppleLink.searchExcerpt)
         }
         lock.withLock { collected.append(result) }
         sink?.yield(.searched(result))
@@ -430,10 +431,12 @@ nonisolated struct WebSearchTool: Tool {
     nonisolated struct Arguments {
         @Guide(description: "What to search for, as you'd type it into a search engine.")
         var query: String
+        @Guide(description: "news for current events, sports, scores, weather, markets and anything else from the last few days, so the results are recent and dated; general (the default) for everything else.", .anyOf(["general", "news"]))
+        var topic: String?
     }
 
     func call(arguments: Arguments) async throws -> String {
-        await sink.search(arguments.query).modelText
+        await sink.search(arguments.query, topic: arguments.topic).modelText
     }
 }
 #endif

@@ -332,7 +332,7 @@ public final class LlamaModel: @unchecked Sendable {
     /// the end of the cache, and the reply carries on: nothing is ever rewound for it.
     public func generate(
         _ messages: [ChatMessage], sampling: Sampling, thinking: Thinking = .off, maxTokens: Int = 2048,
-        checkpoint: URL? = nil, search: (@Sendable (String) async -> WebSearch)? = nil
+        checkpoint: URL? = nil, search: (@Sendable (WebSearch) async -> WebSearch)? = nil
     ) -> AsyncThrowingStream<Generation, Error> {
         let stopped = OSAllocatedUnfairLock(initialState: false)
         return AsyncThrowingStream { continuation in
@@ -394,7 +394,7 @@ public final class LlamaModel: @unchecked Sendable {
 
     private func run(
         _ input: [ChatMessage], sampling: Sampling, thinking: Thinking, maxTokens: Int, checkpoint: URL?,
-        search: (@Sendable (String) async -> WebSearch)?, isStopped: () -> Bool, emit: (Generation) -> Void
+        search: (@Sendable (WebSearch) async -> WebSearch)?, isStopped: () -> Bool, emit: (Generation) -> Void
     ) throws -> GenerationStats {
         var stats = GenerationStats()
         let batch = llama_batch_ext_init(ctx)!
@@ -532,21 +532,25 @@ public final class LlamaModel: @unchecked Sendable {
             closedCall = nil
             var result: WebSearch
             if let query = template.searchQuery(inCall: text) {
+                // The search asked for (query and topic, no results yet). Every outcome keeps its
+                // topic, so the call renders back as the model wrote it.
+                let request = WebSearch(query: query, topic: template.searchTopic(inCall: text))
+                func failed(_ reason: String) -> WebSearch { WebSearch(query: query, topic: request.topic, error: reason) }
                 if searches.count >= Self.searchLimit {
-                    result = WebSearch(query: query, error: "That's as many searches as one answer can run.")
+                    result = failed("That's as many searches as one answer can run.")
                 } else if let search {
                     emit(.searching(query))
-                    result = Self.wait(isStopped: isStopped) { await search(query) }
-                        ?? WebSearch(query: query, error: "The search was stopped.")
+                    result = Self.wait(isStopped: isStopped) { await search(request) } ?? failed("The search was stopped.")
+                    result.topic = request.topic
                 } else {
-                    result = WebSearch(query: query, error: "Searching isn't available right now.")
+                    result = failed("Searching isn't available right now.")
                 }
             } else {
                 result = WebSearch(query: "", error: "The search couldn't be read: give the query as the query parameter.")
             }
             var tokens = try tokenize(template.renderToolResult(result, thinking: thinking))
             if cached.count + tokens.count > contextLength - Self.replyRoom / 2 {
-                result = WebSearch(query: result.query, error: "The results were too long for this chat.")
+                result = WebSearch(query: result.query, topic: result.topic, error: "The results were too long for this chat.")
                 tokens = try tokenize(template.renderToolResult(result, thinking: thinking))
             }
             searches.append(result)
